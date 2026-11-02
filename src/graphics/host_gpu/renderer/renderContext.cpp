@@ -1,0 +1,288 @@
+#include "graphics/host_gpu/renderer/renderContext.h"
+
+#include "common/alignment.h"
+#include "common/assert.h"
+#include "common/logging/log.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/productionProfile.h"
+#include "graphics/host_gpu/regionManager.h"
+#include "graphics/presentation/videoOut.h"
+#include "libs/errno.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+
+namespace Libs::Graphics {
+
+RenderContext::RenderContext(GraphicContext& graphics)
+    : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
+      m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
+      m_pipeline_cache(graphics, m_command_scheduler.GetMasterSemaphore()), m_sampler_cache(graphics),
+      m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+}
+
+RenderContext::~RenderContext() {
+	ShutdownGpu();
+	m_command_scheduler.Shutdown();
+}
+
+void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
+	EXIT_IF(m_gpu != nullptr);
+	m_video_out = video_out;
+	m_gpu       = std::make_unique<GuestGpu>(*this);
+}
+
+void RenderContext::ShutdownGpu() {
+	if (m_gpu != nullptr) {
+		m_gpu->Shutdown();
+		m_gpu.reset();
+	}
+	if (m_video_out != nullptr) {
+		if (m_command_scheduler.Active()) {
+			m_command_scheduler.Finish();
+		}
+		m_command_scheduler.DrainPriorityOperations();
+		m_video_out = nullptr;
+	}
+}
+
+GuestGpu& RenderContext::GetGpu() const {
+	EXIT_IF(m_gpu == nullptr);
+	return *m_gpu;
+}
+
+int RenderContext::DiagnosticFrameNum() const {
+	return m_gpu != nullptr ? m_gpu->GetFrameNum() : 0;
+}
+
+VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
+	EXIT_IF(m_video_out == nullptr);
+	return *m_video_out;
+}
+
+std::atomic<uint64_t> g_fault_writes_count {0};
+std::atomic<uint64_t> g_fault_reads_count {0};
+std::atomic<uint64_t> g_fault_time_ns {0};
+
+bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	uint64_t fault_start = fault_vaddr;
+	uint64_t fault_size  = 1;
+	if (access == PageFaultAccess::Write) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		const auto [map_begin, map_end] = m_mapped_ranges.Enclosing(fault_vaddr);
+		if (map_end == 0) {
+			return false;
+		}
+		static const uint64_t kClusterSize = [] {
+			const char* env = std::getenv("KYTY_FAULT_CLUSTER_KB");
+			if (env != nullptr && env[0] != '\0') {
+				uint64_t kb = std::strtoull(env, nullptr, 10);
+				if (kb > 0) return kb * 1024;
+			}
+#if defined(__APPLE__)
+			return 2048ULL * 1024; // 2 MiB default on Apple Silicon (reduces SIGSEGV storm by 8x)
+#else
+			return 256ULL * 1024;
+#endif
+		}();
+		fault_start = std::max(map_begin, Common::AlignDown(fault_vaddr, kClusterSize));
+		const uint64_t cluster_end = std::min(map_end, Common::AlignUp(fault_vaddr + 1, kClusterSize));
+		fault_size = cluster_end - fault_start;
+	} else {
+		if (!IsMapped(fault_vaddr, fault_size)) {
+			return false;
+		}
+	}
+	const auto fault_t0 = std::chrono::steady_clock::now();
+	if (access == PageFaultAccess::Write) {
+		g_fault_writes_count.fetch_add(1, std::memory_order_relaxed);
+		m_buffer_cache.InvalidateMemory(fault_start, fault_size);
+		m_texture_cache.InvalidateMemory(fault_start, fault_size);
+	} else {
+		g_fault_reads_count.fetch_add(1, std::memory_order_relaxed);
+		m_buffer_cache.NoteCpuReadFault(fault_vaddr);
+		if (DebugDirtyWatchHit(fault_vaddr, 1)) {
+			static std::atomic<int> printed {0};
+			if (printed.fetch_add(1) < 400) {
+				std::fprintf(stderr, "[dirty-watch] cpu-read-fault 0x%llx\n",
+				             static_cast<unsigned long long>(fault_vaddr));
+			}
+		}
+		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+	}
+	const auto fault_dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	    std::chrono::steady_clock::now() - fault_t0).count();
+	g_fault_time_ns.fetch_add(fault_dt, std::memory_order_relaxed);
+	return true;
+}
+
+bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size)) {
+		return false;
+	}
+	m_buffer_cache.InvalidateMemory(vaddr, size);
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
+bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.Contains(vaddr, size);
+}
+
+void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.Add(vaddr, size);
+	++m_mapped_ranges_version;
+	m_command_scheduler.ProfileBufferUse("mapped_range_added", vaddr, size, m_mapped_ranges_version);
+}
+
+void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	const auto unmap = [this, vaddr, size] {
+		if (m_command_scheduler.Active()) {
+			const auto tick = m_command_scheduler.CurrentTick();
+			m_command_scheduler.Finish();
+			m_command_scheduler.WaitPriorityOperations(tick);
+		}
+		m_buffer_cache.InvalidateMemory(vaddr, size);
+		// A remapped range may back a different guest page, so imported aliases must go.
+		m_buffer_cache.DropImportedBuffers(vaddr, size);
+		m_texture_cache.UnmapMemory(vaddr, size);
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Subtract(vaddr, size);
+		++m_mapped_ranges_version;
+		m_command_scheduler.ProfileBufferUse("mapped_range_removed", vaddr, size, m_mapped_ranges_version);
+	};
+	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
+	// longer accepts external work. Use the guest GPU's state for the teardown route.
+	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+		unmap();
+		return;
+	}
+	m_gpu->SendCommandSync(unmap);
+}
+
+void RenderContext::PrepareBda() {
+	ProfileDetailScope profile("cpu_prepare_bda");
+	if (!m_bda_logged) {
+		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
+		m_bda_logged = true;
+	}
+	const uint64_t cpu_epoch   = RegionManager::CpuDirtyEpoch();
+	const uint64_t reg_epoch   = m_buffer_cache.RegisterEpoch();
+	const uint64_t map_version = m_mapped_ranges_version;
+	if (cpu_epoch == m_last_bda_cpu_epoch &&
+	    reg_epoch == m_last_bda_reg_epoch &&
+	    map_version == m_last_bda_map_version) {
+		return;
+	}
+
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	if (BdaSyncControl::Enabled()) {
+		m_bda_sync_control.Run(m_command_scheduler.GpuFrameHint(), [&](BdaSyncAction action) {
+			return m_buffer_cache.SynchronizeBdaRanges(m_mapped_ranges, m_mapped_ranges_version, action);
+		});
+	} else {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+	}
+	m_last_bda_cpu_epoch   = cpu_epoch;
+	m_last_bda_reg_epoch   = reg_epoch;
+	m_last_bda_map_version = map_version;
+	m_fault_process_pending = true;
+}
+
+void RenderContext::TickFrame() {
+	m_texture_cache.TickFrame();
+	m_buffer_cache.TickFrame();
+}
+
+// Instrumented for TASK-0014. This runs inside guest_process_slice but outside the recording
+// scopes, which is exactly what analyze-production-profile.py reports as
+// translation_other_cpu_ms -- about 19% of epoch wall that had never been attributed. None of
+// these four phases carried a profiling scope, so they were invisible.
+void RenderContext::RunGarbageCollector() {
+	Libs::Graphics::ProfileCpuScope gc(m_command_scheduler, "gc_total");
+	if (m_fault_process_pending) {
+		Libs::Graphics::ProfileCpuScope phase(m_command_scheduler, "gc_fault_buffer");
+		m_fault_process_pending = false;
+		m_buffer_cache.ProcessFaultBuffer();
+	}
+	{
+		Libs::Graphics::ProfileCpuScope phase(m_command_scheduler, "gc_download_images");
+		m_texture_cache.ProcessDownloadImages();
+	}
+	{
+		Libs::Graphics::ProfileCpuScope phase(m_command_scheduler, "gc_texture_cache");
+		m_texture_cache.RunGarbageCollector();
+	}
+	{
+		Libs::Graphics::ProfileCpuScope phase(m_command_scheduler, "gc_buffer_cache");
+		m_buffer_cache.RunGarbageCollector();
+	}
+}
+
+void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
+	Common::LockGuard lock(m_interrupt_mutex);
+
+	auto it = std::find_if(
+	    m_interrupt_eqs.begin(), m_interrupt_eqs.end(),
+	    [eq, event_id](const auto& entry) { return entry.eq == eq && entry.event_id == event_id; });
+	if (it != m_interrupt_eqs.end()) {
+		return;
+	}
+
+	m_interrupt_eqs.push_back({eq, event_id});
+}
+
+void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
+	Common::LockGuard lock(m_interrupt_mutex);
+
+	auto it = std::find_if(
+	    m_interrupt_eqs.begin(), m_interrupt_eqs.end(),
+	    [eq, event_id](const auto& entry) { return entry.eq == eq && entry.event_id == event_id; });
+	if (it == m_interrupt_eqs.end()) {
+		return;
+	}
+
+	m_interrupt_eqs.erase(it);
+}
+
+void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
+	std::vector<InterruptEqRegistration> registrations;
+	{
+		Common::LockGuard lock(m_interrupt_mutex);
+		for (const auto& registration: m_interrupt_eqs) {
+			if (registration.event_id == event_id) {
+				registrations.push_back(registration);
+			}
+		}
+	}
+
+	for (const auto& registration: registrations) {
+		const auto result = LibKernel::EventQueue::KernelTriggerEvent(
+		    registration.eq, static_cast<uintptr_t>(registration.event_id),
+		    LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,
+		    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)));
+		if (result == LibKernel::KERNEL_ERROR_EBADF || result == LibKernel::KERNEL_ERROR_ENOENT) {
+			DeleteInterruptEq(registration.eq, registration.event_id);
+			continue;
+		}
+		EXIT_NOT_IMPLEMENTED(result != OK);
+	}
+}
+
+} // namespace Libs::Graphics

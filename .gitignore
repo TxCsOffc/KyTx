@@ -1,0 +1,31 @@
+# Visual Studio 2015 cache/options directory
+.vs/
+.idea/
+build/
+_Build/vscode-clang/
+_Build/
+cmake-build-debug/
+_PipelineCache/
+
+# Stray local clone: upstream vendors SDL3 as a submodule, SDL2 here is not ours
+3rdparty/SDL2/
+
+# Python bytecode from the ufc5 analysis tools
+__pycache__/
+*.pyc
+
+# Ledger: ledger.jsonl is the append-only source of truth and IS tracked.
+# The SQLite database is derived from it (`ledger rebuild`), and .lock is runtime state.
+ufc5/.ledger/.lock
+ufc5/.ledger/ledger.db
+ufc5/.ledger/archive/*.db
+
+# Local run data and game-derived output (never published)
+.DS_Store
+_DownloadData/
+_SaveData/
+_TempData/
+.porting/artifacts/
+.porting/work/
+.porting/tools/
+tools/msl/out/
