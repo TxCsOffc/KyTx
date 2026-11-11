@@ -2644,6 +2644,33 @@ struct Emitter {
 				body << "\t\t}\n";
 				return;
 			}
+			case IR::ValueOpcode::StoreBufferU8:
+			case IR::ValueOpcode::StoreBufferU16: {
+				// A byte (U8) or halfword (U16) buffer store: lower to one/two byte stores at the byte
+				// address, little endian (low byte first), with the same bounds check and active flag as
+				// EmitFormattedStore. The argument layout matches StoreBufferU32: resource, address low,
+				// address high, value, active.
+				const auto& mem = Mem(inst);
+				const auto  ptr = BufferPtr(mem.resource);
+				if (!ptr || mem.kind != IR::ResourceKind::Buffer || !BufferAddressable(mem.resource) || mem.formatted) {
+					Unsupported(inst, "subword buffer store layout");
+					return;
+				}
+				const uint32_t bytes = inst.GetOpcode() == ValueOpcode::StoreBufferU8 ? 1u : 2u;
+				const uint32_t packed = program.info.buffers[mem.resource].packed_stride;
+				const std::string byte = BufferByte(inst, mem, packed);
+				const std::string limit = "sizes[" + std::to_string(mem.resource) + "]";
+				const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
+				body << "\t\tif (" << Expr(inst.Arg(inst.NumArgs() - 1)) << " && " << byte
+				     << " <= " << limit << " && " << U32Literal(bytes)
+				     << " <= " << limit << " - " << byte << ") {\n";
+				body << "\t\t\tdevice uchar* kyty_dst = ((device uchar*)" << *ptr << ") + " << byte << ";\n";
+				for (uint32_t b = 0; b < bytes; ++b) {
+					body << "\t\t\tkyty_dst[" << b << "] = uchar(" << value << " >> " << b * 8u << "u);\n";
+				}
+				body << "\t\t}\n";
+				return;
+			}
 			case IR::ValueOpcode::StoreBufferU32:
 			case IR::ValueOpcode::StoreBufferU32x2:
 			case IR::ValueOpcode::StoreBufferU32x3:
