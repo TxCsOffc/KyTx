@@ -11,6 +11,7 @@ xcrun clang++ -std=c++20 -fobjc-arc -Wl,-dead_strip \
     "$repo_dir/src/graphics/host_gpu/metal/metalDraw.mm" \
     "$repo_dir/src/graphics/host_gpu/metal/metalPassTimer.mm" \
     "$repo_dir/src/graphics/host_gpu/metal/metalIndirect.mm" \
+    "$repo_dir/tools/test_shims/guestWritesLink.mm" \
     "$repo_dir/src/graphics/host_gpu/metal/metalTiling.mm" \
     "$repo_dir/src/graphics/guest_gpu/tile.cpp" \
     "$repo_dir/src/graphics/guest_gpu/gpu_format.cpp" \

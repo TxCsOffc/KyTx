@@ -299,6 +299,93 @@ static void ImageSampling() {
 	Check(failures == 0, "image sampling regressions");
 }
 
+// RDNA: an image load outside the image (x, y or mip past the resource) returns zero and an image store there is dropped. The
+// emitter guards both with the bound texture's dimensions; Metal alone leaves them undefined.
+static void ImageBounds() {
+	struct Case { const char* name; uint32_t x, y, lod; bool inside; };
+	const Case cases[] = {{"inside", 3, 2, 0, true}, {"x==width", 8, 0, 0, false}, {"y==height", 0, 8, 0, false},
+	                      {"x huge", 0xffffffffu, 1, 0, false}, {"lod past last", 1, 1, 1, false}, {"last texel", 7, 7, 0, true}};
+	unsigned checked = 0;
+	for (const Case& test: cases) {
+		Fixture f;
+		IR::ImageResource image {};
+		image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+		image.numeric_class = Prospero::TextureNumericClass::Float;
+		image.resource_class = IR::ImageResourceClass::Storage;
+		image.read = true; image.written = true;
+		image.mip_mode = IR::ImageMipMode::Dynamic; image.mip_count = 1;
+		f.program.info.images.push_back(image);
+		f.program.bindings.descriptors.push_back({*IR::DescriptorBindingForImage(image), {0}});
+		const auto output_handle = f.Buffer(0);
+		const auto output_memory = f.Memory(0);
+		const auto handle = f.Emit(0, ValueOpcode::GetImageResource, {Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)});
+		const auto address = f.Emit(0, ValueOpcode::MakeImageAddress, {Value(test.x),Value(test.y),Value(test.lod),Value(0u),Value(0u),
+		    Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)});
+		IR::MemoryInfo mem {};
+		mem.kind = IR::ResourceKind::Image;
+		mem.image_dimension = image.dimension;
+		mem.dmask = 15;
+		mem.image_address_components = 3;
+		const auto image_memory = f.program.memory_info.size();
+		f.program.memory_info.push_back(mem);
+		const auto texel = f.Emit(0, ValueOpcode::ImageRead, {handle, address, Value(true)}, image_memory);
+		// Store a marker at the same coordinates: it must land only inside.
+		const auto marker = f.Emit(0, ValueOpcode::CompositeConstructU32x4, {Value(std::bit_cast<uint32_t>(-7.0f)),
+		    Value(std::bit_cast<uint32_t>(-7.0f)), Value(std::bit_cast<uint32_t>(-7.0f)), Value(std::bit_cast<uint32_t>(-7.0f))});
+		f.Emit(0, ValueOpcode::ImageWrite, {handle, address, marker, Value(true)}, image_memory);
+		for (unsigned n = 0; n < 4; ++n)
+			f.Store(0, output_handle, n * 4, f.Emit(0, ValueOpcode::CompositeExtractU32x4, {texel, Value(n)}), output_memory);
+		id<MTLFunction> function = Compile(f);
+		NSError* error = nil;
+		id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+		Check(pipeline != nil, "image bounds pipeline failed");
+		MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:8 height:8 mipmapped:NO];
+		d.storageMode = MTLStorageModeShared;
+		d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+		id<MTLTexture> texture = [device newTextureWithDescriptor:d];
+		std::vector<float> pixels(8 * 8 * 4);
+		for (size_t i = 0; i < pixels.size(); ++i) pixels[i] = 1.0f + float(i);
+		[texture replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0 withBytes:pixels.data() bytesPerRow:8 * 16];
+		id<MTLBuffer> output = [device newBufferWithLength:16 options:MTLResourceStorageModeShared];
+		std::memset(output.contents, 0xcd, 16);
+		id<MTLArgumentEncoder> arguments = [function newArgumentEncoderWithBufferIndex:0];
+		id<MTLBuffer> argbuf = [device newBufferWithLength:arguments.encodedLength options:MTLResourceStorageModeShared];
+		[arguments setArgumentBuffer:argbuf offset:0];
+		[arguments setBuffer:output offset:0 atIndex:0];
+		[arguments setTexture:texture atIndex:64];
+		uint32_t push[32] {}, sizes[64] {16};
+		id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+		id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+		[encoder setComputePipelineState:pipeline]; [encoder setBuffer:argbuf offset:0 atIndex:0];
+		[encoder setBytes:push length:sizeof(push) atIndex:1]; [encoder setBytes:sizes length:sizeof(sizes) atIndex:25];
+		[encoder useResource:texture usage:MTLResourceUsageRead | MTLResourceUsageWrite]; [encoder useResource:output usage:MTLResourceUsageWrite];
+		[encoder dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+		[encoder endEncoding]; [command commit]; [command waitUntilCompleted];
+		Check(command.status == MTLCommandBufferStatusCompleted, "image bounds dispatch failed");
+		const auto* got = static_cast<const float*>(output.contents);
+		std::vector<float> after(8 * 8 * 4);
+		[texture getBytes:after.data() bytesPerRow:8 * 16 fromRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0];
+		for (uint32_t c = 0; c < 4; ++c) {
+			const float expect = test.inside ? pixels[(test.y * 8 + test.x) * 4 + c] : 0.0f;
+			if (got[c] != expect) {
+				std::fprintf(stderr, "image bounds %s: read component %u expected %g got %g\n", test.name, c, expect, got[c]);
+				throw std::runtime_error("image bounds read mismatch");
+			}
+		}
+		for (uint32_t i = 0; i < 64; ++i)
+			for (uint32_t c = 0; c < 4; ++c) {
+				const bool target = test.inside && i == test.y * 8 + test.x;
+				const float expect = target ? -7.0f : pixels[i * 4 + c];
+				if (after[i * 4 + c] != expect) {
+					std::fprintf(stderr, "image bounds %s: texel %u.%u expected %g got %g\n", test.name, i, c, expect, after[i * 4 + c]);
+					throw std::runtime_error("image bounds store mismatch");
+				}
+			}
+		++checked;
+	}
+	std::printf("Image bounds: %u GPU cases (load zero / store dropped outside x, y, mip) PASS\n", checked);
+}
+
 #if KYTX_COMPARE_SPIRV_PATH
 #include "metalShaderPathReference.inc"
 #endif
@@ -970,7 +1057,7 @@ int main() {
 			if (std::getenv("KYTX_MSL_STRICT_ONLY")) { LongShaderLoops(); setenv("KYTY_MSL_DISPATCHER","1",1); LongShaderLoops(); RejectedShaderApproximations(); VertexAuxiliaryOutputs(); return 0; }
 			NativeMeshExports(); NativeMeshPrimitiveOutputs(); NativeMeshRectangles(); PixelLaneStorage(); WaveControlOperations();
 			BufferStrideSwizzle();
-			NullDescriptorOperations(); ImageSampling(); DepthCompareSampling(); ComparisonPixelSampling(); OrdinarySampleOffsets(); PixelInterpolation(); LocalAppendConsume(); BitScans32(); CycleTrig(); FloatComparisons(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
+			NullDescriptorOperations(); ImageSampling(); ImageBounds(); DepthCompareSampling(); ComparisonPixelSampling(); OrdinarySampleOffsets(); PixelInterpolation(); LocalAppendConsume(); BitScans32(); CycleTrig(); FloatComparisons(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
 			RejectedShaderApproximations(); VertexAuxiliaryOutputs(); LongShaderLoops(); IndirectRectList(); LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();
 			setenv("KYTY_MSL_DISPATCHER", "1", 1);
 			LongShaderLoops(); LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();

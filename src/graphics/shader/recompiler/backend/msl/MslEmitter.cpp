@@ -623,6 +623,24 @@ struct Emitter {
 		return "float3(" + x + ", " + y + ", " + z + ")";
 	}
 
+	// RDNA drops an image store and returns zero for an image load outside the image (texel coordinates, array slice or mip
+	// level past the resource); Metal leaves both undefined (an out-of-range store can land in other memory). Bounds of the bound
+	// texture, the same dimensions image_get_resinfo reports.
+	static std::string ImageInBounds(const std::string& tex, const std::string& coord, uint32_t spatial, const std::string& slice,
+	                                 const std::string& lod) {
+		std::string c = "(" + lod + ") < " + tex + ".get_num_mip_levels()";
+		if (spatial <= 1u) {
+			c += " && (" + coord + ") < " + tex + ".get_width(" + lod + ")";
+		} else if (spatial == 2u) {
+			c += " && all((" + coord + ") < uint2(" + tex + ".get_width(" + lod + "), " + tex + ".get_height(" + lod + ")))";
+		} else {
+			c += " && all((" + coord + ") < uint3(" + tex + ".get_width(" + lod + "), " + tex + ".get_height(" + lod + "), " + tex +
+			     ".get_depth(" + lod + ")))";
+		}
+		if (!slice.empty()) c += " && (" + slice + ") < " + tex + ".get_array_size()";
+		return c;
+	}
+
 	std::string CoordU32(const Inst& address, const IR::MemoryInfo& mem, uint32_t components) {
 		std::string x = AddressU32(address, mem, 0);
 		if (components <= 1u) {
@@ -1957,8 +1975,11 @@ struct Emitter {
 				const std::string lod =
 				    image.mip_mode == IR::ImageMipMode::Dynamic
 				        ? AddressU32(*address, mem, static_cast<uint32_t>(dim.components)) : "0u";
+				const std::string slice = arrayed ? "uint(" + AddressU32(*address, mem, spatial) + ")" : std::string {};
+				const std::string in_bounds = ImageInBounds(tex, coord, spatial, slice, lod);
 				EmitAssignment(inst, TexelBits(image,
-				                               tex + ".read(" + coord + array_arg + ", " + lod + ")", &mem));
+				                               "((" + in_bounds + ") ? " + tex + ".read(" + coord + array_arg + ", " + lod + ") : vec<" +
+				                                   ImageScalar(image) + ", 4>(0))", &mem));
 				return;
 			}
 			case IR::ValueOpcode::ImageWrite: {
@@ -1986,8 +2007,9 @@ struct Emitter {
 					     << " if (any(isnan(_v.xyz))) { atomic_fetch_add_explicit(kyty_store_dbg + " << base << "u + 1u, 1u, memory_order_relaxed);"
 					     << " atomic_fetch_min_explicit(kyty_store_dbg + " << base << "u + 3u, (_p.y << 16u) | _p.x, memory_order_relaxed); } } }\n";
 				}
-				body << "\t\tif (" << Expr(inst.Arg(3)) << ") {\n\t\t\t" << tex << ".write(" << value
-				     << ", " << coord << array_arg << ", " << lod << ");\n\t\t}\n";
+				const std::string slice = arrayed ? "uint(" + AddressU32(*address, mem, spatial) + ")" : std::string {};
+				body << "\t\tif ((" << Expr(inst.Arg(3)) << ") && (" << ImageInBounds(tex, coord, spatial, slice, lod) << ")) {\n\t\t\t" << tex
+				     << ".write(" << value << ", " << coord << array_arg << ", " << lod << ");\n\t\t}\n";
 				return;
 			}
 			case IR::ValueOpcode::ImageQueryDimensions: {
