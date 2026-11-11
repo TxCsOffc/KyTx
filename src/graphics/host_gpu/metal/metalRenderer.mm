@@ -9051,8 +9051,9 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 			RaceWatchBuffer(cs_hash, b, addr, VsharpBytes(desc.dwords));
 		}
 	}
+	const bool gds_snapshot = !gds_trip && GdsTripSnapshot(trip_guest, cs_hash);
 	bool replay_dump_here = compute_info.stage.program && compute_info.stage.program->native_msl &&
-	    (gds_trip || ReplayDumpWanted(compute_info.stage.program->guest_hash, cs_hash));
+	    (gds_trip || gds_snapshot || ReplayDumpWanted(compute_info.stage.program->guest_hash, cs_hash));
 	if (replay_dump_here) {
 		for (const auto& binding: compute_info.stage.program->bindings.descriptors) {
 			using K = ShaderRecompiler::IR::DescriptorBindingKind;
@@ -10327,7 +10328,7 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 	if (replay_dump_here) {
 		const auto& prog = *compute_info.stage.program;
 		static uint64_t sequence = 0;
-		replay_dir = gds_trip ? GdsTripDir(prog.guest_hash, cs_hash) : [NSString stringWithFormat:@"%s/%016llx-%016llx-f%llu-d%llu", KYTY_ENV("KYTY_REPLAY_DUMP_DIR"),
+		replay_dir = gds_trip ? GdsTripDir(prog.guest_hash, cs_hash) : gds_snapshot ? GdsTripSnapshotDir() : [NSString stringWithFormat:@"%s/%016llx-%016llx-f%llu-d%llu", KYTY_ENV("KYTY_REPLAY_DUMP_DIR"),
 		    (unsigned long long)prog.guest_hash, (unsigned long long)cs_hash,
 		    (unsigned long long)TraceWindow::g_flip.load(), (unsigned long long)sequence++];
 		[[NSFileManager defaultManager] createDirectoryAtPath:replay_dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -10379,7 +10380,7 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 	} else {
 		MetalDrawExecutor::Instance().Dispatch(thread_group_x, thread_group_y, thread_group_z, host_w, host_h, host_d);
 	}
-	if (replay_dir) {
+	if (replay_dir && !gds_snapshot) {
 		const bool after_ok=ReplayDumpPhase(replay_dir,@"after",cs_buffers,replay_images,sizes,arg_ptrs[161] ? GdsBuffer() : nil);
 		std::fprintf(stderr,"[ReplayDump] after complete=%d %s\n",after_ok,replay_dir.UTF8String);
 	}

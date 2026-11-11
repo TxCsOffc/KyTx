@@ -245,6 +245,7 @@ struct GdsTripConfig {
 	uint32_t              max   = 0;
 	std::string           dir;
 	std::vector<uint64_t> watch;
+	bool                  snapshot = false; // KYTY_GDS_TRIP_SNAPSHOT=1: every dispatch below the limit overwrites <dir>/last
 };
 static const GdsTripConfig& GdsTrip() {
 	static const GdsTripConfig config = [] {
@@ -270,7 +271,9 @@ static const GdsTripConfig& GdsTrip() {
 				q = *end == ',' ? end + 1 : end;
 			}
 		}
+		c.snapshot = KYTY_ENV("KYTY_GDS_TRIP_SNAPSHOT") != nullptr;
 		c.on = true;
+		std::fprintf(stderr, "[GdsTrip] armed snapshot=%d ", c.snapshot ? 1 : 0);
 		std::fprintf(stderr, "[GdsTrip] armed hash=%016llx GDS[%u] max=%u watch=%zu dir=%s\n", (unsigned long long)c.hash, c.dword, c.max,
 		             c.watch.size(), c.dir.c_str());
 		return c;
@@ -326,6 +329,17 @@ static bool GdsTripCheck(uint64_t guest, uint64_t native, uint32_t& value) {
 		             (unsigned long long)TraceWindow::g_flip.load(std::memory_order_relaxed), c.dword, value, c.max);
 	}
 	return value > c.max;
+}
+// KYTY_GDS_TRIP_SNAPSHOT: the exact inputs of every checked dispatch go to <dir>/last before it is encoded, so a dispatch the
+// host budget stops as hung leaves its own inputs behind. Only the "before" phase is written.
+static bool GdsTripSnapshot(uint64_t guest, uint64_t native) {
+	const auto& c = GdsTrip();
+	return c.on && c.snapshot && (c.hash == guest || c.hash == native);
+}
+static NSString* GdsTripSnapshotDir() {
+	NSString* dir = [NSString stringWithFormat:@"%s/last", GdsTrip().dir.c_str()];
+	[[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+	return dir;
 }
 static NSString* GdsTripDir(uint64_t guest, uint64_t native) {
 	NSString* dir = [NSString stringWithFormat:@"%s/trip-%016llx-%016llx-f%llu", GdsTrip().dir.c_str(), (unsigned long long)guest,

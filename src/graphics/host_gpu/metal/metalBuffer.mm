@@ -8,6 +8,7 @@
 #include <mutex>
 #include <set>
 #include "graphics/host_gpu/metal/metalBuffer.h"
+#include "graphics/host_gpu/metal/metalContext.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/metal/metalContext.h"
 #include "common/logging/log.h"
@@ -180,7 +181,23 @@ void MetalDynamicRingBuffer::Shutdown() {
 	m_head = 0;
 }
 
+// A replaced ring backing can still be read by encoded or committed work, also through raw GPU addresses inside argument
+// buffers (flattened SRTs), which Metal does not keep alive for us. It is retained until the open command buffer completes:
+// one queue completes in order, so every earlier buffer that could reference it has completed by then.
+static void RetainRingUntilCurrentWorkCompletes(id<MTLBuffer> retired) {
+	if (retired == nil) return;
+	static std::atomic<uint64_t> s_wraps {0};
+	const uint64_t n = s_wraps.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 8 || n % 256 == 0) std::fprintf(stderr, "[DynRing] backing replaced #%llu (old kept until the open command buffer completes)\n", (unsigned long long)n);
+	id<MTLCommandBuffer> cb = MetalContext::Instance().GetCurrentCommandBuffer();
+	if (cb == nil) return;
+	[cb addCompletedHandler:^(id<MTLCommandBuffer>) { (void)retired; }];
+}
+
 MetalBufferAllocation MetalDynamicRingBuffer::Allocate(size_t size, size_t alignment) {
+	id<MTLBuffer> retired = nil;
+	MetalBufferAllocation alloc {};
+	{
 	std::lock_guard lock(m_mutex);
 	if (!m_buffer.IsValid() || size == 0) {
 		return {};
@@ -192,29 +209,34 @@ MetalBufferAllocation MetalDynamicRingBuffer::Allocate(size_t size, size_t align
 		return {};
 	}
 	if (aligned_head > m_capacity - size) {
-		// Encoded commands can still read the old allocation. Never overwrite its
-		// beginning: Metal's retained command buffers keep that backing alive until
-		// completion, including indirect references declared with useResource.
+		// Encoded commands can still read the old allocation: never overwrite it, and keep it alive (see above).
+		retired = m_buffer.GetHandle();
 		if (!m_buffer.Allocate(m_capacity, "DynamicRingBuffer")) return {};
 		aligned_head = 0;
 	}
 
 	m_head = aligned_head + size;
 
-	MetalBufferAllocation alloc {};
 	alloc.buffer = m_buffer.GetHandle();
 	alloc.offset = m_buffer.GetOffset() + aligned_head;
 	alloc.size = size;
 	alloc.cpu_addr = static_cast<uint8_t*>(m_buffer.GetContents()) + aligned_head;
 	alloc.gpu_addr = m_buffer.GetGpuAddress() ? (m_buffer.GetGpuAddress() + aligned_head) : 0;
+	}
+	RetainRingUntilCurrentWorkCompletes(retired);
 	return alloc;
 }
 
 void MetalDynamicRingBuffer::Reset() {
-	std::lock_guard lock(m_mutex);
-	// Reset does not imply that all previously encoded GPU work has completed.
-	m_buffer.Allocate(m_capacity, "DynamicRingBuffer");
-	m_head = 0;
+	id<MTLBuffer> retired = nil;
+	{
+		std::lock_guard lock(m_mutex);
+		// Reset does not imply that all previously encoded GPU work has completed.
+		retired = m_buffer.GetHandle();
+		m_buffer.Allocate(m_capacity, "DynamicRingBuffer");
+		m_head = 0;
+	}
+	RetainRingUntilCurrentWorkCompletes(retired);
 }
 
 MetalBufferManager& MetalBufferManager::Instance() {
