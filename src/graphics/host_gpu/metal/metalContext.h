@@ -4,6 +4,7 @@
 #include "common/common.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,6 +37,8 @@ struct MetalDeviceCapabilities {
 
 // Registers a command buffer that a helper commits and waits on itself with the GPU watchdog (call before commit); `what` names the path.
 void KytyWatchCommandBuffer(id commandBuffer, const char* what);
+// Submit through the shared host duty-cycle/memory budget, including helper queues.
+void KytyBudgetedCommit(id commandBuffer);
 
 class MetalContext {
 public:
@@ -80,6 +83,9 @@ public:
 	// A whole-texture copy (slices [0, slices) and mips [0, levels)) requested while an encoder is open: it runs when that encoder ends
 	// (a layered image grown during a storage binding receives its old slices this way; the open dispatch writes only new ones).
 	void QueueTextureCopy(id src, id dst, uint32_t slices, uint32_t levels);
+	// Materialize private image writes after the producing encoder and before
+	// queued DMA fills/copies or any subsequent consumer. No CPU wait is needed.
+	void QueueEncoderWriteback(std::function<void(id)> writeback, uint64_t key = 0);
 	void CommitCommandBuffer(bool wait = false);
 	void WaitUntilIdle();
 
@@ -122,6 +128,8 @@ private:
 		uint32_t levels = 0;
 	};
 	std::vector<PendingTextureCopy> m_pending_texture_copies;
+	struct PendingWriteback { uint64_t key; std::function<void(id)> encode; };
+	std::vector<PendingWriteback> m_pending_writebacks;
 	uint64_t                     m_encoder_serial = 0;
 	bool                         m_command_buffer_handed_out = false;
 

@@ -117,6 +117,11 @@ public:
 	// Get or wrap a guest memory region into a zero-copy shared Metal buffer
 	MetalBufferAllocation GetBufferForGuestRange(uint64_t vaddr, size_t size);
 
+	// One Metal buffer per 64 MiB of physical guest backing (through the backing alias), shared by every user: the same physical
+	// bytes always have the same Metal buffer and GPU address. Null when the alias is unavailable.
+	static constexpr uint64_t kBackingChunkSize = 64ull << 20;
+	std::shared_ptr<MetalBuffer> GetBackingChunk(uint64_t chunk);
+
 	// Transient allocations
 	MetalBufferAllocation AllocateDynamic(size_t size, size_t alignment = 256);
 
@@ -134,8 +139,12 @@ private:
 	struct PageCacheEntry {
 		std::shared_ptr<MetalBuffer> buffer;
 		int64_t                      used_ms = 0; // steady-clock time of the last lookup
+		uint64_t                     backing_offset = UINT64_MAX; // physical backing behind the wrapped pages when it was made
+		uint64_t                     generation = 0;              // guest mapping generation the entry was last checked against
 	};
 	std::unordered_map<uint64_t, PageCacheEntry> m_page_cache;
+	std::mutex                                                   m_chunk_mutex;
+	std::unordered_map<uint64_t, std::shared_ptr<MetalBuffer>> m_backing_chunks;
 	int64_t                                      m_page_cache_swept_ms = 0;
 	std::unique_ptr<MetalDynamicRingBuffer>         m_dynamic_ring;
 	size_t                                          m_page_size = 16384;

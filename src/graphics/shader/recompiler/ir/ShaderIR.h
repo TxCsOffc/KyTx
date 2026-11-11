@@ -155,6 +155,7 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	bool     point_fetch           = false; // Software footprints for RDNA offsets beyond Metal's four-bit range.
 
 	bool operator==(const SamplerResource& other) const = default;
 };

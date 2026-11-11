@@ -29,13 +29,11 @@ class MetalComputeIndirect {
 public:
 	static constexpr NSUInteger OriginalArgumentsOffset = 16;
 	id<MTLBuffer> Encode(id<MTLCommandBuffer> command, id<MTLBuffer> source,
-	                     NSUInteger offset, MTLSize guest_threads, bool thread_dimensions,
-	                     uint32_t max_groups);
+	                     NSUInteger offset, MTLSize guest_threads, bool thread_dimensions);
 
 private:
 	id<MTLComputePipelineState> m_pipeline = nil;
 	id<MTLBuffer> m_output = nil;
-	id<MTLBuffer> m_guard = nil; // counts the dispatches the total-groups guard zeroed (see KytyPollIndirectGuard)
 };
 
 // Prepare multi-draw arguments in GPU order. Predicate by the GPU draw count,
@@ -60,9 +58,24 @@ private:
 // without waiting). Meant for a hung command buffer, where the stuck indirect op's arguments are the ones still in the shared buffer.
 std::string KytyDescribeIndirectArguments();
 // One line when the total-groups guard zeroed a dispatch since the last call (not thread-safe: one poller), empty otherwise.
-std::string KytyPollIndirectGuard();
 // Called right after MetalComputeIndirect::Encode for the same dispatch: which kernel it feeds, where its arguments live in guest memory, and
 // which UMA surfaces (GPU-written images over guest memory) cover that address (`cover` may be empty).
 void KytyNoteComputeIndirect(uint64_t hash, uint64_t addr, const char* cover);
 
 } // namespace Libs::Graphics::Metal
+
+namespace Libs::Graphics::Metal {
+// Draw arguments and NGG inputs are prepared on the GPU after their producer.
+// No work-count cap or instance-count replacement is applied.
+class MetalMeshIndirect {
+public:
+	static constexpr NSUInteger RecordBytes = 64;
+	static constexpr NSUInteger ParametersOffset = 16;
+	id<MTLBuffer> Encode(id<MTLCommandBuffer> command, id<MTLBuffer> source, NSUInteger offset,
+	                     uint32_t count, uint32_t stride, bool indexed, uint32_t index_bytes,
+	                     uint32_t primitive_size, uint32_t primitive_step, uint32_t primitives_per_group);
+private:
+	id<MTLComputePipelineState> m_pipeline = nil;
+	id<MTLBuffer> m_output = nil;
+};
+}

@@ -3,10 +3,13 @@
 #include "graphics/host_gpu/metal/metalContext.h"
 #include "graphics/host_gpu/metal/metalDraw.h"
 #include "graphics/host_gpu/metal/metalIndirect.h"
+#include "graphics/host_gpu/metal/metalTiling.h"
+#include "graphics/host_gpu/metal/metalDepthBounds.h"
 #include "common/logging/log.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <stdexcept>
 
 namespace Libs::Graphics::Metal {
 MetalContext::MetalContext() { m_device = MTLCreateSystemDefaultDevice(); m_command_queue = [m_device newCommandQueue]; }
@@ -18,9 +21,16 @@ id<MTLCommandBuffer> MetalContext::GetCurrentCommandBuffer() {
 }
 void MetalContext::SetActiveRenderEncoder(id<MTLRenderCommandEncoder> encoder) noexcept { m_active_render_encoder = encoder; }
 void MetalContext::SetActiveComputeEncoder(id<MTLComputeCommandEncoder> encoder) noexcept { m_active_compute_encoder = encoder; }
+void MetalContext::QueueEncoderWriteback(std::function<void(id)> writeback, uint64_t key) {
+	if (key != 0) for (auto& pending:m_pending_writebacks) if (pending.key == key) { pending.encode=std::move(writeback); return; }
+	m_pending_writebacks.push_back({key,std::move(writeback)});
+}
 void MetalContext::EndCurrentEncoder() {
 	[m_active_render_encoder endEncoding]; m_active_render_encoder = nil;
 	[m_active_compute_encoder endEncoding]; m_active_compute_encoder = nil;
+	std::vector<PendingWriteback> writebacks;
+	writebacks.swap(m_pending_writebacks);
+	for (const auto& writeback: writebacks) writeback.encode(m_current_command_buffer);
 }
 void MetalContext::CommitCommandBuffer(bool wait) {
 	EndCurrentEncoder();
@@ -67,23 +77,25 @@ static unsigned ComputeIndirect(id<MTLDevice> device) {
 	// Reproduce the old renderer: BeginComputePass clears the pipeline, then
 	// DispatchIndirect is called without preparing the selected shader/resources.
 	if (!draw.BeginComputePass()) return 1;
-	draw.DispatchIndirect(source,16,64,1,1);
+	bool rejected=false;
+	try { draw.DispatchIndirect(source,16,64,1,1); } catch (const std::runtime_error&) { rejected=true; }
+	if (!rejected) return 1;
 	context.CommitCommandBuffer(true);
 	if (*static_cast<const uint32_t*>(legacy.contents)!=0) return 1;
-	std::puts("Legacy indirect renderer sequence: dispatch skipped after pipeline reset");
-	struct Case { uint32_t raw[3]; MTLSize guest; bool threads; uint32_t cap; MTLSize host; uint32_t expected[3]; };
+	std::puts("Legacy indirect renderer sequence: missing pipeline explicitly rejected");
+	struct Case { uint32_t raw[3]; MTLSize guest; bool threads; MTLSize host; uint32_t expected[3]; bool execute=true; };
 	const Case cases[] = {
-	    {{3,2,1},{2,3,1},false,8,{2,3,1},{3,2,1}},
-	    {{5,4,2},{2,3,2},true,8,{2,3,2},{3,2,1}},
-	    {{2,0,1},{4,1,1},false,8,{4,1,1},{2,0,1}},
-	    {{17,6,1},{1,1,1},false,4,{1,1,1},{4,4,1}},
-	    {{UINT32_MAX,1,1},{8,1,1},true,4,{8,1,1},{4,1,1}},
-	    {{64,1,1},{64,1,1},true,8,{32,1,1},{1,1,1}}, // paired wave64 host geometry
-	    {{0,0,0},{1,1,1},false,8,{1,1,1},{0,0,0}},
-	    // Arguments that are image pixels or stale memory (1.0f bits, 0xFFFFFFFF, 65535^3 after the per-axis clamp) are never a real grid: no groups.
-	    {{0x3F800000u,0x3F800000u,0x3F800000u},{1,1,1},false,65535,{1,1,1},{0,0,0}},
-	    {{UINT32_MAX,UINT32_MAX,UINT32_MAX},{1,1,1},false,65535,{1,1,1},{0,0,0}},
-	    {{2048,1024,1},{1,1,1},false,65535,{1,1,1},{2048,1024,1}} // 2Mi groups is below the default total cap and runs
+	    {{3,2,1},{2,3,1},false,{2,3,1},{3,2,1}},
+	    {{5,4,2},{2,3,2},true,{2,3,2},{3,2,1}},
+	    {{2,0,1},{4,1,1},false,{4,1,1},{2,0,1}},
+	    {{17,6,1},{1,1,1},false,{1,1,1},{17,6,1}},
+	    {{UINT32_MAX,1,1},{8,1,1},true,{8,1,1},{536870912u,1,1},false},
+	    {{64,1,1},{64,1,1},true,{32,1,1},{1,1,1}},
+	    {{0,0,0},{1,1,1},false,{1,1,1},{0,0,0}},
+	    // Inspect full 32-bit boundary arguments, without submitting enormous workloads.
+	    {{0x3F800000u,0x3F800000u,0x3F800000u},{1,1,1},false,{1,1,1},{0x3F800000u,0x3F800000u,0x3F800000u},false},
+	    {{UINT32_MAX,UINT32_MAX,UINT32_MAX},{1,1,1},false,{1,1,1},{UINT32_MAX,UINT32_MAX,UINT32_MAX},false},
+	    {{2048,1024,1},{1,1,1},false,{1,1,1},{2048,1024,1}}
 	};
 	constexpr size_t count=sizeof(cases)/sizeof(cases[0]);
 	id<MTLBuffer> output = [device newBufferWithLength:count*32 options:MTLResourceStorageModeShared];
@@ -91,21 +103,22 @@ static unsigned ComputeIndirect(id<MTLDevice> device) {
 	std::memset(output.contents,0,output.length); std::memset(snapshots.contents,0,snapshots.length);
 	MetalComputeIndirect prepare;
 	id<MTLCommandBuffer> command = context.GetCurrentCommandBuffer();
-	if (prepare.Encode(command,source,source.length-8,{1,1,1},false,8) ||
-	    prepare.Encode(command,source,1,{1,1,1},false,8) ||
-	    prepare.Encode(command,source,16,{0,1,1},false,8)) return 1;
+	if (prepare.Encode(command,source,source.length-8,{1,1,1},false) ||
+	    prepare.Encode(command,source,1,{1,1,1},false) ||
+	    prepare.Encode(command,source,16,{0,1,1},false)) return 1;
 	for (size_t i=0;i<count;++i) {
 		const auto& test=cases[i];
 		if (!draw.BeginComputePass()) return 1;
 		draw.SetComputePipeline(producer); draw.SetComputeBuffer(source,0,0);
 		draw.SetComputeBytes(test.raw,sizeof(test.raw),1); draw.Dispatch(1,1,1,1,1,1);
 		draw.EndComputePass();
-		id<MTLBuffer> arguments = prepare.Encode(command,source,16,test.guest,test.threads,test.cap);
+		id<MTLBuffer> arguments = prepare.Encode(command,source,16,test.guest,test.threads);
 		if (!arguments) return 1;
 		id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
 		[blit copyFromBuffer:arguments sourceOffset:0 toBuffer:snapshots destinationOffset:i*64 size:32];
 		[blit copyFromBuffer:source sourceOffset:16 toBuffer:snapshots destinationOffset:i*64+32 size:12];
 		[blit endEncoding];
+		if (!test.execute) continue;
 		if (!draw.BeginComputePass()) return 1;
 		draw.SetComputePipeline(consumer); draw.SetComputeBuffer(output,i*32,0);
 		const uint32_t tag=uint32_t(i+11); draw.SetComputeBytes(&tag,sizeof(tag),1);
@@ -120,7 +133,7 @@ static unsigned ComputeIndirect(id<MTLDevice> device) {
 		const auto* args=static_cast<const uint32_t*>(snapshots.contents)+i*16;
 		const auto* out=static_cast<const uint32_t*>(output.contents)+i*8;
 		const uint32_t threads=t.host.width*t.host.height*t.host.depth;
-		const uint32_t groups=t.expected[0]*t.expected[1]*t.expected[2];
+		const uint32_t groups=t.execute ? t.expected[0]*t.expected[1]*t.expected[2] : 0u;
 		const uint32_t expected[]={groups*threads,groups*threads*uint32_t(t.host.width-1)/2,
 		    groups*threads*uint32_t(t.host.height-1)/2,groups*threads*uint32_t(t.host.depth-1)/2,
 		    groups*threads*uint32_t(i+11)};
@@ -129,12 +142,7 @@ static unsigned ComputeIndirect(id<MTLDevice> device) {
 		failures+=bad;
 		std::printf("Compute indirect case %zu: groups=%u,%u,%u threads=%u, %s\n",i,args[0],args[1],args[2],out[0],bad?"FAIL":"pass");
 	}
-	// The total-groups guard zeroed exactly the two all-ones cases (7 and 8): the counter the watchdog thread polls must say so.
-	const std::string guard_line=KytyPollIndirectGuard();
-	const bool guard_ok=guard_line.find("2 indirect dispatches zeroed")!=std::string::npos && guard_line.find("raw=4294967295,4294967295,4294967295")!=std::string::npos;
-	std::printf("Indirect guard counter: %s (%s)\n",guard_ok?"pass":"FAIL",guard_line.c_str());
-	failures+=!guard_ok;
-	std::printf("Compute indirect GPU producer/offset/clamp/thread dimensions/zero/reuse: %zu cases, %u failures\n",count,failures);
+	std::printf("Compute indirect exact arguments: %zu GPU cases (3 boundary snapshots, 7 consumer dispatches), %u failures\n",count,failures);
 	return failures;
 }
 
@@ -299,6 +307,9 @@ static unsigned StencilMasking(id<MTLDevice> device, Libs::Graphics::Metal::Meta
 	return failures;
 }
 
+#include "metalStrictPipelineTests.inc"
+#include "metalPixelActivationTests.inc"
+
 static unsigned MultiDrawIndirect(id<MTLDevice> device) {
 	using namespace Libs::Graphics::Metal;
 	NSError* error = nil;
@@ -396,12 +407,15 @@ static unsigned MultiDrawIndirect(id<MTLDevice> device) {
 		draw.SetRenderPipeline(pipelines[indexed || rect]);
 		draw.SetViewport(0,0,16,8,0,1);
 		draw.SetScissor(0,0,16,8);
+		bool split_rejected=false;
 		for (unsigned k = 0; k < max_draws; ++k) {
+			try {
 			const bool last = legacy_split || k + 1 == max_draws;
 			if (indexed) draw.DrawIndexedIndirect(Libs::Graphics::Prospero::PrimitiveType::kTriList, MTLIndexTypeUInt16,
 			                                      index_buffer, 16, arguments, k * MetalMultiDrawIndirect::RecordBytes, last);
 			else draw.DrawIndirect(rect ? Libs::Graphics::Prospero::PrimitiveType::kRectList : Libs::Graphics::Prospero::PrimitiveType::kTriList,
 			                       draw_arguments, k * (rect ? MetalRectListIndirect::RecordBytes : MetalMultiDrawIndirect::RecordBytes), last);
+			} catch (const std::runtime_error&) { if (!legacy_split) throw; split_rejected=true; }
 		}
 		context.CommitCommandBuffer(false);
 		[command waitUntilCompleted];
@@ -426,7 +440,7 @@ static unsigned MultiDrawIndirect(id<MTLDevice> device) {
 			const uint8_t expected[] = {0, uint8_t((expected_sides & (x < 8 ? 1 : 2)) ? 255 : 0), 0, 255};
 			pixel_bad += std::memcmp(pixels+(y*16+x)*4,expected,4) != 0;
 		}
-		if (legacy_split) { if (bad || pixel_bad != 64) ++failures; }
+		if (legacy_split) { if (!split_rejected || bad || pixel_bad != 64) ++failures; }
 		else failures += bad + pixel_bad;
 		std::printf("MDI case %u%s: indexed=%d GPU count=%u sides=%u metadata_bad=%u pixels_bad=%u\n",
 		            test, legacy_split ? " legacy split control" : "", indexed, input[16], expected_sides, bad, pixel_bad);
@@ -448,7 +462,7 @@ static unsigned MultiDrawIndirect(id<MTLDevice> device) {
 		context.CommitCommandBuffer(true);
 		if (!args || command.status == MTLCommandBufferStatusError) return failures + 1;
 		const auto* data = static_cast<const uint32_t*>(args.contents);
-		const uint32_t expected = instances > 65536u ? 1u : instances;
+		const uint32_t expected = instances;
 		bool bad = false;
 		for (unsigned k = 0; k < 2; ++k) bad |= data[k*16+1] != expected || data[k*16+9] != instances;
 		instance_failures += bad;
@@ -466,11 +480,22 @@ static unsigned MultiDrawIndirect(id<MTLDevice> device) {
 	return failures;
 }
 
+#include "metalMipPassTests.inc"
+#include "metalDepthMemoryPassTests.inc"
+#include "metalDepthBoundsTests.inc"
+#include "metalReadOnlyDepthTests.inc"
+#include "metalAttachmentArrayTests.inc"
+#include "metalMeshPipelineTests.inc"
+
 int main(int argc, char** argv) {
 	@autoreleasepool {
 		using namespace Libs::Graphics::Metal;
 		id<MTLDevice> device = MetalContext::Instance().GetDevice();
 		if (!device) { std::fprintf(stderr, "Metal GPU unavailable\n"); return 1; }
+		if (argc > 1 && std::strcmp(argv[1], "--depth-bounds") == 0) return NativeDepthBoundsTests(device)?1:0;
+		if (argc > 1 && std::strcmp(argv[1], "--depth-memory") == 0) return DepthMemoryPassTests(device)?1:0;
+		if (argc > 1 && std::strcmp(argv[1], "--mip") == 0) return (MipPassTransfers(device)+GraphicsImageWritebackTests(device)) ? 1 : 0;
+		if (argc > 1 && std::strcmp(argv[1], "--mesh") == 0) return NativeMeshPipeline(device) ? 1 : 0;
 		if (argc > 1 && std::strcmp(argv[1], "--multi-draw") == 0) return MultiDrawIndirect(device) ? 1 : 0;
 		NSError* error = nil;
 		NSString* source = @"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -562,7 +587,19 @@ int main(int argc, char** argv) {
 		std::printf("Fragment color exports: legacy depth-only PSO rejected; 2 GPU cases, %u failures (depth written/color preserved, color blend retained)\n", failures);
 		failures += MultipleTargets(device, manager, vertex, [library newFunctionWithName:@"mrt"]);
 		failures += StencilMasking(device, manager, vertex, library);
+		failures += StencilXor(device, manager, vertex, library);
+		failures += StrictPipelineContracts(manager);
+		failures += PixelShaderActivationTests(device, manager);
+		failures += GuestViewportArray(device, manager);
+		failures += ReadOnlyDepth(device, manager, vertex, depth_only);
+		failures += AttachmentArrays(device, manager);
 		failures += ComputeIndirect(device);
 		return failures ? 1 : 0;
 	}
+}
+
+namespace Common {
+int DbgExitHandler(const char*, int, std::string_view message) { throw std::runtime_error(std::string(message)); }
+int DbgExitIfHandler(const char* s,const char*,int) { throw std::runtime_error(s); }
+void DbgExit(int) { throw std::runtime_error("pipeline test assertion"); }
 }

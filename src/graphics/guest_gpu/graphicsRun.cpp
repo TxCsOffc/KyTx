@@ -869,7 +869,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 				// Recorded earlier in this stream with the value the wait needs: stream order
 				// already guarantees it. Order the label write before what follows, then go on.
 #if defined(__APPLE__)
-				if (Metal::UseNativeMetalBackend() && std::getenv("KYTY_NO_WBO_SHORTCUT") == nullptr) {
+				static const bool s_no_wbo_shortcut = std::getenv("KYTY_NO_WBO_SHORTCUT") != nullptr;
+				if (Metal::UseNativeMetalBackend() && !s_no_wbo_shortcut) {
 					g_wait_by_order_count.fetch_add(1, std::memory_order_relaxed);
 					return;
 				}
@@ -1037,7 +1038,10 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 			}
 		}
 	}
-	if (std::getenv("KYTY_LOG_DMA") != nullptr && dst_sel != 1 && src_sel != 1) {
+	static const bool s_env_log_dma = std::getenv("KYTY_LOG_DMA") != nullptr;
+	static const bool s_env_log_gds = std::getenv("KYTY_LOG_GDS") != nullptr;
+	static const bool s_env_msl_gds = std::getenv("KYTY_MSL_GDS") != nullptr;
+	if (s_env_log_dma && dst_sel != 1 && src_sel != 1) {
 		static std::atomic<uint32_t> s_dma_n {0};
 		if (s_dma_n.fetch_add(1) < 80) {
 			std::fprintf(stderr, "[Dma] src_sel=%u dst_sel=%u src=0x%llx dst=0x%llx bytes=%u\n", static_cast<unsigned>(src_sel),
@@ -1045,7 +1049,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 			             static_cast<unsigned long long>(dst_address_or_offset), num_bytes);
 		}
 	}
-	if (std::getenv("KYTY_LOG_GDS") != nullptr && (dst_sel == 1 || src_sel == 1)) {
+	if (s_env_log_gds && (dst_sel == 1 || src_sel == 1)) {
 		static std::atomic<uint32_t> s_gds_dma {0};
 		if (s_gds_dma.fetch_add(1) < 40) {
 			std::fprintf(stderr, "[GdsDma] src_sel=%u dst_sel=%u src=0x%llx dst=0x%llx bytes=%u\n", static_cast<unsigned>(src_sel),
@@ -1053,7 +1057,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 			             static_cast<unsigned long long>(dst_address_or_offset), num_bytes);
 		}
 	}
-	if (Metal::UseNativeMetalBackend() && std::getenv("KYTY_MSL_GDS") != nullptr && (dst_sel == 1 || src_sel == 1)) {
+	if (Metal::UseNativeMetalBackend() && s_env_msl_gds && (dst_sel == 1 || src_sel == 1)) {
 		if (src_sel == 2) {
 			Metal::GdsFill(dst_address_or_offset, num_bytes, static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu));
 		} else {
@@ -1452,7 +1456,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
-		if (std::getenv("KYTY_TRACE_PM4") && Libs::Graphics::TraceWindow::Active()) {
+		// getenv scans the whole environment on every call, and this is the loop over every PM4 packet of every frame.
+		static const bool s_trace_pm4 = std::getenv("KYTY_TRACE_PM4") != nullptr;
+		if (s_trace_pm4 && Libs::Graphics::TraceWindow::Active()) {
 			std::fprintf(stderr, "[Pm4] op=0x%02x len=%u\n", opcode, KYTY_PM4_LEN(packet_header));
 		}
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
@@ -1632,7 +1638,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
-	if (std::getenv("KYTY_TRACE_EARLY") && Libs::Graphics::TraceWindow::Active()) { std::fprintf(stderr, "[CpDraw] DrawIndex\n"); }
+	static const bool s_trace_early = std::getenv("KYTY_TRACE_EARLY") != nullptr;
+	if (s_trace_early && Libs::Graphics::TraceWindow::Active()) { std::fprintf(stderr, "[CpDraw] DrawIndex\n"); }
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0 && args.offset_source != DrawOffsetSource::IndirectArgs) {
 		args.instance_count = m_num_instances;
@@ -1658,7 +1665,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 #if defined(__APPLE__)
 	if (Metal::UseNativeMetalBackend()) {
 		if (m_sh_ctx.GetVs().es_regs.data_addr == 0 || args.index_count == 0) {
-			if (std::getenv("KYTY_TRACE_EARLY") && Libs::Graphics::TraceWindow::Active()) {
+			if (s_trace_early && Libs::Graphics::TraceWindow::Active()) {
 				std::fprintf(stderr, "[MetalDrop] DrawIndex es_addr0=%d index_count=%u\n",
 				             m_sh_ctx.GetVs().es_regs.data_addr == 0 ? 1 : 0, args.index_count);
 			}
@@ -2457,9 +2464,20 @@ static bool BarrierCoalesceEnabled() {
 	return enabled;
 }
 
+void CommandProcessor::AcquireMem(const Pm4::AcquireMemInfo& info) {
+#if defined(__APPLE__)
+	if (Metal::UseNativeMetalBackend()) {
+		Metal::MetalRenderer::Instance().MemoryBarrier(&info);
+		return;
+	}
+#endif
+	EmitGlobalBarrier();
+}
+
 void CommandProcessor::EmitGlobalBarrier() {
 #if defined(__APPLE__)
 	if (Metal::UseNativeMetalBackend()) {
+		Metal::MetalRenderer::Instance().MemoryBarrier();
 		return;
 	}
 #endif

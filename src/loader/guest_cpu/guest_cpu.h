@@ -32,6 +32,11 @@ constexpr bool IsEmulated() { return KYTY_GUEST_CPU_EMULATED != 0; }
 // Exits the process if FEX cannot be initialised.
 void Init();
 
+// KYTY_FEX_TRACE_TRIGGER=<file>: when the file appears (it is removed; polled from the flip tick, at most every 200 ms) the next
+// KYTY_FEX_TRACE_BURST (default 20000) guest->host calls print their begin and end lines ("[fex] HLE #n -> ..." / "<- ..."), the way the first
+// KYTY_FEX_TRACE calls do at start. A terminal `touch` therefore records the start and the end of every host call for about one frame.
+void TraceBurstPoll();
+
 // Run the guest function at `entry` on the calling host thread with SysV integer arguments
 // (at most 6 are passed in registers; the rest are not supported) and return guest RAX.
 // `guest_stack_top`: when non-zero, guest RSP starts there (16-byte aligned by the callee);

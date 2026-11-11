@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "loader/guest_cpu/guest_cpu.h"
+
 namespace Libs::Graphics::TraceWindow {
 
 // KYTY_TRACE_FRAMES=<first>:<last-exclusive>: draw traces (KYTY_BIND_TRACE) are emitted only
@@ -34,6 +36,9 @@ inline uint64_t NextDraw() { return g_draw_in_frame.fetch_add(1, std::memory_ord
 inline void OnFlip() {
 	const uint64_t f = g_flip.fetch_add(1, std::memory_order_relaxed);
 	g_draw_in_frame.store(0, std::memory_order_relaxed);
+#if KYTY_GUEST_CPU_EMULATED
+	Loader::GuestCpu::TraceBurstPoll();
+#endif
 	static const bool s_mark = std::getenv("KYTY_TRACE_PM4") != nullptr;
 	if (s_mark) std::fprintf(stderr, "[Flip] %llu\n", static_cast<unsigned long long>(f));
 }

@@ -5,4 +5,4 @@ secs=${1:-60}; shift
 cd /Users/tx/Developer/fex-spike/runs
 env KYTY_MSL_ONLY=1 KYTY_BACKEND=metal KYTY_VIDEO_OUT_1080P=1 KYTY_NP_STATE=signed_in KYTY_LABEL_FLUSH=lazy \
     KYTY_WAIT_RETRY_ELIDE=1 KYTY_WAIT_BY_ORDER=1 KYTY_UMA_READBACK=1 "$@" \
-    timeout "$secs" /Users/tx/Developer/KyTx/_Build/macos-arm64/kyty_emulator --game /Users/tx/Developer/PPSA34015
+    timeout "$secs" /bin/bash /Users/tx/Developer/KyTx/tools/with_resource_budget.sh /Users/tx/Developer/KyTx/_Build/macos-arm64/kyty_emulator --game /Users/tx/Developer/PPSA34015

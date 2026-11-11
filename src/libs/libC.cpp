@@ -683,6 +683,19 @@ char* KYTY_SYSV_ABI strcpy(char* dest, const char* src) {
 	return ::strcpy(dest, src);
 }
 
+int KYTY_SYSV_ABI strcpy_s(char* dest, size_t size, const char* src) {
+	if (dest==nullptr || size==0 || size>SIZE_MAX/2) return Posix::POSIX_EINVAL;
+	const auto fail=[&](int error) { dest[0]='\0'; return error; };
+	if (src==nullptr) return fail(Posix::POSIX_EINVAL);
+	size_t length=0;
+	while (length<size && src[length]!='\0') ++length;
+	if (length==size) return fail(Posix::POSIX_ERANGE);
+	const auto d=reinterpret_cast<uintptr_t>(dest), s=reinterpret_cast<uintptr_t>(src);
+	if ((s>=d && s-d<size) || (d>=s && d-s<=length)) return fail(Posix::POSIX_EINVAL);
+	std::memcpy(dest,src,length+1);
+	return 0;
+}
+
 char* KYTY_SYSV_ABI strncpy(char* dest, const char* src, size_t count) {
 	return ::strncpy(dest, src, count);
 }
@@ -785,10 +798,11 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("Q3VBxCXhUHs", LibcInternal::memcpy);
 	LIB_FUNC("+P6FRGH4LfA", LibcInternal::memmove);
 	LIB_FUNC("DfivPArhucg", LibcInternal::memcmp);
-	LIB_FUNC("aesyjrHVWy4", LibcInternal::strcmp);
-	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strncmp);
+	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strcmp);
+	LIB_FUNC("aesyjrHVWy4", LibcInternal::strncmp);
 	LIB_FUNC("j4ViWNHEgww", LibcInternal::strlen);
-	LIB_FUNC("5Xa2ACNECdo", LibcInternal::strcpy);
+	LIB_FUNC("kiZSXIWd9vg", LibcInternal::strcpy);
+	LIB_FUNC("5Xa2ACNECdo", LibcInternal::strcpy_s);
 	LIB_FUNC("6sJWiWSRuqk", LibcInternal::strncpy);
 	LIB_FUNC("Ls4tzzhimqQ", LibcInternal::strcat);
 	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);

@@ -158,7 +158,7 @@ sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_
 	auto   wide   = file_name.wstring();
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_POSIX, nullptr, OPEN_EXISTING,
-	                     GetCacheAccessType(cache_type), nullptr);
+	                     GetCacheAccessType(cache_type) | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
 
 	if (h_file == INVALID_HANDLE_VALUE) {
 		ret->type = SYS_FILE_ERROR;

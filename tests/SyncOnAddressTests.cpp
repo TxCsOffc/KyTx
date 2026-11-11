@@ -12,8 +12,10 @@
 
 namespace {
 
+using Libs::LibKernel::SyncOnAddress::Wait16;
 using Libs::LibKernel::SyncOnAddress::Wait32;
 using Libs::LibKernel::SyncOnAddress::Wait64;
+using Libs::LibKernel::SyncOnAddress::Wait8;
 using Libs::LibKernel::SyncOnAddress::Wake;
 
 std::atomic<int> g_signal_poll_count{0};
@@ -285,6 +287,43 @@ void TestWakeZeroIsNoOp() {
   }
 }
 
+// Byte and halfword cells (sceKernelSyncOnAddressWait8/16): only the cell is compared, never the 32-bit word around it.
+void TestNarrowCells() {
+  alignas(4) uint8_t bytes[4] = {0x11, 0x22, 0x33, 0x44};
+  uint32_t timeout = 20000;
+  Check(Wait8(&bytes[0], 0x12, &timeout) == OK, "wait8 mismatch returns at once");
+  Check(Wait8(&bytes[3], 0x44, &timeout) == Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+        "wait8 on a matching byte times out");
+  Check(Wait8(&bytes[3], 0x00, &timeout) == OK, "wait8 compares one byte only");
+  auto *halves = reinterpret_cast<uint16_t *>(bytes);
+  Check(Wait16(&halves[1], 0x4433, &timeout) == Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+        "wait16 on a matching halfword times out");
+  Check(Wait16(&halves[1], 0x3344, &timeout) == OK, "wait16 compares exactly the halfword");
+  Check(Wait16(reinterpret_cast<uint16_t *>(bytes + 1), 0, &timeout) ==
+            Libs::LibKernel::KERNEL_ERROR_EINVAL,
+        "wait16 rejects a misaligned halfword");
+  Check(Wait8(nullptr, 0, &timeout) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+        "wait8 rejects a null address");
+
+  // A change of the cell plus a wake on its (word-aligned) address releases the waiter.
+  alignas(4) uint8_t flag[4] = {0, 0, 0, 0};
+  timeout = 1000000;
+  std::atomic<bool> ready{false};
+  int result = Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
+  std::thread waiter([&] {
+    ready.store(true, std::memory_order_release);
+    result = Wait8(&flag[0], 0, &timeout);
+  });
+  while (!ready.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  Store(&flag[0], uint8_t{1});
+  Check(Wake(&flag[0], 1) == OK, "wake of a byte cell succeeds");
+  waiter.join();
+  Check(result == OK, "a byte change plus wake releases the wait8 waiter");
+}
+
 } // namespace
 
 int main() {
@@ -297,6 +336,7 @@ int main() {
   TestAddressesAreIsolated();
   TestCompareRegisterWakeRace();
   TestWakeZeroIsNoOp();
+  TestNarrowCells();
   std::printf("SyncOnAddressTests: all passed\n");
   return 0;
 }

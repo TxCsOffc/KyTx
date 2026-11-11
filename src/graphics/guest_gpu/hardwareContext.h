@@ -492,12 +492,26 @@ struct CsStageRegisters {
 	uint8_t  shared_vgprs              = 0;
 };
 
+// Separate front-stage allocation state must survive PM4 updates and shader
+// state copies. Preserve the complete word, including fields not used by Metal's
+// own physical register allocator; never replace it with the GS/HS back word.
+struct FrontShaderResource1 {
+	uint32_t raw = 0;
+	bool programmed = false;
+	[[nodiscard]] uint32_t VgprBlocks() const { return raw&0x3fu; }
+	[[nodiscard]] uint32_t SgprBlocks() const { return (raw>>6)&0xfu; }
+	[[nodiscard]] uint32_t FloatMode() const { return (raw>>12)&0xffu; }
+	[[nodiscard]] uint32_t VgprComponentCount() const { return (raw>>24)&3u; }
+};
+
 struct EsStageRegisters {
 	uint64_t data_addr = 0;
+	FrontShaderResource1 rsrc1;
 };
 
 struct LsStageRegisters {
 	uint64_t data_addr = 0;
+	FrontShaderResource1 rsrc1;
 };
 
 struct HsStageRegisters {
@@ -1006,6 +1020,8 @@ public:
 
 	void SetEsShaderBase(uint64_t addr) { m_vs.es_regs.data_addr = addr; }
 	void SetLsShaderBase(uint64_t addr) { m_vs.ls_regs.data_addr = addr; }
+	void SetEsShaderResource1(uint32_t value) { m_vs.es_regs.rsrc1={value,true}; }
+	void SetLsShaderResource1(uint32_t value) { m_vs.ls_regs.rsrc1={value,true}; }
 	void SetHsShaderBase(uint64_t addr) { m_vs.hs_regs.data_addr = addr; }
 	void SetHsUserDataAddress(uint32_t word, uint32_t value) {
 		SetUserDataAddressWord(m_vs.hs_regs.user_data_addr, word, value);

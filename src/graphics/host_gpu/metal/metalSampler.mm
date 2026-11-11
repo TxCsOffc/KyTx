@@ -7,6 +7,11 @@
 
 namespace Libs::Graphics::Metal {
 
+bool SupportsNativeDepthCompare(MTLPixelFormat format) {
+	return format == MTLPixelFormatR32Float || format == MTLPixelFormatDepth16Unorm ||
+	       format == MTLPixelFormatDepth32Float || format == MTLPixelFormatDepth32Float_Stencil8;
+}
+
 static MTLSamplerAddressMode AddressMode(uint8_t mode) {
 	switch (static_cast<Prospero::SamplerClampMode>(mode)) {
 		case Prospero::SamplerClampMode::kWrap: return MTLSamplerAddressModeRepeat;
@@ -23,7 +28,7 @@ static MTLSamplerAddressMode AddressMode(uint8_t mode) {
 	return MTLSamplerAddressModeClampToEdge;
 }
 
-MTLSamplerDescriptor* MakeSamplerDescriptor(const ShaderSamplerResource& r) {
+MTLSamplerDescriptor* MakeSamplerDescriptor(const ShaderSamplerResource& r, bool comparison_point) {
 	MTLSamplerDescriptor* d = [[MTLSamplerDescriptor alloc] init];
 	d.supportArgumentBuffers = YES;
 	d.minFilter = (r.XyMinFilter() & 1u) != 0 ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -39,6 +44,12 @@ MTLSamplerDescriptor* MakeSamplerDescriptor(const ShaderSamplerResource& r) {
 	d.maxAnisotropy = (r.XyMinFilter() >= 2 || r.XyMagFilter() >= 2)
 	                      ? 1u << std::min<uint32_t>(r.MaxAnisoRatio(), 4u) : 1u;
 	d.compareFunction = static_cast<MTLCompareFunction>(r.DepthCompareFunc());
+	if (@available(macOS 26.0, *)) {
+		// S# FILTER_MODE selects weighted average, minimum or maximum.
+		// Comparison footprints perform their own weighted 0/1 interpolation.
+		if (!comparison_point && r.FilterMode() <= 2)
+			d.reductionMode = static_cast<MTLSamplerReductionMode>(r.FilterMode());
+	}
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
 		case Prospero::SamplerBorderColor::kOpaqueBlack: d.borderColor = MTLSamplerBorderColorOpaqueBlack; break;
 		case Prospero::SamplerBorderColor::kOpaqueWhite: d.borderColor = MTLSamplerBorderColorOpaqueWhite; break;
@@ -50,6 +61,9 @@ MTLSamplerDescriptor* MakeSamplerDescriptor(const ShaderSamplerResource& r) {
 	}
 	// Pixel-coordinate samplers cannot use mipmaps or anisotropy in Metal.
 	if (r.ForceUnormCoords()) {
+		// Metal requires identical min/mag filters for pixel coordinates.
+		// This path has LOD zero, hence the guest's magnification filter.
+		d.minFilter = d.magFilter;
 		d.sAddressMode = MTLSamplerAddressModeClampToEdge;
 		d.tAddressMode = MTLSamplerAddressModeClampToEdge;
 		d.rAddressMode = MTLSamplerAddressModeClampToEdge;
@@ -60,18 +74,29 @@ MTLSamplerDescriptor* MakeSamplerDescriptor(const ShaderSamplerResource& r) {
 		d.compareFunction = MTLCompareFunctionNever;
 		if (@available(macOS 26.0, *)) d.lodBias = 0.0f;
 	}
+	if (comparison_point) {
+		// Fetch one texel at an explicitly chosen mip. PCF must compare each
+		// texel, rather than compare an already filtered depth value.
+		d.minFilter = d.magFilter = MTLSamplerMinMagFilterNearest;
+		d.mipFilter = r.ForceUnormCoords() ? MTLSamplerMipFilterNotMipmapped : MTLSamplerMipFilterNearest;
+		d.lodMinClamp = 0.0f;
+		d.lodMaxClamp = r.ForceUnormCoords() ? 0.0f : 16.0f;
+		d.maxAnisotropy = 1;
+		d.compareFunction = MTLCompareFunctionNever;
+		if (@available(macOS 26.0, *)) d.lodBias = 0.0f;
+	}
 	return d;
 }
 
-id<MTLSamplerState> GetSampler(id<MTLDevice> device, const ShaderSamplerResource& resource) {
+id<MTLSamplerState> GetSampler(id<MTLDevice> device, const ShaderSamplerResource& resource, bool comparison_point) {
 	if (device == nil) return nil;
-	using Key = std::array<uint32_t, 4>;
+	using Key = std::array<uint32_t, 5>;
 	static std::mutex mutex;
 	static std::map<Key, id<MTLSamplerState>> cache;
-	const Key key {resource.fields[0], resource.fields[1], resource.fields[2], resource.fields[3]};
+	const Key key {resource.fields[0], resource.fields[1], resource.fields[2], resource.fields[3], comparison_point ? 1u : 0u};
 	std::lock_guard lock(mutex);
 	if (const auto it = cache.find(key); it != cache.end()) return it->second;
-	id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:MakeSamplerDescriptor(resource)];
+	id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:MakeSamplerDescriptor(resource, comparison_point)];
 	if (sampler != nil) cache.emplace(key, sampler);
 	return sampler;
 }

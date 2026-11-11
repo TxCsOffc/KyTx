@@ -191,6 +191,8 @@ private:
 	void S_FLBIT_I32_B64(const Decoder::Instruction& inst);
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
+	void V_LERP_U8(const Decoder::Instruction& inst);
+	void V_SUBWORD_SAD(const Decoder::Instruction& inst, uint32_t bits, uint32_t shift);
 	void V_SAD_U32(const Decoder::Instruction& inst);
 	void V_ADD3_U32(const Decoder::Instruction& inst);
 	void S_BITSET_B32(const Decoder::Instruction& inst, bool set);

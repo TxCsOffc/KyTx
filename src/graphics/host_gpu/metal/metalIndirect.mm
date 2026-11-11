@@ -11,7 +11,6 @@ namespace Libs::Graphics::Metal {
 
 // The shared output buffers of the argument converters, for KytyDescribeIndirectArguments (read by the GPU watchdog thread).
 static std::atomic<void*>    s_compute_args {nullptr};
-static std::atomic<void*>    s_compute_guard {nullptr}; // [0] = dispatches zeroed by the total-groups guard, [1..4] = last one's seq and raw counts
 static std::atomic<void*>    s_mdi_args {nullptr};
 static std::atomic<uint32_t> s_mdi_count {0};
 // Every compute-indirect prepare writes its sequence number into dword 7 of the snapshot; the caller records what that dispatch was.
@@ -79,7 +78,7 @@ id<MTLBuffer> MetalRectListIndirect::Encode(id<MTLCommandBuffer> command, id<MTL
 
 id<MTLBuffer> MetalComputeIndirect::Encode(id<MTLCommandBuffer> command, id<MTLBuffer> source,
                                          NSUInteger offset, MTLSize guest_threads,
-                                         bool thread_dimensions, uint32_t max_groups) {
+                                         bool thread_dimensions) {
 	if (!command || !source || offset % 4 != 0 || offset > source.length ||
 	    source.length - offset < 12 || guest_threads.width == 0 ||
 	    guest_threads.height == 0 || guest_threads.depth == 0 ||
@@ -89,24 +88,17 @@ id<MTLBuffer> MetalComputeIndirect::Encode(id<MTLCommandBuffer> command, id<MTLB
 	if (!m_pipeline) {
 		NSString* code = @"#include <metal_stdlib>\nusing namespace metal;\n"
 		    "kernel void compute_args(device const uint* src [[buffer(0)]], device uint* dst [[buffer(1)]],\n"
-		    "                         constant uint* cfg [[buffer(2)]], device uint* guard [[buffer(3)]],\n"
+		    "                         constant uint* cfg [[buffer(2)]],\n"
 		    "                         uint i [[thread_position_in_grid]]) {\n"
 		    " if (i >= 3u) return;\n"
-		    " dst[7] = cfg[5];\n"
+		    " dst[7] = cfg[4];\n"
 		    " uint c[3];\n"
 		    " for (uint k = 0u; k < 3u; ++k) {\n"
 		    "   uint n = src[k]; if (k == i) dst[k+4] = n;\n"
 		    "   if (cfg[3]) n = n / cfg[k] + uint(n % cfg[k] != 0u);\n"
-		    "   c[k] = min(n, cfg[4]);\n"
+		    "   c[k] = n;\n"
 		    " }\n"
-		    // A grid this large is never real work: arguments that are all ones (0xFFFFFFFF, 1.0f) are image pixels or stale memory where the
-		    // producer's counts should be, and clamping them per axis still leaves up to 65535^3 groups (a GPU hang). No groups instead.
-		    " ulong total = ulong(c[0]) * ulong(c[1]) * ulong(c[2]);\n"
-		    " bool bad = cfg[6] != 0u && total > ulong(cfg[6]);\n"
-		    // Count the firings and keep the last one's raw arguments; the CPU polls this buffer (KytyPollIndirectGuard).
-		    " if (bad && i == 0u) { atomic_fetch_add_explicit((device atomic_uint*)&guard[0], 1u, memory_order_relaxed);\n"
-		    "   guard[1] = cfg[5]; guard[2] = src[0]; guard[3] = src[1]; guard[4] = src[2]; }\n"
-		    " dst[i] = bad ? 0u : c[i];\n}\n";
+		    " dst[i] = c[i];\n}\n";
 		NSError* error = nil;
 		id<MTLLibrary> library = [device newLibraryWithSource:code options:nil error:&error];
 		id<MTLFunction> function = [library newFunctionWithName:@"compute_args"];
@@ -122,15 +114,6 @@ id<MTLBuffer> MetalComputeIndirect::Encode(id<MTLCommandBuffer> command, id<MTLB
 		s_compute_args.store((__bridge void*)m_output);
 	}
 	if (!m_output) return nil;
-	if (!m_guard) {
-		m_guard = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
-		if (m_guard) {
-			std::memset(m_guard.contents, 0, m_guard.length);
-			m_guard.label = @"Compute indirect guard counter";
-			s_compute_guard.store((__bridge void*)m_guard);
-		}
-	}
-	if (!m_guard) return nil;
 	id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
 	if (!encoder) return nil;
 	OrderBegin(encoder);
@@ -138,14 +121,8 @@ id<MTLBuffer> MetalComputeIndirect::Encode(id<MTLCommandBuffer> command, id<MTLB
 	[encoder setComputePipelineState:m_pipeline];
 	[encoder setBuffer:source offset:offset atIndex:0];
 	[encoder setBuffer:m_output offset:0 atIndex:1];
-	[encoder setBuffer:m_guard offset:0 atIndex:3];
-	// KYTY_MAX_INDIRECT_TOTAL_GROUPS: most groups one indirect dispatch may run (default 4Mi; real games stay far below, 0 = unlimited).
-	static const uint32_t total_cap = [] {
-		const char* value = std::getenv("KYTY_MAX_INDIRECT_TOTAL_GROUPS");
-		return value && *value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : (1u << 22);
-	}();
 	const uint32_t config[] = {uint32_t(guest_threads.width), uint32_t(guest_threads.height),
-	                          uint32_t(guest_threads.depth), uint32_t(thread_dimensions), max_groups, ++s_compute_seq, total_cap};
+	                          uint32_t(guest_threads.depth), uint32_t(thread_dimensions), ++s_compute_seq};
 	[encoder setBytes:config length:sizeof(config) atIndex:2];
 	[encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(3, 1, 1)];
 	OrderEnd(encoder);
@@ -181,10 +158,6 @@ id<MTLBuffer> MetalMultiDrawIndirect::Encode(id<MTLCommandBuffer> command, id<MT
 		    "   if (start >= cfg[4]) { dst[out] = 0u; dst[out+2u] = 0u; }\n"
 		    "   else dst[out] = min(dst[out], cfg[4] - start);\n"
 		    " }\n"
-		    // Match CommandProcessor's existing direct/legacy guard on the GPU.
-		    // A truncated producer can leave random billions in instanceCount;
-		    // the original snapshot must retain that evidence, while zero stays zero.
-		    " if (dst[out+1u] > 65536u) dst[out+1u] = 1u;\n"
 		    " if (i >= n) dst[out+1u] = 0u;\n"
 		    "}\n";
 		NSError* error = nil;
@@ -222,51 +195,6 @@ id<MTLBuffer> MetalMultiDrawIndirect::Encode(id<MTLCommandBuffer> command, id<MT
 	return m_output;
 }
 
-// One line when the guard fired since the last call (the watchdog thread polls once a second), empty otherwise.
-std::string KytyPollIndirectGuard() {
-	static uint32_t s_seen = 0;
-	void* p = s_compute_guard.load();
-	if (!p) return {};
-	const volatile uint32_t* g = static_cast<const volatile uint32_t*>(((__bridge id<MTLBuffer>)p).contents);
-	const uint32_t count = g[0];
-	if (count == s_seen) return {};
-	s_seen = count;
-	const uint32_t seq = g[1], x = g[2], y = g[3], z = g[4];
-	char line[768];
-	const ComputeIndirectNote& n = s_compute_notes[seq % kComputeNotes];
-	if (n.seq == seq) {
-		// What the guest memory around the arguments holds now (guest addresses are host addresses); only inside one page, so it cannot fault.
-		char memory[160] = "";
-		const uint64_t a = n.addr;
-		if ((a & 3u) == 0 && (a & 0xFFFu) >= 16 && (a & 0xFFFu) + 12 + 16 <= 0x1000) {
-			const volatile uint32_t* m = reinterpret_cast<const volatile uint32_t*>(a);
-			std::snprintf(memory, sizeof(memory), " memory now: [%08x %08x %08x %08x] <%08x %08x %08x> [%08x %08x %08x %08x]", m[-4], m[-3], m[-2], m[-1],
-			              m[0], m[1], m[2], m[3], m[4], m[5], m[6]);
-		}
-		// CPU writes by the command processor over these bytes (KYTY_TRACE_CP_WRITES=1): "+N" = issued N ticks after the dispatch was encoded, "-N" = before.
-		char writes[240] = "";
-		if (Libs::Graphics::CpTraceEnabled()) {
-			const Libs::Graphics::CpWriteNote* ring = Libs::Graphics::CpTraceRing();
-			const uint32_t now = Libs::Graphics::CpTraceClock().load();
-			size_t used = 0;
-			int found = 0;
-			for (uint32_t back = 0; back < Libs::Graphics::kCpWriteRing && back <= now && found < 4; ++back) {
-				const Libs::Graphics::CpWriteNote& w = ring[(now - back) % Libs::Graphics::kCpWriteRing];
-				if (w.clock != now - back || w.bytes == 0 || w.addr >= n.addr + 12 || w.addr + w.bytes <= n.addr) continue;
-				const long delta = static_cast<long>(w.clock) - static_cast<long>(n.clock);
-				used += std::snprintf(writes + used, sizeof(writes) - used, " %s%+ld first=%08x len=0x%llx;", w.kind, delta, w.first, (unsigned long long)w.bytes);
-				++found;
-				if (used >= sizeof(writes) - 60) break;
-			}
-			if (found == 0) std::snprintf(writes, sizeof(writes), " no CP write over the args in the last %u ticks;", Libs::Graphics::kCpWriteRing);
-		}
-		std::snprintf(line, sizeof(line), "[IndirectGuard] %u indirect dispatches zeroed so far; last seq=%u cs=0x%016llx args=0x%llx raw=%u,%u,%u covered by: %s;%s%s", count, seq,
-		              (unsigned long long)n.hash, (unsigned long long)n.addr, x, y, z, n.cover[0] ? n.cover : "(no GPU surface)", memory, writes);
-	} else
-		std::snprintf(line, sizeof(line), "[IndirectGuard] %u indirect dispatches zeroed so far; last seq=%u raw=%u,%u,%u", count, seq, x, y, z);
-	return line;
-}
-
 std::string KytyDescribeIndirectArguments() {
 	std::string out;
 	char line[320];
@@ -297,3 +225,38 @@ std::string KytyDescribeIndirectArguments() {
 }
 
 } // namespace Libs::Graphics::Metal
+
+namespace Libs::Graphics::Metal {
+id<MTLBuffer> MetalMeshIndirect::Encode(id<MTLCommandBuffer> command, id<MTLBuffer> source, NSUInteger offset,
+                                       uint32_t count, uint32_t stride, bool indexed, uint32_t index_bytes,
+                                       uint32_t primitive_size, uint32_t primitive_step, uint32_t primitives_per_group) {
+	const uint32_t input_bytes = indexed ? 20u : 16u;
+	if (!command || !source || count == 0 || stride < input_bytes || stride % 4 || offset % 4 ||
+	    offset > source.length || uint64_t(count - 1) * stride + input_bytes > source.length - offset ||
+	    primitive_size == 0 || primitive_step == 0 || primitives_per_group == 0 ||
+	    (indexed && index_bytes != 2 && index_bytes != 4)) return nil;
+	auto device = command.device;
+	if (!m_pipeline) {
+		NSString* code = @"#include <metal_stdlib>\nusing namespace metal;\n"
+		"kernel void mesh_args(device const uint* src [[buffer(0)]], device uint* dst [[buffer(1)]], constant uint* c [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n"
+		" if (i >= c[0]) return; uint p=i*c[1], q=i*16u; uint n=src[p], instances=src[p+1];\n"
+		" uint primitives=n<c[4]?0u:(n-c[4])/c[5]+1u; uint groups=primitives/c[6]+uint(primitives%c[6]!=0u);\n"
+		" dst[q]=groups; dst[q+1]=instances; dst[q+2]=1u; dst[q+3]=0u;\n"
+		" dst[q+4]=n; dst[q+5]=src[p+(c[2]?3u:2u)]; dst[q+6]=src[p+(c[2]?4u:3u)];\n"
+		" dst[q+7]=c[2]?c[3]:0u; dst[q+8]=c[2]?src[p+2]:0u;\n"
+		" for(uint k=9;k<16;++k) dst[q+k]=0u;\n}\n";
+		NSError* error=nil;
+		auto library=[device newLibraryWithSource:code options:nil error:&error];
+		auto function=[library newFunctionWithName:@"mesh_args"];
+		if (function) m_pipeline=[device newComputePipelineStateWithFunction:function error:&error];
+		if (!m_pipeline) { std::fprintf(stderr,"[MeshIndirect] %s\n",error.localizedDescription.UTF8String); return nil; }
+	}
+	const NSUInteger bytes=NSUInteger(count)*RecordBytes;
+	if (!m_output || m_output.length < bytes) m_output=[device newBufferWithLength:std::max<NSUInteger>(bytes,4096) options:MTLResourceStorageModePrivate];
+	if (!m_output) return nil;
+	auto encoder=[command computeCommandEncoder];if (!encoder) return nil;
+	OrderBegin(encoder);[encoder setComputePipelineState:m_pipeline];[encoder setBuffer:source offset:offset atIndex:0];[encoder setBuffer:m_output offset:0 atIndex:1];
+	const uint32_t config[]={count,stride/4,uint32_t(indexed),index_bytes,primitive_size,primitive_step,primitives_per_group};
+	[encoder setBytes:config length:sizeof(config) atIndex:2];[encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(std::min(count,64u),1,1)];OrderEnd(encoder);[encoder endEncoding];return m_output;
+}
+}

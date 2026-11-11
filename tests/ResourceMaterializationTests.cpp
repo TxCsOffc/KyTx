@@ -424,6 +424,68 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+void TestCompareSamplerVariantSharesGuestDescriptor() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = MixedSamplerProgram();
+  program.info.images[0].depth_compare = true;
+  auto plain = program.info.images[0];
+  plain.depth_compare = false;
+  program.info.images.push_back(plain);
+  program.info.sampled_pairs.push_back({.image = 2, .sampler = 1});
+  const auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 2> user_data{0x1234u, 0x4567u};
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization), "compare/plain/converted sampler materialization failed");
+  ApplyResourceSpecialization(program, specialization);
+  const auto& samplers = program.info.samplers;
+  const auto& pairs = program.info.sampled_pairs;
+  Check(samplers.size() == 4 && snapshot.samplers.size() == 2 && pairs.size() == 4,
+        "compare, float and converted reads did not receive separate variants");
+  for (const auto& pair : pairs) {
+    const auto& image = program.info.images[pair.image];
+    const auto& sampler = samplers[pair.sampler];
+    Check(sampler.depth_compare == image.depth_compare, "comparison state contaminated an ordinary sampler");
+    if (image.depth_compare) Check(!sampler.integer_border && !sampler.force_point_filtering,
+                                  "comparison sampler inherited integer/point filtering");
+  }
+  Check(pairs[1].sampler != pairs[2].sampler && pairs[1].sampler != pairs[3].sampler && pairs[2].sampler != pairs[3].sampler,
+        "shared guest S# aliases were merged across sampler classes");
+  for (unsigned i : {1u, 2u, 3u}) Check(samplers[pairs[i].sampler].snapshot_index == 1,
+                                     "typed variant lost the original guest descriptor");
+  user_data[1] = 0x7654u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.samplers.size() == 2,
+        "refresh duplicated shared sampler descriptors");
+  for (unsigned i : {1u, 2u, 3u}) Check(snapshot.samplers[samplers[pairs[i].sampler].snapshot_index].dwords[0] == user_data[1],
+                                     "a typed sampler alias retained old S# words");
+}
+
+void TestOffsetPointSamplerVariant() {
+  using namespace Libs::Graphics::ShaderRecompiler;
+  using namespace IR;
+  auto program=MixedSamplerProgram();
+  auto& block=*program.blocks[0];
+  const auto image=Value(&block.AppendNewInst(ValueOpcode::GetImageResource,
+      {Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)},0));
+  const auto sampler=Value(&block.AppendNewInst(ValueOpcode::GetSamplerResource,
+      {Value(0u),Value(0u),Value(0u),Value(0u)},1));
+  const auto address=Value(&block.AppendNewInst(ValueOpcode::MakeImageAddress,
+      {Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)}));
+  program.memory_info.push_back({.kind=ResourceKind::Image,.resource=0,.sampler=1,
+      .image_sample_flags=Decoder::ImageSampleFlagOffset|Decoder::ImageSampleFlagLod,
+      .image_dimension=Decoder::ImageDimension::Dim2D,.image_address_components=4});
+  block.AppendNewInst(ValueOpcode::ImageSampleRaw,{image,sampler,address},0);
+  auto plan=ExtractResourcePlan(program);
+  std::array<uint32_t,2> words{0x1234u,0x5678u};
+  ResourceSnapshot snapshot;ResourceSpecialization key;
+  Check(MaterializeResources(plan,{.user_data=words},snapshot,key),"offset sampler materialization failed");
+  ApplyResourceSpecialization(program,key);
+  Check(program.info.samplers.size()==3 && !program.info.samplers[0].point_fetch &&
+        program.info.samplers[1].point_fetch && !program.info.samplers[2].point_fetch,
+        "point-fetch requirement did not follow the actual typed sampler variant");
+}
+
 void TestDescriptorGatherEvaluation() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -1397,6 +1459,8 @@ int main(int argc, char** argv) {
   TestFiniteImageRefreshReusesScalarReads();
   TestFiniteImageRefreshReusesScalarReads(true);
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestCompareSamplerVariantSharesGuestDescriptor();
+  TestOffsetPointSamplerVariant();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

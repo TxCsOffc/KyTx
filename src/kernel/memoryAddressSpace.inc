@@ -181,6 +181,8 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+	[[nodiscard]] uint64_t MappingGeneration() const { return m_mapping_generation.load(std::memory_order_acquire); }
+
 	bool GetMappings(uint64_t& generation, std::vector<GuestBackingMapping>& mappings) {
 		if (generation == m_mapping_generation.load(std::memory_order_acquire)) return false;
 		std::lock_guard lock(m_mutex);
@@ -763,6 +765,7 @@ public:
 	bool GetBackingMappings(uint64_t& generation, std::vector<GuestBackingMapping>& mappings) {
 		return m_backing->GetMappings(generation, mappings);
 	}
+	[[nodiscard]] uint64_t GetBackingGeneration() const { return m_backing->MappingGeneration(); }
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);

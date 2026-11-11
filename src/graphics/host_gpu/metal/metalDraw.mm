@@ -1,11 +1,17 @@
+#include "graphics/host_gpu/metal/metalDepthBounds.h"
 #include "graphics/host_gpu/metal/metalPassTimer.h"
 #include "graphics/host_gpu/metal/metalOrder.h"
 #include "graphics/host_gpu/metal/metalEnv.h"
+#include "graphics/host_gpu/metal/metalUnsupported.h"
 #include "graphics/host_gpu/metal/metalDraw.h"
+#include "graphics/host_gpu/metal/metalIndirect.h"
+#include "graphics/host_gpu/metal/metalViewport.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include <mutex>
 #include <chrono>
 #include <atomic>
 #include <unordered_map>
+#include <set>
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
@@ -70,7 +76,7 @@ MTLPrimitiveType TranslatePrimitiveType(Prospero::PrimitiveType type) {
 			return MTLPrimitiveTypePoint;
 		case Prospero::PrimitiveType::kLineList:
 		case Prospero::PrimitiveType::kLineLoop:
-			return MTLPrimitiveTypeLine;
+			RejectMetalState("line-loop topology requires explicit closing indices");
 		case Prospero::PrimitiveType::kLineStrip:
 			return MTLPrimitiveTypeLineStrip;
 		case Prospero::PrimitiveType::kTriList:
@@ -80,7 +86,7 @@ MTLPrimitiveType TranslatePrimitiveType(Prospero::PrimitiveType type) {
 		case Prospero::PrimitiveType::kTriStrip:
 			return MTLPrimitiveTypeTriangleStrip;
 		default:
-			return MTLPrimitiveTypeTriangle;
+			RejectMetalState("primitive topology " + std::to_string(uint32_t(type)));
 	}
 }
 
@@ -91,7 +97,7 @@ MTLIndexType TranslateIndexType(Prospero::IndexType type) {
 		case Prospero::IndexType::kIndex32:
 			return MTLIndexTypeUInt32;
 		default:
-			return MTLIndexTypeUInt16;
+			RejectMetalState("index element type " + std::to_string(uint32_t(type)));
 	}
 }
 
@@ -124,9 +130,10 @@ bool MetalDrawExecutor::BeginRenderPass(const MetalRenderPassDesc& pass_desc) {
 		m_render_width = width == std::numeric_limits<NSUInteger>::max() ? 0 : static_cast<uint32_t>(width);
 		m_render_height = height == std::numeric_limits<NSUInteger>::max() ? 0 : static_cast<uint32_t>(height);
 		m_scissor_empty = false;
+		m_color_regions={};m_scissors={{0,0,m_render_width,m_render_height}};
 		MTLRenderPassDescriptor* desc = [MTLRenderPassDescriptor renderPassDescriptor];
 		// Guest vertex shaders may write render_target_array_index; Metal needs a nonzero array length.
-		desc.renderTargetArrayLength = 1;
+		desc.renderTargetArrayLength = pass_desc.render_target_array_length;
 		if (!desc) {
 			return false;
 		}
@@ -175,6 +182,14 @@ bool MetalDrawExecutor::BeginRenderPass(const MetalRenderPassDesc& pass_desc) {
 		if (!cmd_buf) {
 			return false;
 		}
+		for (uint32_t i = 0; i < pass_desc.color_attachment_count; ++i) {
+			const auto& color = pass_desc.color_attachments[i];
+			if (color.texture && color.load_action == MTLLoadActionLoad && color.before_load) color.before_load(cmd_buf);
+		}
+
+		for (const auto* plane: {pass_desc.has_depth ? &pass_desc.depth_attachment : nullptr,
+		                         pass_desc.has_stencil ? &pass_desc.stencil_attachment : nullptr})
+			if (plane && plane->texture && plane->load_action == MTLLoadActionLoad && plane->before_load) plane->before_load(cmd_buf);
 
 		if (m_trace_visibility) {
 			if (m_visibility_buffer == nil) m_visibility_buffer = [MetalContext::Instance().GetDevice() newBufferWithLength:4096 options:MTLResourceStorageModeShared];
@@ -191,6 +206,21 @@ bool MetalDrawExecutor::BeginRenderPass(const MetalRenderPassDesc& pass_desc) {
 		if (FaultInfoOn()) encoder.label = @"render";
 
 		MetalContext::Instance().SetActiveRenderEncoder(encoder);
+		for (uint32_t i = 0; i < pass_desc.color_attachment_count; ++i) {
+			const auto& color = pass_desc.color_attachments[i];
+			if (color.texture && color.store_action == MTLStoreActionStore) {
+				if(color.after_store_regions) {
+					auto regions=std::make_shared<std::vector<PixelRect>>();m_color_regions[i]=regions;
+					if(color.load_action==MTLLoadActionClear)regions->push_back({0,0,uint32_t(std::max(color.texture.width>>color.level,NSUInteger(1))),uint32_t(std::max(color.texture.height>>color.level,NSUInteger(1)))});
+					auto writeback=color.after_store_regions;
+					MetalContext::Instance().QueueEncoderWriteback([regions,writeback](id cmd){writeback(cmd,*regions);});
+				} else if(color.after_store)MetalContext::Instance().QueueEncoderWriteback(color.after_store);
+			}
+		}
+		for (const auto* plane: {pass_desc.has_depth ? &pass_desc.depth_attachment : nullptr,
+		                         pass_desc.has_stencil ? &pass_desc.stencil_attachment : nullptr})
+			if (plane && plane->texture && plane->store_action == MTLStoreActionStore && plane->after_store)
+				MetalContext::Instance().QueueEncoderWriteback(plane->after_store);
 		m_has_render_pipeline = false;
 		return true;
 	}
@@ -198,6 +228,16 @@ bool MetalDrawExecutor::BeginRenderPass(const MetalRenderPassDesc& pass_desc) {
 
 uint64_t MetalDrawExecutor::LastPassVisibleSamples() const {
 	return m_visibility_buffer != nil ? *static_cast<const uint64_t*>(m_visibility_buffer.contents) : 0;
+}
+
+void MetalDrawExecutor::QueueGraphicsImageWritebacks() {
+	for(auto& regions:m_color_regions)if(regions)for(const auto& rect:m_scissors) {
+		if(!rect.width || !rect.height || std::any_of(regions->begin(),regions->end(),[&](const auto& r){return r.Contains(rect);}))continue;
+		regions->erase(std::remove_if(regions->begin(),regions->end(),[&](const auto& r){return rect.Contains(r);}),regions->end());
+		regions->push_back(rect);
+	}
+	for(const auto& image:m_image_writebacks)
+		MetalContext::Instance().QueueEncoderWriteback(image.encode,reinterpret_cast<uint64_t>((__bridge void*)image.image));
 }
 
 void MetalDrawExecutor::EndRenderPass() {
@@ -213,6 +253,11 @@ void MetalDrawExecutor::SetRenderPipeline(id<MTLRenderPipelineState> pipeline) {
 	} else {
 		m_has_render_pipeline = false;
 	}
+}
+
+void MetalDrawExecutor::SetDepthBounds(bool enabled,float minimum,float maximum) {
+	EncodeDepthBounds(MetalContext::Instance().GetActiveRenderEncoder(),enabled,minimum,maximum,
+	    m_last_pass_desc.has_depth?m_last_pass_desc.depth_attachment.texture.pixelFormat:MTLPixelFormatInvalid);
 }
 
 void MetalDrawExecutor::SetDepthStencil(id<MTLDepthStencilState> depth_stencil) {
@@ -255,28 +300,61 @@ void MetalDrawExecutor::SetViewport(double x, double y, double width, double hei
 		return;
 	}
 
-	// Guest/Vulkan viewports may carry a negative height to flip Y. Metal requires a
-	// positive viewport height; translate the flip into the origin instead.
-	bool flipped = false;
-	if (height < 0.0) {
-		y += height;
-		height = -height;
-		flipped = true;
-	}
-	// Experimental (KYTY_FLIP_WINDING=1): the Y flip mirrors the image and inverts triangle winding.
-	// Not verified to change the output of the black draws; off by default.
-	static const bool s_flip_winding = KYTY_ENV("KYTY_FLIP_WINDING") != nullptr;
-	if (flipped && s_flip_winding) {
-		[encoder setFrontFacingWinding:(s_last_winding == MTLWindingClockwise ? MTLWindingCounterClockwise : MTLWindingClockwise)];
-	} else {
-		[encoder setFrontFacingWinding:s_last_winding];
-	}
+	const MTLViewport vp = TranslateGuestViewport(x, y, width, height, znear, zfar);
+	const bool flipped = height < 0.0;
+	[encoder setFrontFacingWinding:s_last_winding];
 	static const bool s_log_vp2 = KYTY_ENV("KYTY_LOG_VP") != nullptr;
 	if (s_log_vp2) {
 		std::fprintf(stderr, "[VpView] flip=%llu x=%g y=%g w=%g h=%g zn=%g zf=%g flipped=%d\n", static_cast<unsigned long long>(Libs::Graphics::TraceWindow::g_flip.load(std::memory_order_relaxed)), x, y, width, height, znear, zfar, flipped ? 1 : 0);
 	}
-	MTLViewport vp {x, y, width, height, znear, zfar};
 	[encoder setViewport:vp];
+}
+
+void MetalDrawExecutor::SetGuestViewports(const HW::ScreenViewport& screen, const HW::ScanModeControl& scan,
+                                           const HW::ClipControl& clip, bool indexed) {
+	if (!indexed) {
+		const auto& v = screen.viewports[0];
+		SetViewport(v.xoffset-v.xscale, v.yoffset-v.yscale, v.xscale*2.0, v.yscale*2.0,
+		            v.zoffset-(clip.dx_clip_space ? 0.0 : v.zscale), v.zoffset+v.zscale);
+		SetGuestScissor(screen,scan);
+		return;
+	}
+	auto encoder = MetalContext::Instance().GetActiveRenderEncoder();
+	if (!encoder) RejectMetalState("viewport array without an active render encoder");
+	MTLViewport viewports[16]; MTLScissorRect scissors[16];
+	m_scissors.clear();
+	m_scissor_empty = true;
+	for (uint32_t i=0;i<16;++i) {
+		const auto& v = screen.viewports[i];
+		viewports[i] = TranslateGuestViewport(v.xoffset-v.xscale,v.yoffset-v.yscale,v.xscale*2.0,v.yscale*2.0,
+		    v.zoffset-(clip.dx_clip_space ? 0.0 : v.zscale),v.zoffset+v.zscale);
+		const auto r = calc_final_scissor(screen,scan,{m_render_width,m_render_height},i);
+		scissors[i] = {NSUInteger(r.left),NSUInteger(r.top),NSUInteger(r.right-r.left),NSUInteger(r.bottom-r.top)};
+		m_scissors.push_back({uint32_t(r.left),uint32_t(r.top),uint32_t(r.right-r.left),uint32_t(r.bottom-r.top)});
+		m_scissor_empty &= r.left==r.right || r.top==r.bottom;
+	}
+	[encoder setViewports:viewports count:16]; [encoder setScissorRects:scissors count:16];
+}
+
+void MetalDrawExecutor::SetGuestScissor(const HW::ScreenViewport& viewport, const HW::ScanModeControl& scan_mode) {
+	// Share the guest screen/window/generic/viewport/clip-rectangle intersection
+	// with the Vulkan renderer. A shadow atlas often uses only one small tile.
+	const auto rect = calc_final_scissor(viewport, scan_mode, {m_render_width, m_render_height}, 0);
+	SetScissor(static_cast<uint32_t>(rect.left), static_cast<uint32_t>(rect.top),
+	           static_cast<uint32_t>(rect.right - rect.left), static_cast<uint32_t>(rect.bottom - rect.top));
+	static const bool trace = KYTY_ENV("KYTY_TRACE_RASTER_STATE") != nullptr;
+	if (trace && (rect.left != viewport.screen_scissor_left || rect.top != viewport.screen_scissor_top ||
+	              rect.right != viewport.screen_scissor_right || rect.bottom != viewport.screen_scissor_bottom)) {
+		static std::set<std::array<int, 8>> seen;
+		const std::array key {viewport.screen_scissor_left, viewport.screen_scissor_top,
+		                      viewport.screen_scissor_right, viewport.screen_scissor_bottom,
+		                      rect.left, rect.top, rect.right, rect.bottom};
+		if (seen.size() < 256 && seen.insert(key).second) {
+			std::fprintf(stderr, "[RasterScissor] rt=%ux%u screen=%d,%d,%d,%d final=%d,%d,%d,%d viewport_enabled=%d\n",
+			             m_render_width, m_render_height, key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+			             scan_mode.vport_scissor_enable ? 1 : 0);
+		}
+	}
 }
 
 void MetalDrawExecutor::SetScissor(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
@@ -288,6 +366,7 @@ void MetalDrawExecutor::SetScissor(uint32_t x, uint32_t y, uint32_t width, uint3
 	width = x >= m_render_width ? 0 : std::min(width, m_render_width - x);
 	height = y >= m_render_height ? 0 : std::min(height, m_render_height - y);
 	m_scissor_empty = width == 0 || height == 0;
+	m_scissors={{x,y,width,height}};
 	if (m_scissor_empty) return;
 	static const bool s_log_sc = KYTY_ENV("KYTY_LOG_VP") != nullptr;
 	if (s_log_sc) {
@@ -332,7 +411,8 @@ void MetalDrawExecutor::SetBlendColor(float r, float g, float b, float a) {
 void MetalDrawExecutor::SetVertexBuffer(id<MTLBuffer> buffer, uint64_t offset, uint32_t index) {
 	id<MTLRenderCommandEncoder> encoder = MetalContext::Instance().GetActiveRenderEncoder();
 	if (encoder && buffer) {
-		[encoder setVertexBuffer:buffer offset:static_cast<NSUInteger>(offset) atIndex:index];
+		if (m_mesh_active) [encoder setMeshBuffer:buffer offset:static_cast<NSUInteger>(offset) atIndex:index];
+		else [encoder setVertexBuffer:buffer offset:static_cast<NSUInteger>(offset) atIndex:index];
 	}
 }
 
@@ -360,7 +440,8 @@ void MetalDrawExecutor::SetFragmentSampler(id<MTLSamplerState> sampler, uint32_t
 void MetalDrawExecutor::SetVertexBytes(const void* bytes, size_t length, uint32_t index) {
 	id<MTLRenderCommandEncoder> encoder = MetalContext::Instance().GetActiveRenderEncoder();
 	if (encoder && bytes && length > 0) {
-		[encoder setVertexBytes:bytes length:length atIndex:index];
+		if (m_mesh_active) [encoder setMeshBytes:bytes length:length atIndex:index];
+		else [encoder setVertexBytes:bytes length:length atIndex:index];
 	}
 }
 
@@ -394,12 +475,13 @@ void MetalDrawExecutor::UseResource(id<MTLResource> resource, MTLResourceUsage u
 			s_serial = serial;
 		}
 		uint32_t& mask = s_declared[reinterpret_cast<uintptr_t>((__bridge void*)resource)];
-		if ((mask & static_cast<uint32_t>(usage)) == static_cast<uint32_t>(usage)) return;
-		mask |= static_cast<uint32_t>(usage);
+		const uint32_t declaration = static_cast<uint32_t>(usage) | (m_mesh_active ? 0x10000u : 0x20000u);
+		if ((mask & declaration) == declaration) return;
+		mask |= declaration;
 	}
 	id<MTLRenderCommandEncoder> encoder = MetalContext::Instance().GetActiveRenderEncoder();
 	if (encoder) {
-		[encoder useResource:resource usage:usage stages:MTLRenderStageVertex | MTLRenderStageFragment];
+		[encoder useResource:resource usage:usage stages:(m_mesh_active ? MTLRenderStageMesh : MTLRenderStageVertex) | MTLRenderStageFragment];
 	}
 	id<MTLComputeCommandEncoder> c_encoder = MetalContext::Instance().GetActiveComputeEncoder();
 	if (c_encoder) {
@@ -420,18 +502,43 @@ static void SplitAfterDraw() {
 	MetalContext::Instance().CommitCommandBuffer(false);
 }
 
+void MetalDrawExecutor::SetMeshState(const ShaderMeshInputInfo* mesh) {
+	m_mesh_active = mesh != nullptr;
+	if (mesh) m_mesh = *mesh;
+}
+
+void MetalDrawExecutor::DrawMesh(uint32_t count, uint32_t instances, uint32_t base_vertex,
+                                 uint32_t first_instance, uint32_t index_bytes) {
+	const uint32_t primitives = m_mesh.InputPrimitiveCount(count);
+	if (primitives == 0 || instances == 0) return;
+	if (m_mesh.primitives_per_group == 0) RejectMetalState("mesh draw without a primitive subgroup");
+	const uint32_t groups = primitives / m_mesh.primitives_per_group + (primitives % m_mesh.primitives_per_group != 0);
+	const uint32_t params[8] = {count, base_vertex, first_instance, index_bytes, 0, 0, 0, 0};
+	SetVertexBytes(params, sizeof(params), 26);
+	const uint32_t threads = m_mesh.threads_num[0] * m_mesh.threads_num[1] * m_mesh.threads_num[2];
+	const uint32_t host_threads = m_mesh.wave_size == 64 ? threads / 2 : threads;
+	auto encoder = MetalContext::Instance().GetActiveRenderEncoder();
+	PassTimerItem();
+	QueueGraphicsImageWritebacks();
+	FaultSignpost(encoder);
+	[encoder drawMeshThreadgroups:MTLSizeMake(groups, instances, 1)
+	        threadsPerObjectThreadgroup:MTLSizeMake(1,1,1)
+	        threadsPerMeshThreadgroup:MTLSizeMake(host_threads,1,1)];
+	SplitAfterDraw();
+}
+
 void MetalDrawExecutor::Draw(Prospero::PrimitiveType prim_type,
                              uint32_t vertex_count,
                              uint32_t instance_count,
                              uint32_t first_vertex,
                              uint32_t first_instance) {
-	FaultSignpost(MetalContext::Instance().GetActiveRenderEncoder());
 	id<MTLRenderCommandEncoder> encoder = MetalContext::Instance().GetActiveRenderEncoder();
+	if (vertex_count != 0 && instance_count != 0 && (!encoder || !m_has_render_pipeline)) RejectMetalState("draw without an active encoder/pipeline");
 	{
 		static std::atomic<uint64_t> s_calls {0};
 		static std::atomic<uint64_t> s_skipped {0};
 		const uint64_t call = s_calls.fetch_add(1);
-		if (!encoder || !m_has_render_pipeline || m_scissor_empty || vertex_count == 0 || instance_count == 0) {
+		if (m_scissor_empty || vertex_count == 0 || instance_count == 0) {
 			const uint64_t skipped = s_skipped.fetch_add(1) + 1;
 			if (call < 10 || call % 2000 == 0) {
 				std::fprintf(stderr, "[Draw] skip calls=%llu skipped=%llu enc=%d pipe=%d vtx=%u\n",
@@ -446,6 +553,8 @@ void MetalDrawExecutor::Draw(Prospero::PrimitiveType prim_type,
 		}
 	}
 
+	if (m_mesh_active) { DrawMesh(vertex_count, instance_count, first_vertex, first_instance, 0); return; }
+
 	MTLPrimitiveType mtl_prim = TranslatePrimitiveType(prim_type);
 	// RECTLIST: three corners define a rectangle; the vertex shader wrapper synthesises vertex 3, so a single
 	// rectangle is drawn as a four-vertex strip (two triangles).
@@ -454,6 +563,8 @@ void MetalDrawExecutor::Draw(Prospero::PrimitiveType prim_type,
 		vertex_count = 4;
 	}
 	PassTimerItem();
+	QueueGraphicsImageWritebacks();
+	FaultSignpost(encoder);
 	[encoder drawPrimitives:mtl_prim
 	            vertexStart:first_vertex
 	            vertexCount:vertex_count
@@ -464,16 +575,26 @@ void MetalDrawExecutor::Draw(Prospero::PrimitiveType prim_type,
 
 void MetalDrawExecutor::DrawIndirect(Prospero::PrimitiveType prim_type, id<MTLBuffer> args_buffer,
                                      uint64_t args_offset, bool last_in_batch) {
-	FaultSignpost(MetalContext::Instance().GetActiveRenderEncoder());
 	id<MTLRenderCommandEncoder> encoder = MetalContext::Instance().GetActiveRenderEncoder();
-	if (!encoder || !m_has_render_pipeline || m_scissor_empty || args_buffer == nil) {
-		return;
+	if (m_scissor_empty) return;
+	if (!encoder || !m_has_render_pipeline || args_buffer == nil) RejectMetalState("indirect draw without its pipeline or arguments");
+	if (m_mesh_active) {
+		SetVertexBuffer(args_buffer,args_offset+MetalMeshIndirect::ParametersOffset,26);
+		const uint32_t threads=m_mesh.threads_num[0]*m_mesh.threads_num[1]*m_mesh.threads_num[2];
+		PassTimerItem();
+		QueueGraphicsImageWritebacks();
+		FaultSignpost(encoder);
+		[encoder drawMeshThreadgroupsWithIndirectBuffer:args_buffer indirectBufferOffset:args_offset
+		    threadsPerObjectThreadgroup:MTLSizeMake(1,1,1) threadsPerMeshThreadgroup:MTLSizeMake(m_mesh.wave_size==64?threads/2:threads,1,1)];
+		if (last_in_batch) SplitAfterDraw(); return;
 	}
 	// Expanded nonindexed RECTLIST arguments contain four vertices, which
 	// must form two triangles. The indexed RECTLIST path uses a triangle list.
 	const MTLPrimitiveType primitive = Prospero::IsRectList(prim_type) ? MTLPrimitiveTypeTriangleStrip
 	                                                                : TranslatePrimitiveType(prim_type);
 	PassTimerItem();
+	QueueGraphicsImageWritebacks();
+	FaultSignpost(encoder);
 	[encoder drawPrimitives:primitive
 	         indirectBuffer:args_buffer
 	   indirectBufferOffset:args_offset];
@@ -483,12 +604,16 @@ void MetalDrawExecutor::DrawIndirect(Prospero::PrimitiveType prim_type, id<MTLBu
 void MetalDrawExecutor::DrawIndexedIndirect(Prospero::PrimitiveType prim_type, MTLIndexType index_type,
                                              id<MTLBuffer> index_buffer, uint64_t index_offset,
                                              id<MTLBuffer> args_buffer, uint64_t args_offset, bool last_in_batch) {
-	FaultSignpost(MetalContext::Instance().GetActiveRenderEncoder());
 	id<MTLRenderCommandEncoder> encoder = MetalContext::Instance().GetActiveRenderEncoder();
-	if (!encoder || !m_has_render_pipeline || m_scissor_empty || index_buffer == nil || args_buffer == nil) {
-		return;
+	if (m_scissor_empty) return;
+	if (!encoder || !m_has_render_pipeline || index_buffer == nil || args_buffer == nil) RejectMetalState("indexed indirect draw without its pipeline, indices or arguments");
+	if (m_mesh_active) {
+		SetVertexBuffer(index_buffer,index_offset,24); UseResource(index_buffer,MTLResourceUsageRead);
+		DrawIndirect(prim_type,args_buffer,args_offset,last_in_batch); return;
 	}
 	PassTimerItem();
+	QueueGraphicsImageWritebacks();
+	FaultSignpost(encoder);
 	[encoder drawIndexedPrimitives:TranslatePrimitiveType(prim_type)
 	                     indexType:index_type
 	                   indexBuffer:index_buffer
@@ -506,14 +631,16 @@ void MetalDrawExecutor::DrawIndexed(Prospero::PrimitiveType prim_type,
                                     uint32_t instance_count,
                                     int32_t base_vertex,
                                     uint32_t first_instance) {
-	FaultSignpost(MetalContext::Instance().GetActiveRenderEncoder());
 	id<MTLRenderCommandEncoder> encoder = MetalContext::Instance().GetActiveRenderEncoder();
-	if (!encoder || !m_has_render_pipeline || m_scissor_empty || index_count == 0 || instance_count == 0 || !index_buffer) {
-		return;
-	}
+	if (m_scissor_empty || index_count == 0 || instance_count == 0) return;
+	if (!encoder || !m_has_render_pipeline || !index_buffer) RejectMetalState("indexed draw without its pipeline or indices");
+
+	if (m_mesh_active) { SetVertexBuffer(index_buffer, index_buffer_offset, 24); UseResource(index_buffer, MTLResourceUsageRead); DrawMesh(index_count, instance_count, uint32_t(base_vertex), first_instance, index_type == MTLIndexTypeUInt16 ? 2 : 4); return; }
 
 	const MTLPrimitiveType mtl_prim = TranslatePrimitiveType(prim_type);
 	PassTimerItem();
+	QueueGraphicsImageWritebacks();
+	FaultSignpost(encoder);
 	[encoder drawIndexedPrimitives:mtl_prim
 	                    indexCount:index_count
 	                     indexType:index_type
@@ -538,12 +665,35 @@ bool MetalDrawExecutor::BeginComputePass() {
 	if (!encoder) {
 		return false;
 	}
-	OrderBegin(encoder);
+	// KYTY_CS_OVERLAP: the wait for the earlier encoders is recorded right before the dispatch, when the memory it touches is known.
+	m_access.clear();
+	m_access_unknown = false;
+	m_order_pending  = CsOverlapEnabled();
+	if (!m_order_pending) OrderBegin(encoder);
 	if (FaultInfoOn()) encoder.label = @"compute";
 
 	MetalContext::Instance().SetActiveComputeEncoder(encoder);
 	m_has_compute_pipeline = false;
 	return true;
+}
+
+void MetalDrawExecutor::ComputeAccessAdd(uint64_t begin, uint64_t end, bool write) {
+	if (end <= begin) end = begin + 1;
+	m_access.push_back({begin, end, write});
+}
+
+void MetalDrawExecutor::ComputeAccessUnknown() {
+	m_access_unknown = true;
+}
+
+void MetalDrawExecutor::BeginDispatchOrder(id<MTLComputeCommandEncoder> encoder) {
+	if (!m_order_pending) return;
+	m_order_pending = false;
+	std::vector<OrderAccess> acc;
+	acc.reserve(m_access.size());
+	for (const auto& r: m_access) acc.push_back({r.begin, r.end, r.write});
+	// a dispatch that declared nothing cannot be shown independent
+	OrderBeginCompute(encoder, acc.data(), acc.size(), m_access_unknown || acc.empty());
 }
 
 void MetalDrawExecutor::EndComputePass() {
@@ -615,7 +765,8 @@ void MetalDrawExecutor::Dispatch(uint32_t group_x, uint32_t group_y, uint32_t gr
 	static std::atomic<uint32_t> s_dispatch_dropped {0};
 	id<MTLComputeCommandEncoder> encoder = MetalContext::Instance().GetActiveComputeEncoder();
 	const uint32_t total = s_dispatch_total.fetch_add(1) + 1;
-	if (!encoder || !m_has_compute_pipeline || group_x == 0 || group_y == 0 || group_z == 0) {
+	if (group_x && group_y && group_z && (!encoder || !m_has_compute_pipeline)) RejectMetalState("dispatch without an active encoder/pipeline");
+	if (group_x == 0 || group_y == 0 || group_z == 0) {
 		CountDispatchStat(!encoder ? 4 : !m_has_compute_pipeline ? 3 : 5);
 		// Dropped dispatch: no encoder, no pipeline, or an empty grid. Must stay 0 on a healthy run.
 		const uint32_t dropped = s_dispatch_dropped.fetch_add(1) + 1;
@@ -634,6 +785,7 @@ void MetalDrawExecutor::Dispatch(uint32_t group_x, uint32_t group_y, uint32_t gr
 
 	CountDispatchStat(2);
 	PassTimerItem();
+	BeginDispatchOrder(encoder);
 	[encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
 	// KYTY_MTL_SYNC_EACH=1: run this dispatch to completion alone, so validation/fault reports printed
 	// between the begin/end markers belong to this op (shader hash in the op label). The end line carries the wall time of the
@@ -649,18 +801,16 @@ void MetalDrawExecutor::DispatchIndirect(id<MTLBuffer> indirect_args, uint64_t i
                                          uint32_t threads_per_group_x, uint32_t threads_per_group_y, uint32_t threads_per_group_z) {
 	FaultSignpost(MetalContext::Instance().GetActiveComputeEncoder());
 	id<MTLComputeCommandEncoder> encoder = MetalContext::Instance().GetActiveComputeEncoder();
-	if (!encoder || !m_has_compute_pipeline || !indirect_args) {
-		CountDispatchStat(!encoder ? 4 : 3);
-		return;
-	}
+	if (!encoder || !m_has_compute_pipeline || !indirect_args) RejectMetalState("indirect dispatch without an active encoder, pipeline or arguments");
 	if (indirect_offset % 4 != 0 || indirect_offset > indirect_args.length ||
-	    indirect_args.length - indirect_offset < sizeof(MTLDispatchThreadgroupsIndirectArguments)) return;
+	    indirect_args.length - indirect_offset < sizeof(MTLDispatchThreadgroupsIndirectArguments)) RejectMetalState("indirect dispatch argument range");
 
 	MTLSize threads_per_group = MTLSizeMake(threads_per_group_x, threads_per_group_y, threads_per_group_z);
 	// MetalRenderer prepares these counts on the GPU, in order after their
 	// producer. Host reads/writes here would race that producer.
 	CountDispatchStat(2);
 	PassTimerItem();
+	BeginDispatchOrder(encoder);
 	[encoder dispatchThreadgroupsWithIndirectBuffer:indirect_args
 	                           indirectBufferOffset:static_cast<NSUInteger>(indirect_offset)
 	                          threadsPerThreadgroup:threads_per_group];

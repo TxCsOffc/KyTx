@@ -107,9 +107,10 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
-enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
+enum class SamplerClass : uint8_t { Float, Integer, PointInteger, Compare };
 
 SamplerClass ClassifySampler(const ImageResource& image) {
+	if (image.depth_compare) return SamplerClass::Compare;
 	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	    image.conversion_format != Prospero::BufferFormat::kInvalid) {
 		return SamplerClass::PointInteger;
@@ -379,7 +380,7 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::array<std::array<uint32_t, 3>, ShaderInfo::MaxSamplers> mapping;
+	std::array<std::array<uint32_t, 4>, ShaderInfo::MaxSamplers> mapping;
 	std::array<Binding, ShaderInfo::MaxSamplers>                bindings;
 	uint32_t                                                  sampler_count = 0;
 };
@@ -1307,13 +1308,14 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
-		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		samplers[index].integer_border        = binding.type == SamplerClass::Integer || binding.type == SamplerClass::PointInteger;
+		samplers[index].depth_compare         = binding.type == SamplerClass::Compare;
+		samplers[index].point_fetch           = false;
 	}
 	for (auto& pair: sampled_pairs) {
 		const auto type = static_cast<uint32_t>(ClassifySampler(images[pair.image]));
 		pair.sampler = sampler_plan.mapping[pair.sampler][type];
 		EXIT_IF(pair.sampler == UINT32_MAX);
-		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
 	}
 
 	auto& memory_info = program.memory_info;
@@ -1399,6 +1401,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				const auto type = static_cast<uint32_t>(ClassifySampler(image));
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
+			}
+			if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
+			    (memory.image_sample_flags & Decoder::ImageSampleFlagOffset) != 0u) {
+				samplers.at(memory.sampler).point_fetch = true;
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);

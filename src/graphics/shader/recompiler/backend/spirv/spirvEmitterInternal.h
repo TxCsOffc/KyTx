@@ -86,6 +86,7 @@ struct EmitterState {
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
 	uint32_t                                        void_type = 0;
+	bool                                            allow_dynamic_sample_offset = false;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
 	uint32_t                                        native_u64_type = 0;

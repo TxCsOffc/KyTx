@@ -10,7 +10,7 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+	                                  ShaderStageInputInfo input_info, bool allow_dynamic_sample_offset = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

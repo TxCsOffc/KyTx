@@ -56,11 +56,23 @@ public:
 	void Umount(const std::string& folder_or_point);
 
 	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name);
+	[[nodiscard]] bool IsMountPoint(const std::string& point);
 
 private:
 	std::vector<MountPair> m_mount_pairs;
 	Common::Mutex          m_mutex;
 };
+
+static std::string NormalizeGuestPath(const std::string& path) {
+	auto normalized=Common::FixFilenameSlash(path);
+	normalized.erase(std::unique(normalized.begin(),normalized.end(),[](char a,char b) { return a=='/' && b=='/'; }),normalized.end());
+	return normalized;
+}
+
+bool MountPoints::IsMountPoint(const std::string& point) {
+	Common::LockGuard lock(m_mutex);
+	return std::any_of(m_mount_pairs.begin(),m_mount_pairs.end(),[&](const auto& pair) { return pair.point==point; });
+}
 
 struct File {
 	Common::File                        f;
@@ -357,13 +369,14 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 	Common::LockGuard lock(m_mutex);
 
 	// Match the entire guest path so a mount root works with or without a trailing slash.
-	const auto mounted_path = Common::FixDirectorySlash(mounted_name);
+	const auto normalized = NormalizeGuestPath(mounted_name);
+	const auto mounted_path = Common::FixDirectorySlash(normalized);
 	const auto it           = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(),
 	    [&mounted_path](const MountPair& p) { return mounted_path.starts_with(p.point); });
 	if (it != m_mount_pairs.end()) {
 		const auto& p = *it;
-		auto rel_path = Common::RemoveFirst(Common::FixFilenameSlash(mounted_name), p.point.size());
+		auto rel_path = Common::RemoveFirst(normalized, p.point.size());
 		while (rel_path.starts_with('/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
@@ -422,7 +435,19 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+static int KernelOpenImpl(const char* path, int flags, uint16_t mode);
+
+// KYTY_LOG_OPEN=1: one [Open] line per guest open (path, flags, result) on stderr, to see which assets fail to load.
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
+	const int  result = KernelOpenImpl(path, flags, mode);
+	static const bool s_log = std::getenv("KYTY_LOG_OPEN") != nullptr;
+	if (s_log) {
+		std::fprintf(stderr, "[Open] %s flags=%x -> %d\n", path != nullptr ? path : "(null)", static_cast<unsigned>(flags), result);
+	}
+	return result;
+}
+
+static int KernelOpenImpl(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
 
 	if (path == nullptr) {
@@ -525,6 +550,12 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		file->dirents      = PackDirents(entries);
 		file->dents_offset = 0;
 		file->directory    = true;
+		// Keep the host directory open too: fsync must flush this directory,
+		// including when its pathname is renamed while the descriptor is open.
+		if (!Common::IsArchivePath(file->real_name) && !file->f.Open(file->real_name,Common::File::Mode::Read)) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EACCES;
+		}
 
 		LOGF_COLOR(Log::Color::Green, "\tOpen dir: %s, entries = %" PRIu32 ", [ok]\n",
 		           Common::PathToString(file->real_name).c_str(),
@@ -596,7 +627,7 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 		// Wait for an operation that holds the file lock, such as KernelFsync, before closing.
 		Common::LockGuard lock(file->mutex);
 
-		if (!file->directory && file->special == SpecialFile::None) {
+		if (file->special == SpecialFile::None) {
 			file->f.Close();
 		}
 
@@ -1348,6 +1379,21 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelFsync(int d) {
+	PRINT_NAME();
+	if (d < DESCRIPTOR_MIN) return KERNEL_ERROR_EBADF;
+	if (::Libs::Network::Net::IsSocket(d)) return KERNEL_ERROR_EINVAL;
+	auto* file=g_files->GetFile(d);
+	if (file == nullptr) return KERNEL_ERROR_EBADF;
+	Common::LockGuard lock(file->mutex);
+	if (!file->opened) return KERNEL_ERROR_EBADF;
+	if (file->special != SpecialFile::None) return KERNEL_ERROR_EINVAL;
+	// Archive members are immutable; they never hold pending writes.
+	if (Common::IsArchivePath(file->real_name)) return OK;
+	if (file->f.IsInvalid() || !file->f.Flush()) return KERNEL_ERROR_EIO;
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	PRINT_NAME();
 
@@ -1430,8 +1476,9 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	PRINT_NAME();
 
 	if (from == nullptr || to == nullptr) {
-		return KERNEL_ERROR_EINVAL;
+		return KERNEL_ERROR_EFAULT;
 	}
+	if (std::strlen(from)>255 || std::strlen(to)>255) return KERNEL_ERROR_ENAMETOOLONG;
 
 	auto from_path = std::string(from);
 	auto to_path   = std::string(to);
@@ -1441,17 +1488,23 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 		return KERNEL_ERROR_EROFS;
 	}
 
-	if (real_to.empty() || !Common::File::IsFileExisting(real_from)) {
+	if (real_to.empty() || real_from.empty()) {
 		return KERNEL_ERROR_ENOENT;
 	}
-
-	Common::File::CreateDirectories(real_to.parent_path());
-
-	if (Common::File::IsFileExisting(real_to)) {
-		Common::File::DeleteFile(real_to);
-	}
-
-	if (!Common::File::RenameFile(real_from, real_to)) {
+	if (g_mount_points->IsMountPoint(Common::FixDirectorySlash(NormalizeGuestPath(from))) ||
+	    g_mount_points->IsMountPoint(Common::FixDirectorySlash(NormalizeGuestPath(to)))) return KERNEL_ERROR_EBUSY;
+	// Host rename preserves open descriptors and replaces the destination
+	// atomically. Deleting it first loses saved data if the rename then fails.
+	std::error_code error;
+	std::filesystem::rename(real_from,real_to,error);
+	if (error) {
+		if (error==std::errc::no_such_file_or_directory) return KERNEL_ERROR_ENOENT;
+		if (error==std::errc::not_a_directory) return KERNEL_ERROR_ENOTDIR;
+		if (error==std::errc::is_a_directory) return KERNEL_ERROR_EISDIR;
+		if (error==std::errc::directory_not_empty || error==std::errc::file_exists) return KERNEL_ERROR_ENOTEMPTY;
+		if (error==std::errc::permission_denied) return KERNEL_ERROR_EACCES;
+		if (error==std::errc::cross_device_link) return KERNEL_ERROR_EXDEV;
+		if (error==std::errc::invalid_argument) return KERNEL_ERROR_EINVAL;
 		return KERNEL_ERROR_EIO;
 	}
 
@@ -1547,25 +1600,31 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 	PRINT_NAME();
 
 	if (path == nullptr) {
-		return KERNEL_ERROR_EINVAL;
+		return KERNEL_ERROR_EFAULT;
 	}
+	if (std::strlen(path)>255) return KERNEL_ERROR_ENAMETOOLONG;
 
 	LOGF("\t path = %s\n", path);
 
-	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	const auto directory=Common::FixDirectorySlash(NormalizeGuestPath(path));
+	if (directory.ends_with("/./") || directory.ends_with("/../")) return KERNEL_ERROR_EINVAL;
+	if (g_mount_points->IsMountPoint(directory)) return KERNEL_ERROR_EBUSY;
+	const auto real_name = g_mount_points->ResolvePath(path);
 	if (Common::IsArchivePath(real_name)) {
 		return KERNEL_ERROR_EROFS;
 	}
 
-	if (!Common::File::IsDirectoryExisting(real_name)) {
-		return KERNEL_ERROR_ENOENT;
-	}
-
-	if (!Common::File::DeleteDirectory(real_name)) {
-		return KERNEL_ERROR_EIO;
-	}
-
-	return OK;
+	std::error_code error;
+	const auto status=std::filesystem::symlink_status(real_name,error);
+	if (error==std::errc::not_a_directory) return KERNEL_ERROR_ENOTDIR;
+	if (error || !std::filesystem::exists(status)) return KERNEL_ERROR_ENOENT;
+	if (!std::filesystem::is_directory(status)) return KERNEL_ERROR_ENOTDIR;
+	if (std::filesystem::remove(real_name,error)) return OK;
+	if (error==std::errc::directory_not_empty) return KERNEL_ERROR_ENOTEMPTY;
+	if (error==std::errc::permission_denied) return KERNEL_ERROR_EACCES;
+	if (error==std::errc::read_only_file_system) return KERNEL_ERROR_EROFS;
+	if (error==std::errc::device_or_resource_busy) return KERNEL_ERROR_EBUSY;
+	return error ? KERNEL_ERROR_EIO : KERNEL_ERROR_ENOENT;
 }
 
 int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {

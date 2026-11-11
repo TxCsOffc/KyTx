@@ -262,7 +262,12 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 
 	int result = OK;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	result = WaitLinux(address, expected, deadline, signal_poll);
+	// FUTEX_WAIT compares a 32-bit word: byte and halfword cells cannot use it.
+	if constexpr (sizeof(T) >= sizeof(uint32_t)) {
+		result = WaitLinux(address, expected, deadline, signal_poll);
+	} else {
+		result = WaitPortable(address, expected, deadline, signal_poll);
+	}
 #else
 	result = WaitPortable(address, expected, deadline, signal_poll);
 #endif
@@ -271,6 +276,16 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 }
 
 } // namespace
+
+int Wait8(volatile uint8_t* address, uint8_t expected, const uint32_t* timeout_micros,
+          signal_poll_func_t signal_poll) {
+	return WaitImpl(address, expected, MakeDeadline(timeout_micros), signal_poll);
+}
+
+int Wait16(volatile uint16_t* address, uint16_t expected, const uint32_t* timeout_micros,
+           signal_poll_func_t signal_poll) {
+	return WaitImpl(address, expected, MakeDeadline(timeout_micros), signal_poll);
+}
 
 int Wait32(volatile uint32_t* address, uint32_t expected, const uint32_t* timeout_micros,
            signal_poll_func_t signal_poll) {
@@ -293,9 +308,14 @@ int Wake(volatile void* address, int32_t count) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// Byte and halfword waiters sleep in the portable registry, word waiters on the futex.
+	if (const int portable = WakePortable(address, count); portable != OK) {
+		return portable;
+	}
 	return WakeLinux(address, count);
-#endif
+#else
 	return WakePortable(address, count);
+#endif
 }
 
 } // namespace Libs::LibKernel::SyncOnAddress

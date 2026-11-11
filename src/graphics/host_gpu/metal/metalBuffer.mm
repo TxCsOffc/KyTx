@@ -1,9 +1,14 @@
 #include "graphics/host_gpu/metal/metalEnv.h"
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #include "graphics/host_gpu/metal/metalBuffer.h"
+#include "kernel/memory.h"
 #include "graphics/host_gpu/metal/metalContext.h"
 #include "common/logging/log.h"
 
@@ -235,9 +240,62 @@ void MetalBufferManager::CacheStats(size_t* count, uint64_t* bytes) {
 	*bytes = total;
 }
 
+std::shared_ptr<MetalBuffer> MetalBufferManager::GetBackingChunk(uint64_t chunk) {
+	uint64_t alias = 0, alias_size = 0;
+	if (!LibKernel::Memory::GetGuestBackingAlias(&alias, &alias_size)) return nullptr;
+	const uint64_t start = chunk * kBackingChunkSize;
+	if (start >= alias_size) return nullptr;
+	std::lock_guard lock(m_chunk_mutex);
+	auto& buffer = m_backing_chunks[chunk];
+	if (!buffer) {
+		auto made = std::make_shared<MetalBuffer>();
+		if (!made->WrapHostMemory(reinterpret_cast<void*>(alias + start), std::min(kBackingChunkSize, alias_size - start), "GuestAddressBacking")) {
+			m_backing_chunks.erase(chunk);
+			return nullptr;
+		}
+		buffer = std::move(made);
+	}
+	return buffer;
+}
+
 MetalBufferAllocation MetalBufferManager::GetBufferForGuestRange(uint64_t vaddr, size_t size) {
 	if (vaddr == 0 || size == 0) {
 		return {};
+	}
+	// A wrapper per start page gave the same physical bytes several Metal buffers: a longer lookup made a longer wrapper over the same
+	// pages, and within that frame a kernel's writes through one buffer were not what the next kernel read through the other. The garments'
+	// cloth started from those stale bytes in their first frame and turned to NaN (shirts, shorts and tracksuits missing until the solver
+	// settled). A range inside one physical 64 MiB chunk now always goes through that chunk's buffer. KYTY_GUEST_BUFFER_PER_PAGE=1
+	// restores the per-page wrappers.
+	static const bool s_per_page = std::getenv("KYTY_GUEST_BUFFER_PER_PAGE") != nullptr;
+	if (!s_per_page) {
+		uint64_t backing = 0;
+		const bool have_backing = LibKernel::Memory::TryGetGuestBackingOffset(vaddr, size, &backing);
+		// KYTY_LOG_BUFFER_PATH=1: which way each range of 1 MiB or more is bound (first 300 distinct): "chunk" shares the one buffer that
+		// the kernels writing those bytes use, "page" (a range over a chunk boundary, or without one backing) gets a wrapper of its own.
+		if (static const bool s_log_path = std::getenv("KYTY_LOG_BUFFER_PATH") != nullptr; s_log_path && size >= (1u << 20)) {
+			static std::mutex                         s_path_mutex;
+			static std::set<std::pair<uint64_t, size_t>> s_path_seen;
+			std::lock_guard<std::mutex> path_lock(s_path_mutex);
+			if (s_path_seen.size() < 300 && s_path_seen.emplace(vaddr, size).second) {
+				const bool in_chunk = have_backing && backing % kBackingChunkSize + size <= kBackingChunkSize;
+				std::fprintf(stderr, "[BufferPath] vaddr=0x%llx size=%zu %s backing=%s0x%llx in_chunk=0x%llx\n", static_cast<unsigned long long>(vaddr), size,
+				             in_chunk ? "chunk" : "page", have_backing ? "" : "none/", static_cast<unsigned long long>(backing),
+				             static_cast<unsigned long long>(have_backing ? backing % kBackingChunkSize : 0));
+			}
+		}
+		if (have_backing && backing % kBackingChunkSize + size <= kBackingChunkSize) {
+			if (auto chunk = GetBackingChunk(backing / kBackingChunkSize); chunk && chunk->GetLength() >= backing % kBackingChunkSize + size) {
+				const uint64_t inside = backing % kBackingChunkSize;
+				MetalBufferAllocation alloc {};
+				alloc.buffer = chunk->GetHandle();
+				alloc.offset = chunk->GetOffset() + inside;
+				alloc.size = size;
+				alloc.cpu_addr = reinterpret_cast<void*>(vaddr);
+				alloc.gpu_addr = chunk->GetGpuAddress() ? (chunk->GetGpuAddress() + inside) : 0;
+				return alloc;
+			}
+		}
 	}
 
 	const uint64_t page_aligned = vaddr & ~(static_cast<uint64_t>(m_page_size) - 1);
@@ -261,7 +319,28 @@ MetalBufferAllocation MetalBufferManager::GetBufferForGuestRange(uint64_t vaddr,
 			else ++e;
 		}
 	}
+	// A wrapper holds the physical pages that were behind its guest range when it was made. When the game maps that range to other
+	// backing (a garment's buffers in a new scene), a cached wrapper kept the old pages: one kernel wrote the new data through it while the
+	// next read the guest range, which held garbage, and cloth started from NaN (shirts, shorts and tracksuits missing for half a minute).
+	// After a mapping change the entry is checked against the backing again. KYTY_PAGE_CACHE_NO_REVALIDATE=1 restores the old cache.
+	static const bool s_no_revalidate = std::getenv("KYTY_PAGE_CACHE_NO_REVALIDATE") != nullptr;
+	const uint64_t generation = s_no_revalidate ? 0 : LibKernel::Memory::GetGuestBackingGeneration();
 	auto it = m_page_cache.find(page_aligned);
+	if (it != m_page_cache.end() && !s_no_revalidate && it->second.generation != generation) {
+		uint64_t backing = UINT64_MAX;
+		if (!LibKernel::Memory::TryGetGuestBackingOffset(page_aligned, it->second.buffer->GetLength(), &backing)) backing = UINT64_MAX - 1;
+		if (backing != it->second.backing_offset) {
+			static std::atomic<uint32_t> s_log {0};
+			if (s_log.fetch_add(1) < 200) {
+				std::fprintf(stderr, "[PageCacheStale] page=0x%llx len=%zu backing 0x%llx -> 0x%llx\n", (unsigned long long)page_aligned,
+				             it->second.buffer->GetLength(), (unsigned long long)it->second.backing_offset, (unsigned long long)backing);
+			}
+			m_page_cache.erase(it);
+			it = m_page_cache.end();
+		} else {
+			it->second.generation = generation;
+		}
+	}
 	if (it != m_page_cache.end()) {
 		it->second.used_ms = now_ms;
 		const auto& cached = it->second.buffer;
@@ -281,7 +360,9 @@ MetalBufferAllocation MetalBufferManager::GetBufferForGuestRange(uint64_t vaddr,
 		return {};
 	}
 
-	m_page_cache[page_aligned] = {buf, now_ms};
+	uint64_t backing = UINT64_MAX;
+	if (!LibKernel::Memory::TryGetGuestBackingOffset(page_aligned, aligned_size, &backing)) backing = UINT64_MAX - 1;
+	m_page_cache[page_aligned] = {buf, now_ms, backing, generation};
 
 	MetalBufferAllocation alloc {};
 	alloc.buffer = buf->GetHandle();

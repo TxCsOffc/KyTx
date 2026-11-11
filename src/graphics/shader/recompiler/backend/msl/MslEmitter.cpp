@@ -8,6 +8,7 @@
 // one 64-bit slot per resource id (see BindMetalShaderResources).
 
 #include "graphics/shader/recompiler/backend/msl/MslEmitter.h"
+#include "graphics/shader/recompiler/backend/msl/MslSamplerHelpers.h"
 
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/shader.h"
@@ -22,8 +23,11 @@
 #include <atomic>
 #include <cstdio>
 #include <iterator>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -35,19 +39,11 @@ static bool LdsSyncEnabled() {
 	return s_on;
 }
 
-// KYTY_MSL_GDS=1: DS instructions with the GDS bit use the device GDS buffer (ab.gds, 64 KiB, bound for compute) instead of the
-// workgroup LDS array. Without it they keep the old (wrong) LDS lowering and ds_append/ds_consume on GDS stay unsupported.
-static bool MslGdsEnabled() {
-	static const bool s_on = [] {
-		const char* value = std::getenv("KYTY_MSL_GDS");
-		return value != nullptr && value[0] == '1';
-	}();
-	return s_on;
-}
+// GDS instructions use the shared device GDS allocation, never workgroup LDS.
+static bool MslGdsEnabled() { return true; }
 
 // Dwords of the Metal GDS buffer (GdsBuffer() in metalRenderer.mm is 64 KiB).
 static constexpr uint32_t kMslGdsDwords = 16384u;
-static constexpr uint32_t kMslLoopTripGdsBase = 16376u; // KYTY_LOOP_TRIP_GDS counters, the last 8 GDS dwords
 
 namespace Libs::Graphics::ShaderRecompiler::Msl {
 namespace {
@@ -60,26 +56,6 @@ std::string U32Literal(uint32_t value) {
 	char buffer[32];
 	std::snprintf(buffer, sizeof(buffer), "0x%08xu", value);
 	return buffer;
-}
-
-// Runaway-loop guard (KYTY_LOOP_CAP=<n> overrides): structured code returns once one entry into a loop has run this many
-// iterations. The old guard, one counter per invocation that grew on every block, cut legitimate loops short: the BRDF LUT pass
-// (PS 0xf77586..., 4096 samples of a ~12-step radical inverse, ~57k steps in all) returned with an empty output and every lit
-// surface read a zero LUT, and the forward light loops (one bit per light, ~17k lines per light) returned after a few lights. One
-// counter per invocation cannot fit both: 65536 kept the LUT but let the light shaders run past the GPU timeout. The SPIR-V path
-// has no guard by default.
-uint32_t MslLoopCap() {
-	static const uint32_t cap = [] {
-		const char* val = std::getenv("KYTY_LOOP_CAP");
-		return val != nullptr ? static_cast<uint32_t>(std::strtoul(val, nullptr, 0)) : 8192u;
-	}();
-	return cap;
-}
-
-// The switch(pc) dispatcher counts block transitions, not loop iterations: a few blocks per iteration.
-uint32_t MslDispatcherCap() {
-	const uint64_t cap = static_cast<uint64_t>(MslLoopCap()) * 16u;
-	return static_cast<uint32_t>(std::min<uint64_t>(cap, 0xffffffffu));
 }
 
 std::string F32Literal(uint32_t bits) {
@@ -145,13 +121,18 @@ struct Emitter {
 	std::unordered_map<const Inst*, std::string> names;
 	uint32_t next_name = 0;
 	uint32_t next_phi_edge = 0;
-	uint32_t next_loop = 0; // structured loops emitted so far: each gets its own runaway guard counter
 
 	// Wave64 pair lowering (see Wave64Pair in MslEmitter.h): every instruction is emitted once per emulated half of the wave, with
 	// the results of half 1 named "<name>_h"; half_ is the half being emitted.
 	bool     pair_ = false;
 	bool     nan_trace_ = false; // KYTY_MSL_NAN_TRACE=<pixel shader hash>[,<hash>...]: remember the first float result that is NaN
+	bool     store_trace_ = false; // KYTY_MSL_STORE_TRACE=<guest hash,...>: active raw dword store ranges and float-bit NaN counts
+	std::set<uint32_t> value_trace_; // KYTY_MSL_VALUE_TRACE=<guest hash>,<id>,...: first guest lanes' scalar values
+	std::string value_at_ = "all(tgid == uint3(0u)) && liid == 0u"; // KYTY_MSL_VALUE_AT=<gx>,<gy>,<gz>,<lane>: the thread whose values are traced (default group 0, lane 0)
 	uint32_t half_ = 0;
+	std::unordered_map<const Inst*,uint32_t> pixel_lds_slots;
+	uint32_t pixel_lds_slot_count=0;
+	void PreparePixelLaneStorage();
 
 	// Stage interface: one struct per direction, plus lookup tables used by
 	// GetAttribute/SetAttribute/GetBuiltin.
@@ -163,6 +144,9 @@ struct Emitter {
 	// 1 = uint4 attachment, 2 = int4 attachment, 0 = float4.
 	std::unordered_map<uint32_t, uint32_t> mrt_integer;
 	std::string position_field;
+	bool point_size_output = false;
+	bool layer_output = false;
+	bool viewport_output = false;
 	uint32_t    clip_distance_count = 0;
 	std::string depth_field;
 	std::string frag_coord_field;
@@ -186,10 +170,11 @@ struct Emitter {
 	}
 
 	void BuildInterface() {
-		const bool vertex = program.stage == ShaderType::Vertex;
+		const bool vertex = program.stage == ShaderType::Vertex || program.stage == ShaderType::Mesh;
 		const bool pixel  = program.stage == ShaderType::Pixel;
 
 		if (vertex) {
+			if (input_info.vertex && input_info.vertex->clip_space.enabled) unsupported.push_back("clip-disable XY transform needs the matching expanded viewport");
 			for (const auto& output: program.info.outputs) {
 				switch (output.kind) {
 					case IR::StageOutputKind::Position:
@@ -205,16 +190,22 @@ struct Emitter {
 						     "[[user(locn" + std::to_string(output.index) + ")]]"});
 						break;
 					case IR::StageOutputKind::ClipDistance:
-						// User clip planes from the auxiliary position exports (PA_CL_VS_OUT_CNTL.CLIP_DIST_ENA), as gl_ClipDistance in
-						// the SPIR-V backend. KYTY_MSL_NO_CLIP_DIST=1 drops them again.
-						if (std::getenv("KYTY_MSL_NO_CLIP_DIST") == nullptr) clip_distance_count = std::max(clip_distance_count, output.index + 1u);
+						clip_distance_count = std::max(clip_distance_count, output.index + 1u);
 						break;
 					case IR::StageOutputKind::PointSize:
-					case IR::StageOutputKind::CullDistance:
+						if (!point_size_output) out_fields.push_back({"point_size", "float", "[[point_size]]"});
+						point_size_output = true;
+						break;
 					case IR::StageOutputKind::Layer:
+						if (!layer_output) out_fields.push_back({"layer", "uint", program.stage == ShaderType::Mesh ? "[[user(kyty_vertex_layer), flat]]" : "[[render_target_array_index]]"});
+						layer_output = true;
+						break;
 					case IR::StageOutputKind::ViewportIndex:
-						// Accepted and dropped: no cull planes, layered rendering or point size yet.
-						// Writes to these outputs are ignored (see EmitSetAttribute).
+						if (!viewport_output) out_fields.push_back({"viewport_index", "uint", program.stage == ShaderType::Mesh ? "[[user(kyty_vertex_viewport), flat]]" : "[[viewport_array_index]]"});
+						viewport_output = true;
+						break;
+					case IR::StageOutputKind::CullDistance:
+						unsupported.push_back("vertex cull distance requires primitive culling, not clipping");
 						break;
 					default:
 						unsupported.push_back("vertex output kind " +
@@ -307,11 +298,14 @@ struct Emitter {
 						                                : "[[color(" + std::to_string(output.index) + ")]]"});
 						break;
 					}
+					case IR::StageOutputKind::SampleMask:
+						unsupported.push_back("pixel sample mask export has no lowering");
+						break;
 					case IR::StageOutputKind::Depth:
 						depth_field = "depth";
 						out_fields.push_back({depth_field, "float", "[[depth(any)]]"});
 						break;
-					default: break;
+					default: unsupported.push_back("pixel output kind " + std::to_string(uint32_t(output.kind))); break;
 				}
 			}
 			pixel_location_count = static_cast<uint32_t>(in_fields.size());
@@ -428,14 +422,9 @@ struct Emitter {
 	}
 
 	[[nodiscard]] bool BufferAddressable(uint32_t resource) const {
-		if (resource >= program.info.buffers.size()) {
-			return false;
-		}
-		const uint32_t packed = program.info.buffers[resource].packed_stride;
-		const uint32_t stride = packed & 0x3fffu;
-		// The RDNA2 stride swizzle (bit 14) is not lowered yet.
-		return stride == 0 || (packed & (1u << 14u)) == 0;
+		return resource < program.info.buffers.size();
 	}
+	static bool BufferSwizzled(uint32_t packed) { return (packed & 0x3fffu) != 0 && (packed & (1u << 14u)) != 0; }
 
 	const IR::MemoryInfo& Mem(const Inst& inst) const {
 		return program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
@@ -677,19 +666,6 @@ struct Emitter {
 		}
 	}
 
-	// GDS access that goes to the device GDS buffer (compute only, where the binding exists). The address is the guest
-	// address plus the static offset, without the M0 base, as in the SPIR-V path (only ds_append/consume use M0).
-	// KYTY_LOOP_TRIP_GDS=1: a compute shader with a GDS binding counts its runaway-loop guard trips in GDS dwords
-	// kMslLoopTripGdsBase + loop id (ids past 7 share the last one); the GPU watchdog prints them. Diagnostic only.
-	bool LoopTripGds() const {
-		static const bool on = std::getenv("KYTY_LOOP_TRIP_GDS") != nullptr;
-		if (!on) return false;
-		for (const auto& binding: program.bindings.descriptors) {
-			if (binding.kind == IR::DescriptorBindingKind::Gds) return true;
-		}
-		return false;
-	}
-
 	bool GdsMem(const IR::MemoryInfo& mem) const {
 		return mem.kind == IR::ResourceKind::Gds && program.stage == ShaderType::Compute && MslGdsEnabled();
 	}
@@ -734,19 +710,27 @@ struct Emitter {
 			index = "(" + index + " + (" + LaneIdExpr() + " & 63u))";
 		}
 		std::string expr;
-		if (stride != 0) {
-			expr = "(" + index + " * " + U32Literal(stride) + ") + ";
-		}
-		expr += Expr(inst.Arg(2));
-		if ((mem.offset + extra) != 0) {
-			expr += " + " + U32Literal(mem.offset + extra);
+		if (BufferSwizzled(packed)) {
+			const std::string offset = "(" + Expr(inst.Arg(2)) + " + " + U32Literal(mem.offset + extra) + ")";
+			// RDNA index-stride swizzle: interleave groups of 8/16/32/64
+			// records at dword granularity. Scalar offset is added afterwards.
+			// Each vector component must rebase its byte offset before this step.
+			const uint32_t shift = 3u + ((packed >> 16u) & 3u);
+			const uint32_t indices = 1u << shift;
+			expr = "(((" + index + " >> " + U32Literal(shift) + ") * " + U32Literal(stride) +
+			       " + (" + offset + " & 0xfffffffcu)) * " + U32Literal(indices) +
+			       " + ((" + index + " & " + U32Literal(indices - 1u) + ") << 2u) + (" + offset + " & 3u))";
+		} else {
+			if (stride != 0) expr = "(" + index + " * " + U32Literal(stride) + ") + ";
+			expr += Expr(inst.Arg(2));
+			if ((mem.offset + extra) != 0) expr += " + " + U32Literal(mem.offset + extra);
 		}
 		expr += " + " + Expr(inst.Arg(3));
 		return "(" + expr + ")";
 	}
 
-	std::string BufferDword(const Inst& inst, const IR::MemoryInfo& mem, uint32_t packed) {
-		return "(" + BufferByte(inst, mem, packed) + " >> 2)";
+	std::string BufferDword(const Inst& inst, const IR::MemoryInfo& mem, uint32_t packed, uint32_t extra = 0) {
+		return "(" + BufferByte(inst, mem, packed, extra) + " >> 2)";
 	}
 
 	static std::string SignExtendBits(const std::string& raw, uint32_t bits) {
@@ -844,10 +828,15 @@ struct Emitter {
 		                       : inst.GetOpcode() == ValueOpcode::StoreBufferU32x3 ? 3u : 4u;
 		const auto value = Expr(inst.Arg(inst.NumArgs() - 2));
 		const auto limit = "sizes[" + std::to_string(mem.resource) + "]";
-		body << "\t\t{\n\t\t\tconst uint kyty_byte = " << BufferByte(inst, mem, packed) << ";\n"
-		     << "\t\t\tif (" << Expr(inst.Arg(inst.NumArgs() - 1)) << " && kyty_byte <= " << limit
-		     << " && " << info.byte_size << "u <= " << limit << " - kyty_byte) {\n"
-		     << "\t\t\t\tdevice uchar* kyty_dst = ((device uchar*)" << ptr << ") + kyty_byte;\n";
+		const bool swizzled_components = BufferSwizzled(packed) && !info.packed_bitfield;
+		if (swizzled_components) {
+			body << "\t\t{\n\t\t\tif (" << Expr(inst.Arg(inst.NumArgs() - 1)) << ") {\n";
+		} else {
+			body << "\t\t{\n\t\t\tconst uint kyty_byte = " << BufferByte(inst, mem, packed) << ";\n"
+			     << "\t\t\tif (" << Expr(inst.Arg(inst.NumArgs() - 1)) << " && kyty_byte <= " << limit
+			     << " && " << info.byte_size << "u <= " << limit << " - kyty_byte) {\n"
+			     << "\t\t\t\tdevice uchar* kyty_dst = ((device uchar*)" << ptr << ") + kyty_byte;\n";
+		}
 		if (info.packed_bitfield) body << "\t\t\t\tuint kyty_packed = 0u;\n";
 		for (uint32_t c = 0; c < info.component_count; ++c) {
 			const uint32_t bits = info.component_bits[c];
@@ -872,9 +861,15 @@ struct Emitter {
 				body << "\t\t\t\tkyty_packed |= kyty_c" << c << " << " << info.component_bit_offset[c] << "u;\n";
 			} else {
 				const uint32_t offset = Format::GetFormatComponentByteOffset(info, c);
-				for (uint32_t b = 0; b < bits / 8u; ++b) {
-					body << "\t\t\t\tkyty_dst[" << offset + b << "] = uchar(kyty_c" << c << " >> " << b * 8u << "u);\n";
+				if (swizzled_components) {
+					body << "\t\t\t\t{ const uint kyty_byte = " << BufferByte(inst, mem, packed, offset) << ";\n"
+					     << "\t\t\t\tif (kyty_byte <= " << limit << " && " << bits / 8u << "u <= " << limit << " - kyty_byte) {\n"
+					     << "\t\t\t\tdevice uchar* kyty_dst = ((device uchar*)" << ptr << ") + kyty_byte;\n";
 				}
+				for (uint32_t b = 0; b < bits / 8u; ++b) {
+					body << "\t\t\t\tkyty_dst[" << (swizzled_components ? b : offset + b) << "] = uchar(kyty_c" << c << " >> " << b * 8u << "u);\n";
+				}
+				if (swizzled_components) body << "\t\t\t\t} }\n";
 			}
 		}
 		if (info.packed_bitfield) {
@@ -885,9 +880,12 @@ struct Emitter {
 	}
 
 	[[nodiscard]] uint32_t LdsDwords() const {
-		if (program.stage != ShaderType::Compute) return 2048u;
-		const uint32_t declared = input_info.compute ? input_info.compute->lds_size_dwords : 0u;
-		return declared != 0 ? std::min(declared, 8192u) : 8192u;
+		const auto* group = ShaderWorkgroupInput(program.stage, input_info);
+		return group && group->lds_size_dwords ? group->lds_size_dwords : 8192u;
+	}
+
+	[[nodiscard]] const char* ReturnValue() const {
+		return program.stage != ShaderType::Mesh && HasOutInterface() ? " out" : "";
 	}
 
 	[[nodiscard]] bool UsesLds() const {
@@ -938,10 +936,22 @@ struct Emitter {
 		const auto kind = static_cast<IR::StageInputKind>(*kind_value);
 		const auto comp = *comp_value;
 		switch (kind) {
-			case IR::StageInputKind::VertexIndex: EmitAssignment(inst, "vid"); return;
-			case IR::StageInputKind::InstanceIndex: EmitAssignment(inst, "iid"); return;
+			case IR::StageInputKind::VertexIndex:
+				if (program.stage == ShaderType::Mesh) {
+					const auto& m=input_info.vertex->mesh;
+					const std::string local=pair_?PairLinearId():"liid";
+					std::string index="(tgid.x * "+std::to_string(m.primitives_per_group*m.InputPrimitiveStep())+"u + "+local+")";
+					if (m.input_primitive==uint32_t(Prospero::PrimitiveType::kTriFan)) index="("+local+" == 0u ? 0u : "+index+")";
+					EmitAssignment(inst,"(mesh_draw[1] + (mesh_draw[3] == 0u ? "+index+" : ("+index+" < mesh_draw[0] ? (mesh_draw[3] == 2u ? uint(reinterpret_cast<device const ushort*>(mesh_indices)[mesh_draw[4] + "+index+"]) : reinterpret_cast<device const uint*>(mesh_indices)[mesh_draw[4] + "+index+"]) : 0u)))");
+				} else EmitAssignment(inst, "vid");
+				return;
+			case IR::StageInputKind::InstanceIndex: EmitAssignment(inst, program.stage==ShaderType::Mesh ? "(mesh_draw[2] + tgid.y)" : "iid"); return;
 			case IR::StageInputKind::InvocationId: EmitAssignment(inst, "0u"); return;
 			case IR::StageInputKind::PrimitiveId:
+				if (program.stage==ShaderType::Mesh) {
+					EmitAssignment(inst,"(tgid.x * "+std::to_string(input_info.vertex->mesh.primitives_per_group)+"u + "+(pair_?PairLinearId():"liid")+")");
+					return;
+				}
 				if (!prim_id_field.empty()) {
 					EmitAssignment(inst, "in." + prim_id_field);
 				} else {
@@ -977,7 +987,7 @@ struct Emitter {
 				EmitAssignment(inst, std::string("tgid.") + ComponentName(comp));
 				return;
 			case IR::StageInputKind::LocalInvocationId:
-				EmitAssignment(inst, pair_ ? PairLocalId(comp) : std::string("tid.") + ComponentName(comp));
+				EmitAssignment(inst, pair_ ? PairLocalId(comp) : program.stage==ShaderType::Mesh ? (comp==0?"liid":"0u") : std::string("tid.") + ComponentName(comp));
 				return;
 			case IR::StageInputKind::LocalInvocationIndex: EmitAssignment(inst, pair_ ? PairLinearId() : "liid"); return;
 			case IR::StageInputKind::GlobalInvocationId:
@@ -1038,8 +1048,7 @@ struct Emitter {
 		// An export with the valid-mask bit makes EXEC the pixel's coverage: a pixel out of it is dropped, colour and depth (the SPIR-V path
 		// kills it the same way). Without this, every pixel a shader rejects wrote zeros to all its targets and its depth: the body under a kit,
 		// which the game masks out, punched black holes into the shirt and shorts. Null exports carry the bit too, so this comes first.
-		static const bool s_no_kill = std::getenv("KYTY_MSL_NO_KILL") != nullptr;
-		if (program.stage == ShaderType::Pixel && exp.vm && !s_no_kill) {
+		if (program.stage == ShaderType::Pixel && exp.vm) {
 			body << "\t\tif (!(" << Expr(inst.Arg(1)) << ")) discard_fragment();\n";
 		}
 		if (exp.kind == IR::ExportTargetKind::Null || exp.en == 0u) {
@@ -1047,20 +1056,27 @@ struct Emitter {
 		}
 		const std::string value = Expr(inst.Arg(0));
 		const std::string exec  = Expr(inst.Arg(1));
+		const std::string output = program.stage == ShaderType::Mesh && half_ == 1u ? "out_h" : "out";
 
 		std::string field;
 		switch (exp.kind) {
 			case IR::ExportTargetKind::Position:
 				if (exp.index != 0) {
-					// Auxiliary position exports carry point size, layer, clip and cull distances: only the clip distances are kept.
-					if (clip_distance_count != 0u && input_info.vertex != nullptr && !exp.compr) {
-						for (uint32_t component = 0; component < 4; ++component) {
-							if ((exp.en & (1u << component)) == 0u) continue;
-							const auto decoded = IR::DecodePositionExportComponent(input_info.vertex->pa_cl_vs_out_cntl, exp.index, component);
-							if (decoded.clip_distance == UINT32_MAX || decoded.clip_distance >= clip_distance_count) continue;
-							body << "\t\tif (" << exec << ") {\n\t\t\tout.clip_dist[" << decoded.clip_distance << "] = as_type<float>(" << value
-							     << "." << ComponentName(component) << ");\n\t\t}\n";
-						}
+					if (input_info.vertex == nullptr || exp.compr) {
+						Unsupported(inst, "auxiliary position export without vertex state or compressed");
+						return;
+					}
+					for (uint32_t component = 0; component < 4; ++component) {
+						if ((exp.en & (1u << component)) == 0u) continue;
+						const auto decoded = IR::DecodePositionExportComponent(input_info.vertex->pa_cl_vs_out_cntl, exp.index, component);
+						const std::string raw = value + "." + ComponentName(component);
+						body << "\t\tif (" << exec << ") {\n";
+						if (decoded.layer && layer_output) body << "\t\t\t" << output << ".layer = " << raw << " & 0x7ffu;\n";
+						if (decoded.viewport && viewport_output) body << "\t\t\t" << output << ".viewport_index = (" << raw << " >> 16u) & 15u;\n";
+						if (decoded.point_size && point_size_output) body << "\t\t\t" << output << ".point_size = as_type<float>(" << raw << ");\n";
+						if (decoded.clip_distance < clip_distance_count) body << "\t\t\t" << output << ".clip_dist[" << decoded.clip_distance << "] = as_type<float>(" << raw << ");\n";
+						if (decoded.cull_distance != UINT32_MAX) Unsupported(inst, "cull distance export");
+						body << "\t\t}\n";
 					}
 					return;
 				}
@@ -1081,11 +1097,18 @@ struct Emitter {
 				break;
 			}
 			case IR::ExportTargetKind::Primitive:
-				// Tessellation/mesh primitive attribute; no export slot in VS/PS.
+				if (program.stage != ShaderType::Mesh) {
+					Unsupported(inst, "primitive export requires NGG execution");
+				} else if (exp.en != 1u || exp.compr) {
+					Unsupported(inst, "invalid NGG primitive export encoding");
+				} else {
+					body << "\t\tif (" << exec << ") " << (half_ == 1u ? "kyty_primitive_h" : "kyty_primitive")
+					     << " = " << value << ".x;\n";
+				}
 				return;
 			case IR::ExportTargetKind::MrtZ:
 				if ((exp.en & 1u) != 0u && !depth_field.empty()) {
-					body << "\t\tif (" << exec << ") {\n\t\t\tout." << depth_field
+					body << "\t\tif (" << exec << ") {\n\t\t\t" << output << "." << depth_field
 					     << " = as_type<float>(" << value << ".x);\n\t\t}\n";
 					return;
 				}
@@ -1119,13 +1142,25 @@ struct Emitter {
 			if (!component_written) {
 				// Unexported colour components read as (0, 0, 0, 1), as in the SPIR-V backend.
 				if (exp.kind == IR::ExportTargetKind::Mrt && component == 3u) {
-					body << "\t\t\tout." << field << "." << ComponentName(component) << " = "
+					body << "\t\t\t" << output << "." << field << "." << ComponentName(component) << " = "
 					     << (integer == 0u ? "1.0f" : "1") << ";\n";
 				}
 				continue;
 			}
 			const std::string bits = value + "." + ComponentName(component);
-			body << "\t\t\tout." << field << "." << ComponentName(component) << " = ";
+			body << "\t\t\t" << output << "." << field << "." << ComponentName(component) << " = ";
+			if (exp.kind == IR::ExportTargetKind::Position && exp.index == 0u && component == 2u &&
+			    input_info.vertex != nullptr && input_info.vertex->clip_space.remap_z) {
+				// Match SPIR-V ConvertPositionToClipSpace: Metal clips [0,W],
+				// while this guest state clips [-W,W]. Do this before viewport Z.
+				if (exp.compr) {
+					body << "(float(as_type<half2>(" << value << ".y).x) + float(as_type<half2>("
+					     << value << ".y).y)) * 0.5f;\n";
+				} else {
+					body << "(as_type<float>(" << bits << ") + as_type<float>(" << value << ".w)) * 0.5f;\n";
+				}
+				continue;
+			}
 			if (exp.compr) {
 				// Compressed export: two 16-bit components per source dword (R,G in the first, B,A in the second).
 				const uint32_t pair = component / 2u;
@@ -1211,6 +1246,162 @@ struct Emitter {
 		return {g, "true"};
 	}
 
+	// Whether a guest EXEC predicate is all ones, so that it also enables the lanes that never launched: whole-wave code
+	// writes EXEC = ~EXEC | saved (s_orn2_saveexec with the saved mask) or EXEC = -1. Only then is a lane absent from a
+	// partly covered host group a live guest lane; everywhere else it is a lane whose EXEC bit is zero.
+	static bool Complements(Value value, Value negated) {
+		const Inst* inst = negated.TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalNot && inst->Arg(0).Resolve() == value;
+	}
+	static bool WholeWaveExec(Value value, uint32_t depth = 0) {
+		if (value.IsEmpty() || depth > 8u) return false;
+		value = value.Resolve();
+		const Inst* inst = value.TryInstruction();
+		if (inst == nullptr) return value.GetType() == IR::Type::U1 && value.U1();
+		const Value a = inst->NumArgs() > 0 ? inst->Arg(0).Resolve() : Value();
+		const Value b = inst->NumArgs() > 1 ? inst->Arg(1).Resolve() : Value();
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::LogicalOr:
+				return Complements(a, b) || Complements(b, a) || WholeWaveExec(a, depth + 1) || WholeWaveExec(b, depth + 1);
+			case ValueOpcode::LogicalAnd: return WholeWaveExec(a, depth + 1) && WholeWaveExec(b, depth + 1);
+			default: return false;
+		}
+	}
+
+	// Identity element of an associative, commutative combining operation, as the 32-bit pattern of its operands.
+	static std::optional<uint32_t> CombineIdentity(ValueOpcode opcode) {
+		switch (opcode) {
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::UMax32: return 0u;
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::UMin32: return 0xffffffffu;
+			case ValueOpcode::SMin32: return 0x7fffffffu;
+			case ValueOpcode::SMax32: return 0x80000000u;
+			case ValueOpcode::IMul32: return 1u;
+			case ValueOpcode::FPAdd32: return 0x80000000u; // -0.0: x + -0.0 == x for every x
+			case ValueOpcode::FPMul32: return 0x3f800000u;
+			case ValueOpcode::FPMin32: return 0x7f800000u; // +inf
+			case ValueOpcode::FPMax32: return 0xff800000u; // -inf
+			default: return std::nullopt;
+		}
+	}
+
+	// One use of a 32-bit value: a combining operation (its identity and its other operand, as a 32-bit value) or anything else.
+	struct CombineUse {
+		bool     combine  = false;
+		uint32_t identity = 0;
+		Value    other;
+	};
+	static Value AsBits(Value value) {
+		value             = value.Resolve();
+		const Inst* inst = value.TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == ValueOpcode::BitCastF32U32 ? inst->Arg(0).Resolve() : value;
+	}
+	// The uses of `value`, looking through float bitcasts and Identity, and (when asked) through selects that pass it on.
+	static void CombineUses(const Inst& value, bool through_select, std::vector<CombineUse>& out, uint32_t depth = 0) {
+		for (const auto& use : value.Uses()) {
+			const Inst& user = *use.user;
+			const auto  op   = user.GetOpcode();
+			if ((op == ValueOpcode::BitCastF32U32 || op == ValueOpcode::Identity ||
+			     (op == ValueOpcode::SelectU32 && through_select && use.operand != 0)) &&
+			    depth < 4u) {
+				CombineUses(user, through_select, out, depth + 1);
+				continue;
+			}
+			const auto identity = CombineIdentity(op);
+			if (identity && user.NumArgs() == 2) {
+				out.push_back({true, *identity, AsBits(user.Arg(use.operand == 0 ? 1 : 0))});
+			} else {
+				out.push_back({});
+			}
+		}
+	}
+
+	// A wave64 program that runs native32 is a guest wave whose lanes 32..63 never launched: always for pixel and vertex waves
+	// (the rasterizer and vertex grouping choose a wave's lanes), for compute and mesh only when the whole workgroup fits in 32
+	// lanes (larger native32 groups put guest lanes 32..63 in another SIMD group, which nothing here models).
+	bool UpperHalfNeverLaunched() const {
+		if (pair_ || program.wave_size != 64u) return false;
+		if (program.stage == ShaderType::Pixel || program.stage == ShaderType::Vertex) return true;
+		const auto* group = ShaderWorkgroupInput(program.stage, input_info);
+		if (group == nullptr) return false;
+		return std::max(group->threads_num[0], 1u) * std::max(group->threads_num[1], 1u) * std::max(group->threads_num[2], 1u) <= 32u;
+	}
+
+	// `op(readlane(V, lo), readlane(V, hi))`, lo < 32 <= hi, combines the two halves' partial results of a reduction. With the
+	// upper half never launched it contributes op's identity; reading lane hi & 31 instead counts the low half twice for add
+	// and cancels it for xor. Only that exact form is rewritten; any other use keeps the ordinary read.
+	std::optional<uint32_t> UpperHalfIdentity(const Inst& readlane) const {
+		const auto lane = ImmU32(readlane.Arg(1));
+		if (!lane || (*lane & 63u) < 32u || !UpperHalfNeverLaunched()) return std::nullopt;
+		const Value             source = readlane.Arg(0).Resolve();
+		std::vector<CombineUse> uses;
+		CombineUses(readlane, false, uses);
+		std::optional<uint32_t> identity;
+		for (const auto& use : uses) {
+			const Inst* other = use.other.TryInstruction();
+			if (!use.combine || other == nullptr || other->GetOpcode() != ValueOpcode::ReadLane || !(other->Arg(0).Resolve() == source)) {
+				return std::nullopt;
+			}
+			const auto other_lane = ImmU32(other->Arg(1));
+			if (!other_lane || (*other_lane & 63u) >= 32u || (identity && *identity != use.identity)) return std::nullopt;
+			identity = use.identity;
+		}
+		return identity;
+	}
+
+	// Identity of the operation that combines a permlane result with its own source, op(V, permlane(V)) (also through an EXEC
+	// select), when every such combination agrees. Uses that do not combine (a loop-carried copy) do not decide it.
+	static std::optional<uint32_t> PermlaneIdentity(const Inst& permlane) {
+		const Value             source = permlane.Arg(0).Resolve();
+		std::vector<CombineUse> uses;
+		CombineUses(permlane, true, uses);
+		std::optional<uint32_t> identity;
+		for (const auto& use : uses) {
+			if (!use.combine) continue;
+			if (!(use.other == source) || (identity && *identity != use.identity)) return std::nullopt;
+			identity = use.identity;
+		}
+		return identity;
+	}
+
+	// The value is the last row step of a DPP scan (row_shr:8) or butterfly (row_xmask:8): a lane of the row that never launched
+	// holds what the highest launched lane of the row at or below it holds (its prefix, or the row total).
+	static bool RowComplete(Value value) {
+		const Inst* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::DppUpdateU32) return false;
+		const uint32_t control = inst->Flags<IR::DppMoveFlags>().control;
+		return control == 0x118u || control == 0x168u;
+	}
+
+	// row_xmask:m (m = 2, 4, 8) applied to the result of row_xmask:m/2 is a butterfly step: before it every aligned block of m
+	// lanes holds one value, so a lane that never launched holds what the launched lanes of its block hold. Returns m, else 0.
+	static uint32_t ButterflyBlock(const IR::DppMoveFlags& flags, Value source) {
+		const uint32_t control = flags.control;
+		if (flags.dpp8 || control < 0x162u || control > 0x16fu) return 0u;
+		const uint32_t m = control & 0xfu;
+		if ((m & (m - 1u)) != 0u) return 0u;
+		const Inst* inst = source.Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::DppUpdateU32) return 0u;
+		return inst->Flags<IR::DppMoveFlags>().control == (0x160u | (m >> 1u)) ? m : 0u;
+	}
+	// The DPP move whose result DppUpdateU32 writes (directly, or as an operand of the combining operation).
+	static const Inst* DppMoveOf(const Inst& update) {
+		const Inst* value = update.Arg(0).Resolve().TryInstruction();
+		if (value == nullptr) return nullptr;
+		if (value->GetOpcode() == ValueOpcode::DppMoveU32) return value;
+		for (size_t i = 0; i < value->NumArgs(); ++i) {
+			const Inst* arg = value->Arg(i).Resolve().TryInstruction();
+			if (arg != nullptr && arg->GetOpcode() == ValueOpcode::DppMoveU32 &&
+			    arg->Flags<IR::DppMoveFlags>().control == update.Flags<IR::DppMoveFlags>().control) {
+				return arg;
+			}
+		}
+		return nullptr;
+	}
+
 	// ds_swizzle_b32 source lane within the 32-lane group of `lane` (the host simdgroup lane, which is also the lane within its half).
 	static std::string SwizzleSourceLane(uint32_t control) {
 		if ((control & 0xc000u) == 0xc000u) {
@@ -1268,7 +1459,7 @@ struct Emitter {
 					     << "\t\t\tconst bool kyty_da = ((((kyty_dt & 32u) != 0u ? kyty_db.y : kyty_db.x) >> (kyty_dt & 31u)) & 1u) != 0u;\n"
 					     << "\t\t\tkyty_dv = (" << src.valid << " && kyty_da) ? kyty_dv : 0u;\n";
 				}
-				body << "\t\t\t" << Name(inst) << " = kyty_dv;\n\t\t}\n";
+				body << "\t\t\t" << Name(inst) << " = (" << src.valid << ") ? kyty_dv : 0u;\n\t\t}\n";
 				return true;
 			}
 			case IR::ValueOpcode::DppUpdateU32: {
@@ -1277,9 +1468,24 @@ struct Emitter {
 				std::string       write = "(" + Expr(inst.Arg(2)) + " && ((" + std::to_string(flags.bank_mask) + "u >> ((" + g +
 				                    " >> 2u) & 3u)) & 1u) != 0u && ((" + std::to_string(flags.row_mask) + "u >> ((" + g +
 				                    " >> 4u) & 3u)) & 1u) != 0u";
-				if (!flags.bound_control) write += " && " + DppSourceLane(flags, g).valid;
+				// BOUND_CTRL = 0 suppresses the write for an invalid source: outside the row, or (FI = 0) a lane whose EXEC
+				// bit is zero.
+				const auto src    = DppSourceLane(flags, g);
+				const bool check  = !flags.bound_control && !flags.fetch_inactive;
+				if (!flags.bound_control) write += " && " + src.valid;
+				if (check) {
+					body << "\t\t{\n\t\t\tconst uint kyty_ut = " << src.target << " & 63u;\n"
+					     << "\t\t\tconst uint4 kyty_ub = kyty_ballot2(" << arg(2, 0) << ", " << arg(2, 1) << ");\n"
+					     << "\t\t\tconst bool kyty_ua = ((((kyty_ut & 32u) != 0u ? kyty_ub.y : kyty_ub.x) >> (kyty_ut & 31u)) & 1u) != 0u;\n";
+					write += " && kyty_ua";
+				}
 				write += ")";
-				EmitAssignment(inst, "(" + write + " ? " + Expr(inst.Arg(0)) + " : " + Expr(inst.Arg(1)) + ")");
+				if (check) {
+					body << "\t\t\t" << Name(inst) << " = " << write << " ? " << Expr(inst.Arg(0)) << " : " << Expr(inst.Arg(1))
+					     << ";\n\t\t}\n";
+				} else {
+					EmitAssignment(inst, "(" + write + " ? " + Expr(inst.Arg(0)) + " : " + Expr(inst.Arg(1)) + ")");
+				}
 				return true;
 			}
 			default: return false;
@@ -1299,6 +1505,13 @@ struct Emitter {
 			}
 			return;
 		}
+		if(inst.GetOpcode()==ValueOpcode::DppMoveU32 || inst.GetOpcode()==ValueOpcode::DppUpdateU32) {
+			const auto flags=inst.Flags<IR::DppMoveFlags>();const uint32_t c=flags.control;
+			if(!flags.dpp8 && !(c<=0xffu || (c>=0x101u && c<=0x10fu) || (c>=0x111u && c<=0x11fu) ||
+			    (c>=0x121u && c<=0x12fu) || c==0x140u || c==0x141u || (c>=0x150u && c<=0x16fu))) {
+				Unsupported(inst,"unsupported RDNA DPP control");return;
+			}
+		}
 		if (pair_ && EmitWavePair(inst)) return;
 		switch (inst.GetOpcode()) {
 			case IR::ValueOpcode::LaneId:
@@ -1307,10 +1520,17 @@ struct Emitter {
 			case IR::ValueOpcode::Ballot:
 				EmitAssignment(inst, "kyty_ballot(" + Expr(inst.Arg(0)) + ")");
 				return;
-			case IR::ValueOpcode::ReadLane:
-				EmitAssignment(inst, "simd_shuffle(" + Expr(inst.Arg(0)) + ", (ushort)(" +
-				                        Expr(inst.Arg(1)) + " & 31u))");
+			case IR::ValueOpcode::ReadLane: {
+				if (const auto identity = UpperHalfIdentity(inst)) {
+					EmitAssignment(inst, U32Literal(*identity));
+					return;
+				}
+				// Wave64 lanes 32..63 are not in this group; lane & 31 keeps a reduction's total at lane 31 (63 -> 31).
+				body << "\t\t{\n\t\t\tconst uint kyty_rl = kyty_live_lanes();\n"
+				     << "\t\t\t" << Name(inst) << " = simd_shuffle(" << Expr(inst.Arg(0)) << ", kyty_live_source(kyty_rl, "
+				     << Expr(inst.Arg(1)) << " & 31u));\n\t\t}\n";
 				return;
+			}
 			case IR::ValueOpcode::WriteLane:
 				EmitAssignment(inst, "(lane == " + Expr(inst.Arg(2)) + " ? " + Expr(inst.Arg(1)) +
 				                        " : " + Expr(inst.Arg(0)) + ")");
@@ -1320,15 +1540,67 @@ struct Emitter {
 				                        ", kyty_first_lane(kyty_ballot(" + Expr(inst.Arg(1)) + ")))");
 				return;
 			case IR::ValueOpcode::DppMoveU32: {
-				const auto flags = inst.Flags<IR::DppMoveFlags>();
-				EmitAssignment(inst, "simd_shuffle(" + Expr(inst.Arg(0)) + ", (ushort)((" +
-				                        DppSourceLane(flags, "lane").target + ") & 31u))");
+				// RDNA DPP16: a source outside the row, or (FI = 0) a source lane whose EXEC bit is zero, is invalid;
+				// BOUND_CTRL = 1 reads zero from it and BOUND_CTRL = 0 suppresses the write (DppUpdateU32). A lane absent
+				// from a partly covered group is live on the guest only under a whole-wave EXEC; its value is not
+				// available here, so the move reads our own value and DppUpdateU32 keeps the destination.
+				const auto     flags = inst.Flags<IR::DppMoveFlags>();
+				const auto     src   = DppSourceLane(flags, "lane");
+				const bool     whole = WholeWaveExec(inst.Arg(1));
+				const uint32_t block = whole ? ButterflyBlock(flags, inst.Arg(0)) : 0u;
+				body << "\t\t{\n\t\t\tconst uint kyty_dt = " << src.target << " & 31u;\n"
+				     << "\t\t\tconst uint kyty_dl = kyty_live_lanes();\n"
+				     << "\t\t\tconst bool kyty_dp = ((kyty_dl >> kyty_dt) & 1u) != 0u;\n";
+				std::string source = "(ushort)kyty_dt", fetched = "kyty_dp";
+				if (block != 0u) {
+					// Launched lanes of the source's butterfly block at or below it (they hold the block's value).
+					body << "\t\t\tconst uint kyty_dk = kyty_dl & (0xffffffffu >> (31u - kyty_dt)) & ~((1u << (kyty_dt & ~"
+					     << (block - 1u) << "u)) - 1u);\n";
+					source  = "(kyty_dp || kyty_dk == 0u ? (ushort)kyty_dt : (ushort)(31u - clz(kyty_dk)))";
+					fetched = "(kyty_dp || kyty_dk != 0u)";
+				}
+				body << "\t\t\tuint kyty_dv = simd_shuffle(" << Expr(inst.Arg(0)) << ", " << source << ");\n"
+				     << "\t\t\tkyty_dv = " << fetched << " ? kyty_dv : " << Expr(inst.Arg(0)) << ";\n";
+				std::string active = "true";
+				if (!flags.fetch_inactive) {
+					body << "\t\t\tconst uint kyty_db = kyty_ballot(" << Expr(inst.Arg(1)) << ").x;\n";
+					active = std::string("(kyty_dp ? (((kyty_db >> kyty_dt) & 1u) != 0u) : ") + (whole ? "true" : "false") + ")";
+				}
+				body << "\t\t\t" << Name(inst) << " = (" << src.valid << " && " << active << ") ? kyty_dv : 0u;\n\t\t}\n";
 				return;
 			}
-			case IR::ValueOpcode::DppUpdateU32:
-				EmitAssignment(inst, "(" + Expr(inst.Arg(2)) + " ? " + Expr(inst.Arg(0)) + " : " +
-				                        Expr(inst.Arg(1)) + ")");
+			case IR::ValueOpcode::DppUpdateU32: {
+				const auto        flags = inst.Flags<IR::DppMoveFlags>();
+				const auto        src   = DppSourceLane(flags, "lane");
+				const bool        whole = WholeWaveExec(inst.Arg(2));
+				const std::string exec  = Expr(inst.Arg(2));
+				const Inst*       move  = whole ? DppMoveOf(inst) : nullptr;
+				const uint32_t    block = move != nullptr ? ButterflyBlock(flags, move->Arg(0)) : 0u;
+				body << "\t\t{\n\t\t\tconst uint kyty_ut = " << src.target << " & 31u;\n"
+				     << "\t\t\tconst uint kyty_ul = kyty_live_lanes();\n"
+				     << "\t\t\tconst bool kyty_up = ((kyty_ul >> kyty_ut) & 1u) != 0u;\n";
+				if (block != 0u) {
+					body << "\t\t\tconst uint kyty_uk = kyty_ul & (0xffffffffu >> (31u - kyty_ut)) & ~((1u << (kyty_ut & ~"
+					     << (block - 1u) << "u)) - 1u);\n";
+				}
+				// Source validity on the guest: in the row, and (FI = 0) live. An absent source is live only under a
+				// whole-wave EXEC, where it holds the reduction identity: keeping the destination is that result for
+				// in-place operations and for moves into an identity-filled register.
+				std::string live = "true";
+				if (!flags.fetch_inactive) {
+					body << "\t\t\tconst uint kyty_ub = kyty_ballot(" << exec << ").x;\n";
+					live = std::string("(kyty_up ? (((kyty_ub >> kyty_ut) & 1u) != 0u) : ") + (whole ? "true" : "false") + ")";
+				}
+				const std::string valid = "(" + src.valid + " && " + live + ")";
+				std::string       write = "(" + exec + " && ((" + std::to_string(flags.bank_mask) +
+				                    "u >> ((lane >> 2u) & 3u)) & 1u) != 0u && ((" + std::to_string(flags.row_mask) +
+				                    "u >> ((lane >> 4u) & 3u)) & 1u) != 0u && " + (flags.bound_control ? "true" : valid);
+				if (whole) write += " && !(" + src.valid + " && !kyty_up" + (block != 0u ? " && kyty_uk == 0u" : "") + ")";
+				write += ")";
+				body << "\t\t\t" << Name(inst) << " = " << write << " ? " << Expr(inst.Arg(0)) << " : " << Expr(inst.Arg(1))
+				     << ";\n\t\t}\n";
 				return;
+			}
 			case IR::ValueOpcode::Permlane16U32: {
 				const auto flags = inst.Flags<IR::PermlaneFlags>();
 				body << "\t\t{\n"
@@ -1340,11 +1612,33 @@ struct Emitter {
 				     << Expr(inst.Arg(2)) << " : " << Expr(inst.Arg(1)) << ";\n"
 				     << "\t\t\tconst uint kyty_target = kyty_row_value | ((kyty_selected >> "
 				        "kyty_shift) & 15u);\n"
-				     << "\t\t\t" << Name(inst) << " = simd_shuffle(" << Expr(inst.Arg(0))
-				     << ", (ushort)(kyty_target & 31u));\n";
+				     << "\t\t\tconst uint kyty_pl = kyty_live_lanes();\n"
+				     << "\t\t\tconst bool kyty_pp = ((kyty_pl >> (kyty_target & 31u)) & 1u) != 0u;\n"
+				     << "\t\t\tconst uint kyty_pv = simd_shuffle(" << Expr(inst.Arg(0)) << ", (ushort)(kyty_target & 31u));\n";
+				// A source lane that never launched is live on the guest under a whole-wave EXEC. After the row step of a
+				// scan or butterfly it holds what the highest launched lane of its row at or below it holds; a row with no
+				// launched lane holds the identity of the operation that combines the result with its source (own value
+				// when that is not known: neutral for min/max/and/or, as the SPIR-V path does). Without a whole-wave EXEC
+				// it is an inactive lane: zero with FI = 0, its stale register with FI = 1.
+				const bool  whole = WholeWaveExec(inst.Arg(3));
+				std::string absent = flags.fetch_inactive ? Expr(inst.Arg(0)) : std::string("0u");
+				if (whole) {
+					const auto identity = PermlaneIdentity(inst);
+					absent              = identity ? U32Literal(*identity) : Expr(inst.Arg(0));
+					if (RowComplete(inst.Arg(0))) {
+						body << "\t\t\tconst uint kyty_pr = kyty_pl & (0xffffu << (kyty_target & 16u)) & (0xffffffffu >> (31u - (kyty_target & 31u)));\n"
+						     << "\t\t\tconst uint kyty_ph = simd_shuffle(" << Expr(inst.Arg(0))
+						     << ", (ushort)(kyty_pr != 0u ? 31u - clz(kyty_pr) : (kyty_target & 31u)));\n";
+						absent = "(kyty_pr != 0u ? kyty_ph : " + absent + ")";
+					}
+				}
 				if (!flags.fetch_inactive) {
-					body << "\t\t\tif (!simd_shuffle(uint(" << Expr(inst.Arg(3))
-					     << "), (ushort)(kyty_target & 31u))) " << Name(inst) << " = 0u;\n";
+					body << "\t\t\tconst uint kyty_pe = simd_shuffle(uint(" << Expr(inst.Arg(3))
+					     << "), (ushort)(kyty_target & 31u));\n";
+				}
+				body << "\t\t\t" << Name(inst) << " = kyty_pp ? kyty_pv : " << absent << ";\n";
+				if (!flags.fetch_inactive) {
+					body << "\t\t\tif (kyty_pp && kyty_pe == 0u) " << Name(inst) << " = 0u;\n";
 				}
 				body << "\t\t}\n";
 				return;
@@ -1408,17 +1702,18 @@ struct Emitter {
 			return;
 		}
 
+		if (inst.GetType() != IR::Type::Void)
+			body << "\t\t" << Name(inst) << " = (" << MslType(inst.GetType()) << ")0;\n";
+		body << "\t\tif (!is_null_texture(" << tex << ")) {\n";
+		struct ImageScope {
+			std::ostringstream& body;
+			~ImageScope() { body << "\t\t}\n"; }
+		} image_scope {body};
+
 		switch (op) {
 			case IR::ValueOpcode::ImageSampleRaw: {
 				const auto layout = LayoutOf(mem);
 				if (image.cube) {
-					// Experimental (KYTY_MSL_CUBE=1): the kernels that sample cubes (reflection filtering) run for seconds per frame
-					// with the state-machine codegen and the cube faces are not uploaded yet, so they stay skipped by default.
-					// Graphics stages sample cubes by default (a skipped pixel shader drops its draw); compute kernels stay off.
-					if (program.stage == ShaderType::Compute && std::getenv("KYTY_MSL_CUBE") == nullptr) {
-						fail("cube sample in compute (enable with KYTY_MSL_CUBE=1)");
-						return;
-					}
 					if (dim.components < 2u || dim.components > 3u || dim.spatial != 2u || (mem.image_sample_flags & Decoder::ImageSampleFlagDerivative) != 0u ||
 					    layout.dref >= 0) {
 						char why[160];
@@ -1499,18 +1794,101 @@ struct Emitter {
 				} else {
 					call = tex + ".sample(" + sampler + ", " + coord + array_arg + ")";
 				}
+				if (layout.dref < 0 && layout.offset >= 0 && (spatial == 2u || spatial == 3u)) {
+					// Metal's native offset is signed four-bit; RDNA's is six-bit.
+					// Keep native filtering for representable offsets and fetch the
+					// actual selected-mip footprint for the wider guest range.
+					const auto packed = AddressU32(*address,mem,static_cast<uint32_t>(layout.offset));
+					std::string offset = "int" + std::to_string(spatial) + "(";
+					for (uint32_t axis=0;axis<spatial;++axis)
+						offset += (axis ? ", " : "") + std::string("(int((") + packed + " >> " +
+						          std::to_string(axis*8u) + "u) << 26u) >> 26)";
+					offset += ")";
+					call.insert(call.size()-1,", " + offset);
+					std::string state = "uint4(";
+					for (uint32_t word=0;word<4;++word)
+						state += (word ? ", " : "") + std::string("sizes[") +
+						    std::to_string(SamplerDescriptorWordBase + 4u * *sampler_slot + word) + "]";
+					state += ")";
+					std::string lod = "0.0f";
+					if (lod_flag && layout.lod>=0) lod=AddressF32(*address,mem,static_cast<uint32_t>(layout.lod));
+					else if (!level_zero && (derivative || program.stage==ShaderType::Pixel)) {
+						const auto dx=derivative?CoordF32(*address,mem,static_cast<uint32_t>(layout.grad_x),spatial,false):"dfdx("+coord+")";
+						const auto dy=derivative?CoordF32(*address,mem,static_cast<uint32_t>(layout.grad_y),spatial,false):"dfdy("+coord+")";
+						const auto extent="float"+std::to_string(spatial)+"("+tex+".get_width(), "+tex+".get_height()"+
+						    (spatial==3u?", "+tex+".get_depth())":")");
+						const auto scale="(("+state+".x & 0x8000u) == 0u ? "+extent+" : float"+std::to_string(spatial)+"(1.0f))";
+						lod="(log2(max(length("+dx+" * "+scale+"), length("+dy+" * "+scale+")))";
+						if (layout.bias>=0) lod+=" + "+AddressF32(*address,mem,static_cast<uint32_t>(layout.bias));
+						lod+=")";
+					}
+					const auto software="kyty_sample_colour_offset("+tex+", ab.comparison_points["+std::to_string(*sampler_slot)+"], "+
+					    coord+array_arg+", "+state+", "+lod+", float"+std::to_string(spatial)+"("+offset+"))";
+					call="((all("+offset+" >= int"+std::to_string(spatial)+"(-8)) && all("+offset+" <= int"+
+					    std::to_string(spatial)+"(7))) ? "+call+" : "+software+")";
+				}
 				if (layout.dref >= 0) {
-					// Depth-compare sample: the depth is sampled as a float and compared with the reference (texel >= reference,
-					// no percentage-closer filtering). KYTY_MSL_CMP_FUNC=1: the sampler's own compare function instead (sizes[64 + slot]):
-					// right for the shadow samplers (GREATER) but um190/um194 lost the red room's light (some dref samplers carry
-					// NEVER/ALWAYS), so it stays opt-in.
-					// KYTY_MSL_CMP_FUNC=ref: reference <func> texel (the Vulkan reference's order), as the mirrored function of texel-first.
-					static const char* s_cmp_func = std::getenv("KYTY_MSL_CMP_FUNC");
-					const std::string slot_func = "sizes[" + std::to_string(64u + *sampler_slot) + "]";
-					const std::string func = s_cmp_func == nullptr ? std::string("6u")
-					                         : std::strcmp(s_cmp_func, "ref") == 0 ? "((0x73516240u >> (" + slot_func + " * 4u)) & 0xfu)"
-					                                                               : slot_func;
-					call = "kyty_sample_cmp(" + call + ", " + AddressF32(*address, mem, static_cast<uint32_t>(layout.dref)) + ", " + func + ")";
+					const auto state_base = SamplerDescriptorWordBase + 4u * *sampler_slot;
+					std::string state = "uint4(";
+					for (uint32_t word = 0; word < 4; ++word)
+						state += (word ? ", " : "") + std::string("sizes[") + std::to_string(state_base + word) + "]";
+					state += ")";
+					std::string lod = "0.0f";
+					if (lod_flag && layout.lod >= 0) lod = AddressF32(*address, mem, static_cast<uint32_t>(layout.lod));
+					else if (!level_zero && (derivative || program.stage == ShaderType::Pixel)) {
+						const auto dx = derivative ? CoordF32(*address, mem, static_cast<uint32_t>(layout.grad_x), spatial, false) : "dfdx(" + coord + ")";
+						const auto dy = derivative ? CoordF32(*address, mem, static_cast<uint32_t>(layout.grad_y), spatial, false) : "dfdy(" + coord + ")";
+						std::string extent = "float(" + tex + ".get_width())";
+						if (spatial > 1u) extent = "float" + std::to_string(spatial) + "(" + tex + ".get_width(), " + tex + ".get_height()" +
+						                             (spatial == 3u ? ", " + tex + ".get_depth())" : ")");
+						const auto scale = "((" + state + ".x & 0x8000u) == 0u ? " + extent + " : " + (spatial == 1u ? "1.0f" : "float" + std::to_string(spatial) + "(1.0f)") + ")";
+						lod = "(log2(max(length(" + dx + " * " + scale + "), length(" + dy + " * " + scale + ")))";
+						if (layout.bias >= 0) lod += " + " + AddressF32(*address, mem, static_cast<uint32_t>(layout.bias));
+						lod += ")";
+					}
+					std::string offset = spatial == 1u ? "0.0f" : "float" + std::to_string(spatial) + "(0.0f)";
+					if (layout.offset >= 0) {
+						const auto packed = AddressU32(*address, mem, static_cast<uint32_t>(layout.offset));
+						offset = spatial == 1u ? "" : "float" + std::to_string(spatial) + "(";
+						for (uint32_t axis = 0; axis < spatial; ++axis)
+							offset += (axis ? ", " : "") + std::string("float(int((") + packed + " >> " + std::to_string(8u * axis) + "u) << 26u) >> 26)";
+						if (spatial > 1u) offset += ")";
+					}
+					call = "kyty_sample_depth_cmp(" + tex + ", ab.comparison_points[" + std::to_string(*sampler_slot) + "], " + coord + array_arg + ", " +
+					       AddressF32(*address, mem, static_cast<uint32_t>(layout.dref)) + ", " + state + ", " + lod + ", " + offset + ")";
+					// Use the same native depth operation as SPIRV-Cross for normalized
+					// 2D resources. This preserves hardware PCF and anisotropic footprints.
+					// Metal requires a constant texel offset; dynamic offsets and dimensions
+					// without a Metal depth type use the explicit per-texel comparison above.
+					const auto packed_offset = layout.offset >= 0 ? address->Arg(static_cast<uint32_t>(layout.offset)).Resolve() : IR::Value(0u);
+					bool native_offset=packed_offset.IsImmediate();
+					if (native_offset && layout.offset>=0) for (uint32_t axis=0;axis<2u;++axis) {
+						const int value=int(((packed_offset.U32()>>(axis*8u))&63u)^32u)-32;
+						native_offset &= value>=-8 && value<=7;
+					}
+					if (spatial == 2u && native_offset) {
+						std::string native = "kyty_depth_cast(" + tex + ").sample_compare(" + sampler + ", " + coord + array_arg + ", " +
+						                     AddressF32(*address, mem, static_cast<uint32_t>(layout.dref));
+						if (derivative) {
+							native += ", gradient2d(" + CoordF32(*address, mem, static_cast<uint32_t>(layout.grad_x), spatial, false) + ", " +
+							          CoordF32(*address, mem, static_cast<uint32_t>(layout.grad_y), spatial, false) + ")";
+						} else if (explicit_lod) {
+							native += ", level(" + (lod_flag && layout.lod >= 0 ? AddressF32(*address, mem, static_cast<uint32_t>(layout.lod)) : "0.0f") + ")";
+						} else if (layout.bias >= 0) {
+							native += ", bias(" + AddressF32(*address, mem, static_cast<uint32_t>(layout.bias)) + ")";
+						}
+						if (layout.offset >= 0) {
+							const auto packed = packed_offset.U32();
+							const auto x = static_cast<int32_t>((packed & 63u) ^ 32u) - 32;
+							const auto y = static_cast<int32_t>(((packed >> 8u) & 63u) ^ 32u) - 32;
+							native += ", int2(" + std::to_string(x) + ", " + std::to_string(y) + ")";
+						}
+						native += ")";
+						call = "((sizes[" + std::to_string(ImageMetadataWordBase + mem.resource) + "] & 1u) != 0u && (" + state +
+						       ".x & 0x8000u) == 0u ? float4(" + native + ") : " + call + ")";
+					}
+					// IR carries one scalar result; the RDNA frontend replicates VGPR writes.
+					if (mem.data_bits != 16u) call = "float4((" + call + ").x, 0.0f, 0.0f, 0.0f)";
 				}
 				EmitAssignment(inst, TexelBits(image, call, &mem));
 				return;
@@ -1546,13 +1924,14 @@ struct Emitter {
 				                   std::to_string(*sampler_slot) + "], " + coord + array_arg +
 				                   ", int2(0), component::" + component + ")";
 				if ((mem.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u && layout.dref >= 0) {
-					// Depth-compare gather: compare the reference with each gathered texel (LESS_EQUAL).
-					static const char* s_cmp_func_g = std::getenv("KYTY_MSL_CMP_FUNC");
-					const std::string slot_func_g = "sizes[" + std::to_string(64u + *sampler_slot) + "]";
-					const std::string func_g = s_cmp_func_g == nullptr ? std::string("6u")
-					                           : std::strcmp(s_cmp_func_g, "ref") == 0 ? "((0x73516240u >> (" + slot_func_g + " * 4u)) & 0xfu)"
-					                                                                   : slot_func_g;
-					call = "kyty_gather_cmp(" + call + ", " + AddressF32(*address, mem, static_cast<uint32_t>(layout.dref)) + ", " + func_g + ")";
+					const std::string func = "(sizes[" + std::to_string(64u + *sampler_slot) + "] & 7u)";
+					call = "kyty_gather_cmp(" + call + ", " + AddressF32(*address, mem, static_cast<uint32_t>(layout.dref)) + ", " + func + ")";
+					const auto state_base = SamplerDescriptorWordBase + 4u * *sampler_slot;
+					const std::string native = "kyty_depth_cast(" + tex + ").gather_compare(ab.samplers[" +
+					    std::to_string(*sampler_slot) + "], " + coord + array_arg + ", " +
+					    AddressF32(*address, mem, static_cast<uint32_t>(layout.dref)) + ")";
+					call = "((sizes[" + std::to_string(ImageMetadataWordBase + mem.resource) + "] & 1u) != 0u && (sizes[" +
+					       std::to_string(state_base) + "] & 0x8000u) == 0u ? " + native + " : " + call + ")";
 				}
 				EmitAssignment(inst, TexelBits(image, call, &mem));
 				return;
@@ -1591,6 +1970,17 @@ struct Emitter {
 				    image.mip_mode == IR::ImageMipMode::Dynamic
 				        ? AddressU32(*address, mem, static_cast<uint32_t>(dim.components)) : "0u";
 				const std::string value = TexelValue(image, Expr(inst.Arg(2)), &mem);
+				if (store_trace_ && image.numeric_class == Prospero::TextureNumericClass::Float && spatial == 2 && !arrayed && mem.resource < 32) {
+					const auto base = std::to_string(321u + mem.resource * 4u);
+					body << "\t\tif (" << Expr(inst.Arg(3)) << " && atomic_load_explicit(kyty_store_dbg, memory_order_relaxed) != 0u) {"
+					     << " uint2 _p = " << coord << "; float4 _v = " << value << ";"
+					     << " if (all(_p < uint2(" << tex << ".get_width(), " << tex << ".get_height()))) {"
+					     << " atomic_fetch_add_explicit(kyty_store_dbg + " << base << "u, 1u, memory_order_relaxed);"
+					     << " float _m = fmax(fabs(_v.x), fmax(fabs(_v.y), fabs(_v.z)));"
+					     << " atomic_fetch_max_explicit(kyty_store_dbg + " << base << "u + 2u, as_type<uint>(_m), memory_order_relaxed);"
+					     << " if (any(isnan(_v.xyz))) { atomic_fetch_add_explicit(kyty_store_dbg + " << base << "u + 1u, 1u, memory_order_relaxed);"
+					     << " atomic_fetch_min_explicit(kyty_store_dbg + " << base << "u + 3u, (_p.y << 16u) | _p.x, memory_order_relaxed); } } }\n";
+				}
 				body << "\t\tif (" << Expr(inst.Arg(3)) << ") {\n\t\t\t" << tex << ".write(" << value
 				     << ", " << coord << array_arg << ", " << lod << ");\n\t\t}\n";
 				return;
@@ -1609,8 +1999,8 @@ struct Emitter {
 				} else if (dim.components > dim.spatial) {
 					d = "(uint)" + tex + ".get_array_size()";
 				}
-				EmitAssignment(inst, "uint4((uint)" + tex + ".get_width(" + lod + "), " + h + ", " + d + ", (uint)" +
-				                         tex + ".get_num_mip_levels())");
+				const std::string width = tex + (dim.spatial == 1u ? ".get_width()" : ".get_width(" + lod + ")");
+				EmitAssignment(inst, "uint4((uint)" + width + ", " + h + ", " + d + ", (uint)" + tex + ".get_num_mip_levels())");
 				return;
 			}
 			default: fail("image operation"); return;
@@ -1690,20 +2080,7 @@ struct Emitter {
 				const auto merge = BlockIndex(term.merge_block);
 				if (merge >= program.blocks.size() || merge == index) return false;
 				loops.emplace_back(index, merge);
-				// The guard counts the iterations of this entry into the loop (reset when an enclosing loop enters it again).
-				const uint32_t loop_id = next_loop++;
-				body << "\tuint kyty_loop" << loop_id << " = 0u;\n";
 				body << "\twhile (true) {\n";
-				// A compute thread that ran out of iterations leaves the loop rather than the kernel: a `return` here left the
-				// rest of the threadgroup waiting at the next threadgroup_barrier for good (a GPU hang the watchdog ends).
-				if (program.stage == ShaderType::Compute && LoopTripGds()) {
-					body << "\t\tif (++kyty_loop" << loop_id << " > " << MslLoopCap() << "u) { atomic_fetch_add_explicit(&ab.gds["
-					     << kMslLoopTripGdsBase + std::min(loop_id, 7u) << "u], 1u, memory_order_relaxed); break; }\n";
-				} else if (program.stage == ShaderType::Compute) {
-					body << "\t\tif (++kyty_loop" << loop_id << " > " << MslLoopCap() << "u) { break; }\n";
-				} else {
-					body << "\t\tif (++kyty_loop" << loop_id << " > " << MslLoopCap() << "u) { return" << (HasOutInterface() ? " out" : "") << "; }\n";
-				}
 				if (!EmitStructuredRegion(index, UINT32_MAX, loops, seen, depth + 1, index)) return false;
 				body << "\t}\n";
 				loops.pop_back();
@@ -1718,7 +2095,7 @@ struct Emitter {
 				if (inst.GetOpcode() != ValueOpcode::Phi && !IsResourceType(inst.GetType())) EmitWaveInstruction(inst);
 			}
 			if (term.kind == CFG::TerminatorKind::Return) {
-				body << "\t\treturn" << (HasOutInterface() ? " out" : "") << ";\n";
+				body << "\t\treturn" << ReturnValue() << ";\n";
 				return true;
 			}
 			if (term.kind == CFG::TerminatorKind::Branch) {
@@ -1752,11 +2129,24 @@ struct Emitter {
 			return;
 		}
 		body << "\t\t" << Name(inst) << " = " << expr << ";\n";
+		if (!value_trace_.empty() && (std::strcmp(type_name, "float") == 0 || std::strcmp(type_name, "uint") == 0 ||
+		                              std::strcmp(type_name, "bool") == 0)) {
+			const std::string name = Name(inst);
+			const bool high = name.ends_with("_h");
+			const uint32_t id = static_cast<uint32_t>(std::strtoul(name.c_str() + 1, nullptr, 10));
+			if (value_trace_.contains(id)) {
+				body << "\t\tif (kyty_value_dbg[0] != 0u && " << value_at_ << ") kyty_value_dbg["
+				     << 1u + id * 2u + (high ? 1u : 0u) << "] = "
+				     << (std::strcmp(type_name, "float") == 0 ? "as_type<uint>(" : "uint(") << name << ");\n";
+			}
+		}
 		// A bit cast is no float result: phi values and integers pass through as_type<float> here and would read as NaN.
 		const bool nan_cast_only = expr.rfind("as_type<float>(", 0) == 0;
-		if (nan_trace_ && program.stage == ShaderType::Compute && std::strcmp(type_name, "float") == 0 && nan_cast_only) {
+		// Compute and pixel shaders share the debug buffer scheme (the pixel one is bound to the fragment stage at index 28).
+		const bool nan_stage_buffer = program.stage == ShaderType::Compute || program.stage == ShaderType::Pixel;
+		if (nan_trace_ && nan_stage_buffer && std::strcmp(type_name, "float") == 0 && nan_cast_only) {
 			// Not traced.
-		} else if (nan_trace_ && program.stage == ShaderType::Compute && std::strcmp(type_name, "float") == 0) {
+		} else if (nan_trace_ && nan_stage_buffer && std::strcmp(type_name, "float") == 0) {
 			// Compute: the smallest (id * 2 + half) over all threads goes into the debug buffer (buffer 28) with an atomic minimum; the host prints it
 			// after the traced dispatch ([NanTrace]). Ids are the numbers of the [NanId] lines printed here at compile time.
 			const std::string name  = Name(inst);
@@ -1788,14 +2178,12 @@ struct Emitter {
 	// KYTY_MSL_RDNA_FLOAT=<mask> (default 7): 1 = flush denormal inputs of sqrt/rcp/rsq/exp2/log2, 2 = RDNA float->int conversions,
 	// 4 = med3 NaN rule (the SPIR-V path's semantics, see the kyty_ftz/kyty_f2u/kyty_f2i/kyty_med3f helpers). A/B switch for comparisons.
 	static uint32_t RdnaFloatMask() {
-		static const uint32_t mask = [] {
-			const char* value = std::getenv("KYTY_MSL_RDNA_FLOAT");
-			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 7u;
-		}();
-		return mask;
+		return 7u;
 	}
 	std::string Ftz(const std::string& expr) { return (RdnaFloatMask() & 1u) != 0 ? "kyty_ftz(" + expr + ")" : expr; }
 
+	void EmitMeshEntry(std::ostringstream& out);
+	void EmitRectMeshEntry(std::ostringstream& out);
 	void EmitAlu(const Inst& inst);
 
 	// One IR instruction for the whole wave: once per emulated half when pair-packed (the barrier once, it is a workgroup-wide
@@ -1810,7 +2198,27 @@ struct Emitter {
 	}
 
 	void EmitInstruction(const Inst& inst) {
+		if (const auto slot=pixel_lds_slots.find(&inst);slot!=pixel_lds_slots.end()) {
+			const std::string variable="kyty_pixel_lds["+std::to_string(slot->second)+"]";
+			if(inst.GetOpcode()==IR::ValueOpcode::WriteSharedU32) body << "\t\tif (" << Expr(inst.Arg(2)) << ") " << variable << " = " << Expr(inst.Arg(1)) << ";\n";
+			else EmitAssignment(inst,"("+Expr(inst.Arg(1))+" ? "+variable+" : 0u)");
+			return;
+		}
 		switch (inst.GetOpcode()) {
+			case IR::ValueOpcode::MeshIndex:
+				EmitAssignment(inst, "(" + Expr(inst.Arg(2)) + " ? (" + Expr(inst.Arg(1)) +
+				    " == 2u ? uint(reinterpret_cast<device const ushort*>(mesh_indices)[" + Expr(inst.Arg(0)) +
+				    "]) : reinterpret_cast<device const uint*>(mesh_indices)[" + Expr(inst.Arg(0)) + "]) : 0u)");
+				return;
+			case IR::ValueOpcode::MeshDrawParameter:
+				EmitAssignment(inst, "mesh_draw[" + Expr(inst.Arg(0)) + "]");
+				return;
+			case IR::ValueOpcode::MeshAllocate:
+				if (program.stage != ShaderType::Mesh) { Unsupported(inst, "NGG allocation outside mesh execution"); return; }
+				body << "\t\tif (" << (pair_ ? PairLinearId() : "liid") << " == 0u) { kyty_allocation[0] = "
+				     << Expr(inst.Arg(0)) << " & 0x7ffu; kyty_allocation[1] = (" << Expr(inst.Arg(0))
+				     << " >> 12u) & 0x7ffu; }\n";
+				return;
 			case IR::ValueOpcode::Identity:
 				EmitAssignment(inst, Expr(inst.Arg(0)));
 				return;
@@ -1826,19 +2234,10 @@ struct Emitter {
 				if (HasDescriptor(IR::DescriptorBindingKind::FlattenedSrt)) {
 					// An immediate index is a flat slot assigned by the SRT plan and always lies inside the uploaded table (FC 27 glass
 					// reads slot 315: the old clamp to 255 read another constant, zero exposure and transmittance = black glass).
-					// A computed index keeps a bound against stray reads. KYTY_MSL_SRT_CLAMP255=1|ps|vs|<hash,...>: the old clamp for
-					// every shader, the pixel shaders, the other stages, or the listed shader hashes (A/B and bisection only).
-					static const std::string s_clamp255 = std::getenv("KYTY_MSL_SRT_CLAMP255") != nullptr ? std::getenv("KYTY_MSL_SRT_CLAMP255") : "";
-					const bool clamp255 = !s_clamp255.empty() &&
-					    (s_clamp255 == "1" || (s_clamp255 == "ps" && program.stage == ShaderType::Pixel) ||
-					     (s_clamp255 == "vs" && program.stage != ShaderType::Pixel) ||
-					     s_clamp255.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos);
-					if (clamp255) {
-						EmitAssignment(inst, "ab.flattened_srt[min(" + Expr(inst.Arg(1)) + ", 255u)]");
-					} else if (inst.Arg(1).IsImmediate()) {
+					if (inst.Arg(1).IsImmediate()) {
 						EmitAssignment(inst, "ab.flattened_srt[" + Expr(inst.Arg(1)) + "]");
 					} else {
-						EmitAssignment(inst, "ab.flattened_srt[min(" + Expr(inst.Arg(1)) + ", 4095u)]");
+						Unsupported(inst, "dynamic flattened SRT index requires canonical guest-memory lowering");
 					}
 				} else {
 					Unsupported(inst, "SRT read without flattened SRT binding");
@@ -1926,7 +2325,13 @@ struct Emitter {
 					}
 					return;
 				}
-				EmitAssignment(inst, Expr(inst.Arg(0)));
+				// EXECZ/VCCZ test the entire mask. Keep lanes in a scalar guest
+				// branch together so a later EXEC write can reactivate them.
+				// Arg(0) is already negated for the zero branch kinds.
+				const bool zero=kind==CFG::BranchCondition::ExecZero || kind==CFG::BranchCondition::VccZero;
+				const bool nonzero=kind==CFG::BranchCondition::ExecNonZero || kind==CFG::BranchCondition::VccNonZero;
+				if(zero || nonzero)EmitAssignment(inst,std::string(zero?"simd_all(":"simd_any(")+Expr(inst.Arg(0))+")");
+				else EmitAssignment(inst, Expr(inst.Arg(0)));
 				return;
 			}
 			case IR::ValueOpcode::BitFieldUExtract:
@@ -2071,7 +2476,7 @@ struct Emitter {
 				const auto  ptr = BufferPtr(mem.resource);
 				if (!ptr || mem.kind != IR::ResourceKind::Buffer ||
 				    !BufferAddressable(mem.resource)) {
-					Unsupported(inst, "swizzled buffer load");
+					Unsupported(inst, "buffer load resource");
 					EmitAssignment(inst, "0");
 					return;
 				}
@@ -2122,8 +2527,10 @@ struct Emitter {
 				for (uint32_t i = 0; i < count; ++i) {
 					if (i != 0) result += ", ";
 					const auto component = std::to_string(i) + "u";
-					result += "(" + Expr(inst.Arg(inst.NumArgs() - 1)) + " && " + d + " < " + n + " && " + component + " < " + n + " - " + d +
-					          " ? " + *ptr + "[" + d + " + " + component + "] : 0u)";
+					const std::string index = BufferSwizzled(packed) ? BufferDword(inst, mem, packed, i * 4u) : d + " + " + component;
+					const std::string bounds = BufferSwizzled(packed) ? index + " < " + n :
+					    d + " < " + n + " && " + component + " < " + n + " - " + d;
+					result += "(" + Expr(inst.Arg(inst.NumArgs() - 1)) + " && " + bounds + " ? " + *ptr + "[" + index + "] : 0u)";
 				}
 				if (count > 1) result += ")";
 				EmitAssignment(inst, result);
@@ -2214,14 +2621,15 @@ struct Emitter {
 				    program.info.buffers[mem.resource].descriptor_format == Prospero::BufferFormat::k16_16_16_16Float;
 				if (!ptr || mem.kind != IR::ResourceKind::Buffer ||
 				    !BufferAddressable(mem.resource) || (mem.formatted && !raw_formatted_dword && !half4_store)) {
-					const std::string reason = "formatted/swizzled buffer store (data_format=" + std::to_string(mem.data_format) +
+					const std::string reason = "formatted buffer store (data_format=" + std::to_string(mem.data_format) +
 					                           " number_format=" + std::to_string(mem.number_format) + " typed=" + std::to_string(mem.typed) +
 					                           " desc_format=" + std::to_string(mem.resource < program.info.buffers.size() ?
 					                               static_cast<uint32_t>(program.info.buffers[mem.resource].descriptor_format) : 9999u) + ")";
 					Unsupported(inst, reason.c_str());
 					return;
 				}
-				const std::string d = BufferDword(inst, mem, program.info.buffers[mem.resource].packed_stride);
+				const uint32_t packed = program.info.buffers[mem.resource].packed_stride;
+				const std::string d = BufferDword(inst, mem, packed);
 				const std::string n = "(sizes[" + std::to_string(mem.resource) + "] >> 2)";
 				const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
 				const uint32_t count = half4_store ? 2u : store_op == ValueOpcode::StoreBufferU32 ? 1u
@@ -2233,8 +2641,25 @@ struct Emitter {
 						component = "as_type<uint>(half2(as_type<float>(" + value + "." + ComponentName(i * 2) +
 						    "), as_type<float>(" + value + "." + ComponentName(i * 2 + 1) + ")))";
 					} else if (count > 1) component += "." + std::string(ComponentName(i));
-					body << "\t\t\tif (" << d << " < " << n << " && " << i << "u < " << n << " - " << d << ") "
-					     << *ptr << "[" << d << " + " << i << "u] = " << component << ";\n";
+					const std::string index = BufferSwizzled(packed) ? BufferDword(inst, mem, packed, i * 4u) : d + " + " + std::to_string(i) + "u";
+					const std::string bounds = BufferSwizzled(packed) ? index + " < " + n :
+					    d + " < " + n + " && " + std::to_string(i) + "u < " + n + " - " + d;
+					body << "\t\t\tif (" << bounds << ") { " << *ptr << "[" << index << "] = " << component << ";";
+					if (store_trace_ && !half4_store && mem.resource < 64) {
+						const auto base = std::to_string(1u + mem.resource * 4u);
+						body << " if (atomic_load_explicit(kyty_store_dbg, memory_order_relaxed) != 0u) {"
+						     << " uint _byte = (" << index << ") * 4u;"
+						     << " atomic_fetch_min_explicit(kyty_store_dbg + " << base << "u, _byte, memory_order_relaxed);"
+						     << " atomic_fetch_max_explicit(kyty_store_dbg + " << base << "u + 1u, _byte + 4u, memory_order_relaxed);"
+						     << " atomic_fetch_add_explicit(kyty_store_dbg + " << base << "u + 2u, 1u, memory_order_relaxed);"
+						     << " if (isnan(as_type<float>(" << component << "))) atomic_fetch_add_explicit(kyty_store_dbg + " << base
+						     << "u + 3u, 1u, memory_order_relaxed);"
+						     << " uint _bits = " << component << ";"
+						     << " uint _hn = uint((_bits & 0x7c00u) == 0x7c00u && (_bits & 0x3ffu) != 0u) +"
+						     << " uint((_bits & 0x7c000000u) == 0x7c000000u && (_bits & 0x3ff0000u) != 0u);"
+						     << " atomic_fetch_add_explicit(kyty_store_dbg + " << 257u + mem.resource << "u, _hn, memory_order_relaxed); }";
+					}
+					body << " }\n";
 				}
 				body << "\t\t}\n";
 				return;
@@ -2255,7 +2680,7 @@ struct Emitter {
 				// array contribute 0 and do not write (same guard as the SPIR-V EmitAtomicAccess path).
 				const auto& mem   = Mem(inst);
 				const auto  op    = inst.GetOpcode();
-				const bool  compute = program.stage == ShaderType::Compute;
+				const bool  compute = program.stage == ShaderType::Compute || program.stage == ShaderType::Mesh;
 				const bool  gds   = GdsMem(mem);
 				const std::string limit = std::to_string(gds ? kMslGdsDwords : LdsDwords()) + "u";
 				const std::string d     = "(" + LdsByte(inst, mem) + " >> 2)";
@@ -2266,10 +2691,7 @@ struct Emitter {
 				body << "\t\t" << Name(inst) << " = 0u;\n";
 				body << "\t\tif (" << cond << " && " << d << " < " << limit << ") {\n";
 				if (!compute) {
-					// Non-kernel stages use a per-thread array: plain read-modify-write, no atomics.
-					body << "\t\t\t{\n\t\t\t\tconst uint kyty_old = kyty_lds[" << d << "];\n"
-					     << "\t\t\t\tkyty_lds[" << d << "] = " << SharedAtomicNew(op, "kyty_old", value) << ";\n"
-					     << "\t\t\t\t" << Name(inst) << " = kyty_old;\n\t\t\t}\n";
+					Unsupported(inst, "graphics shared atomic requires shared execution");
 				} else if (op == IR::ValueOpcode::SharedAtomicInc32 || op == IR::ValueOpcode::SharedAtomicDec32) {
 					// No native MSL atomic for the wrapping inc/dec: CAS loop on the threadgroup dword.
 					body << "\t\t\t{\n\t\t\t\t" << space << " atomic_uint* kyty_p = (" << space << " atomic_uint*)&" << slot << ";\n"
@@ -2571,7 +2993,9 @@ void Emitter::EmitAlu(const Inst& inst) {
 			                        ") || " + Expr(inst.Arg(0)) + " != " + Expr(inst.Arg(1)) + ")");
 			return;
 		case IR::ValueOpcode::FPUnordEqual32:
-			EmitAssignment(inst, "(" + Expr(inst.Arg(0)) + " == " + Expr(inst.Arg(1)) + ")");
+			if (store_trace_) std::fprintf(stderr, "[MslCompare] guest=0x%016llx %s unordered equal\n", (unsigned long long)program.shader_hash, Name(inst).c_str());
+			EmitAssignment(inst, "!((" + Expr(inst.Arg(0)) + " < " + Expr(inst.Arg(1)) + ") | (" +
+			                        Expr(inst.Arg(0)) + " > " + Expr(inst.Arg(1)) + "))");
 			return;
 		case IR::ValueOpcode::FPUnordLessThan32:
 			EmitAssignment(inst, "(isnan(" + Expr(inst.Arg(0)) + ") || isnan(" + Expr(inst.Arg(1)) +
@@ -2590,7 +3014,7 @@ void Emitter::EmitAlu(const Inst& inst) {
 			                        ") || " + Expr(inst.Arg(0)) + " >= " + Expr(inst.Arg(1)) + ")");
 			return;
 		case IR::ValueOpcode::Barrier:
-			if (program.stage == ShaderType::Compute) {
+			if (program.stage == ShaderType::Compute || program.stage == ShaderType::Mesh) {
 				body << "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup | "
 				        "mem_flags::mem_device);\n";
 			} else {
@@ -2598,7 +3022,11 @@ void Emitter::EmitAlu(const Inst& inst) {
 			}
 			return;
 		case IR::ValueOpcode::FPOrdEqual32: EmitAssignment(inst, Binary(inst, "==")); return;
-		case IR::ValueOpcode::FPOrdNotEqual32: EmitAssignment(inst, Binary(inst, "!=")); return;
+		case IR::ValueOpcode::FPOrdNotEqual32:
+			if (store_trace_) std::fprintf(stderr, "[MslCompare] guest=0x%016llx %s ordered not equal\n", (unsigned long long)program.shader_hash, Name(inst).c_str());
+			EmitAssignment(inst, "((" + Expr(inst.Arg(0)) + " < " + Expr(inst.Arg(1)) + ") | (" +
+			                        Expr(inst.Arg(0)) + " > " + Expr(inst.Arg(1)) + "))");
+			return;
 		case IR::ValueOpcode::FPOrdLessThan32: EmitAssignment(inst, Binary(inst, "<")); return;
 		case IR::ValueOpcode::FPOrdGreaterThan32: EmitAssignment(inst, Binary(inst, ">")); return;
 		case IR::ValueOpcode::FPOrdLessThanEqual32: EmitAssignment(inst, Binary(inst, "<=")); return;
@@ -2623,8 +3051,15 @@ void Emitter::EmitAlu(const Inst& inst) {
 		case IR::ValueOpcode::FPRoundEven32:
 			EmitAssignment(inst, "rint(" + Expr(inst.Arg(0)) + ")");
 			return;
-		case IR::ValueOpcode::FPSin: EmitAssignment(inst, "sin(" + Expr(inst.Arg(0)) + ")"); return;
-		case IR::ValueOpcode::FPCos: EmitAssignment(inst, "cos(" + Expr(inst.Arg(0)) + ")"); return;
+		case IR::ValueOpcode::FPSin:
+		case IR::ValueOpcode::FPCos: {
+			// RDNA takes turns, including period reduction, rather than radians (EmitTrigCycleF32 on the SPIR-V path).
+			const bool sine = inst.GetOpcode() == IR::ValueOpcode::FPSin;
+			std::string argument = Expr(inst.Arg(0));
+			argument = "(kyty_trig_cycle(" + argument + ", " + (sine ? "true" : "false") + ") * as_type<float>(0x40c90fdbu))";
+			EmitAssignment(inst, std::string(sine ? "sin(" : "cos(") + argument + ")");
+			return;
+		}
 		case IR::ValueOpcode::FPExp2: EmitAssignment(inst, "exp2(" + Ftz(Expr(inst.Arg(0))) + ")"); return;
 		case IR::ValueOpcode::FPLog2: EmitAssignment(inst, "log2(" + Ftz(Expr(inst.Arg(0))) + ")"); return;
 		case IR::ValueOpcode::FPAbs32: EmitAssignment(inst, "fabs(" + Expr(inst.Arg(0)) + ")"); return;
@@ -2671,10 +3106,11 @@ void Emitter::EmitAlu(const Inst& inst) {
 			EmitAssignment(inst, "reverse_bits(" + Expr(inst.Arg(0)) + ")");
 			return;
 		case IR::ValueOpcode::FindILsb32:
-			EmitAssignment(inst, "ctz(" + Expr(inst.Arg(0)) + ")");
+			EmitAssignment(inst, "(" + Expr(inst.Arg(0)) + " == 0u ? 0xffffffffu : ctz(" + Expr(inst.Arg(0)) + "))");
 			return;
 		case IR::ValueOpcode::FindUMsb32:
-			EmitAssignment(inst, "clz(" + Expr(inst.Arg(0)) + ")");
+			// The IR requests a bit index, not the RDNA instruction's leading-zero count. The frontend performs that conversion.
+			EmitAssignment(inst, "(" + Expr(inst.Arg(0)) + " == 0u ? 0xffffffffu : 31u - clz(" + Expr(inst.Arg(0)) + "))");
 			return;
 		case IR::ValueOpcode::GetInterpolationParameter: {
 			// Interpolation modes are not distinguished yet; read the varying directly.
@@ -2736,7 +3172,12 @@ void Emitter::EmitAlu(const Inst& inst) {
 	}
 }
 
+#include "MslPixelLaneMemory.inc"
+#include "MslRectMeshEmitter.inc"
+#include "MslMeshEmitter.inc"
+
 std::string Emitter::Emit() {
+	PreparePixelLaneStorage();
 	pair_ = Wave64Pair(program.stage, program.wave_size, input_info, program.shader_hash);
 	if (const char* trace = std::getenv("KYTY_MSL_NAN_TRACE"); trace != nullptr && (program.stage == ShaderType::Pixel || program.stage == ShaderType::Compute)) {
 		// A comma-separated list of pixel or compute shader hashes (the guest shader hash, not the translated variant hash that traces print).
@@ -2748,7 +3189,33 @@ std::string Emitter::Emit() {
 			p = *end == ',' ? end + 1 : end;
 		}
 	}
+	if (const char* trace = std::getenv("KYTY_MSL_STORE_TRACE"); trace != nullptr && program.stage == ShaderType::Compute) {
+		for (const char* p = trace; *p != '\0';) {
+			char* end = nullptr;
+			const uint64_t hash = std::strtoull(p, &end, 0);
+			if (end == p) break;
+			store_trace_ = store_trace_ || hash == program.shader_hash;
+			p = *end == ',' ? end + 1 : end;
+		}
+	}
 	BuildImageSlots();
+	if (const char* trace = std::getenv("KYTY_MSL_VALUE_TRACE"); trace && program.stage == ShaderType::Compute) {
+		char* end = nullptr;
+		if (std::strtoull(trace, &end, 0) == program.shader_hash) {
+			while (end && *end == ',') {
+				const char* p = end + 1;
+				const auto id = std::strtoul(p, &end, 0);
+				if (end == p) break;
+				if (id < 8192) value_trace_.insert(static_cast<uint32_t>(id));
+			}
+			if (const char* at = std::getenv("KYTY_MSL_VALUE_AT"); at != nullptr) {
+				unsigned gx = 0, gy = 0, gz = 0, lane = 0;
+				if (std::sscanf(at, "%u,%u,%u,%u", &gx, &gy, &gz, &lane) == 4) {
+					value_at_ = "all(tgid == uint3(" + std::to_string(gx) + "u, " + std::to_string(gy) + "u, " + std::to_string(gz) + "u)) && liid == " + std::to_string(lane) + "u";
+				}
+			}
+		}
+	}
 	std::ostringstream out;
 	out << "// generated by Kyty RDNA->MSL backend\n";
 	for (const auto& [resource, slot]: image_slots_) {
@@ -2756,6 +3223,7 @@ std::string Emitter::Emit() {
 		    << " kind=" << static_cast<uint32_t>(slot.kind) << "\n";
 	}
 	out << "#include <metal_stdlib>\n";
+	if (program.stage == ShaderType::Mesh) out << "#include <metal_mesh>\n";
 	out << "#include <simd/simd.h>\n";
 	out << "using namespace metal;\n\n";
 	if (HasDescriptor(IR::DescriptorBindingKind::BdaPagetable)) {
@@ -2811,6 +3279,18 @@ inline uint kyty_load_guest(device const ulong* root, ulong address, uint bytes)
 	out << "inline ushort kyty_first_lane(uint4 ballot) {\n";
 	out << "\treturn ballot.x != 0u ? (ushort)ctz(ballot.x) : (ballot.y != 0u ? (ushort)min(ctz(ballot.y) + 32u, 31u) : 0u);\n";
 	out << "}\n\n";
+	// Lanes of this SIMD group running the current instruction. A partly covered pixel group has lanes that never
+	// launched (Apple fills a group from lane 0); a shuffle from them is undefined (Apple returns 0).
+	out << "inline uint kyty_live_lanes() {\n";
+	out << "\treturn as_type<uint2>((simd_vote::vote_t)simd_ballot(true)).x;\n";
+	out << "}\n\n";
+	// readlane of a lane that is not running reads the highest running lane at or below it, else the lowest one. On
+	// the guest such a lane exists; in whole-wave code it holds the reduction identity, so a scan's running value there
+	// equals the one at the highest launched lane below it (readlane 31/63 for the wave total).
+	out << "inline ushort kyty_live_source(uint live, uint target) {\n";
+	out << "\tconst uint below = live & (0xffffffffu >> (31u - (target & 31u)));\n";
+	out << "\treturn below != 0u ? (ushort)(31u - clz(below)) : (ushort)ctz(live);\n";
+	out << "}\n\n";
 
 	out << R"(
 inline bool kyty_class_f32(uint bits, uint mask) {
@@ -2863,16 +3343,19 @@ inline float kyty_med3f(float a, float b, float c) {
 	return (isnan(a) || isnan(b) || isnan(c)) ? minimum : median;
 }
 )";
-	// func: a DEPTH_COMPARE_FUNC applied as texel <func> reference (6 = GEQUAL, the default; with KYTY_MSL_CMP_FUNC the sampler's own,
-	// FC 27's shadow samplers are GREATER, S# 0x4092/0x4012; reference-first lit the red room grey and blew out frames, um190).
-	out << "inline float4 kyty_sample_cmp(float4 s, float ref, uint func) {\n";
-	out << "\tconst float d = s.x;\n";
-	out << "\tconst bool pass = func == 0u ? false : func == 1u ? d < ref : func == 2u ? d == ref : func == 3u ? d <= ref :\n";
-	out << "\t                  func == 4u ? d > ref : func == 5u ? d != ref : func == 6u ? d >= ref : true;\n";
-	out << "\treturn float4(pass ? 1.0f : 0.0f);\n}\n\n";
-	out << "inline float4 kyty_gather_cmp(float4 g, float ref, uint func) {\n";
-	out << "\treturn float4(kyty_sample_cmp(float4(g.x), ref, func).x, kyty_sample_cmp(float4(g.y), ref, func).x,\n";
-	out << "\t              kyty_sample_cmp(float4(g.z), ref, func).x, kyty_sample_cmp(float4(g.w), ref, func).x);\n}\n\n";
+	bool uses_trig = false;
+	for (const auto* block: program.blocks)
+		for (const auto& inst: block->Instructions())
+			uses_trig |= inst.GetOpcode() == IR::ValueOpcode::FPSin || inst.GetOpcode() == IR::ValueOpcode::FPCos;
+	if (uses_trig) out << R"(inline float kyty_trig_cycle(float x, bool preserve_signed_zero) {
+	const uint magnitude = as_type<uint>(x) & 0x7fffffffu;
+	// Every finite F32 at or above 2^23 is an integer number of turns.
+	if (magnitude >= 0x4b000000u && magnitude < 0x7f800000u) return 0.0f;
+	if (preserve_signed_zero && magnitude == 0u) return x;
+	return x - floor(x);
+}
+)";
+	EmitComparisonSamplerHelpers(out);
 	// D16 image data: two 16-bit components per dword. `mask` is the dmask (enabled texel components in order).
 	out << "inline uint4 kyty_d16_pack(uint4 t, uint mask, bool is_float) {\n";
 	out << "\tuint v[4] = {0u, 0u, 0u, 0u};\n\tuint n = 0u;\n";
@@ -2915,6 +3398,10 @@ inline float kyty_med3f(float a, float b, float c) {
 					members.emplace_back(kMslSamplerBase, 32u,
 					                     "sampler samplers [[id(" +
 					                         std::to_string(kMslSamplerBase) + ")]][32];");
+					if (std::any_of(program.info.samplers.begin(),program.info.samplers.end(),[](const auto& s){ return s.depth_compare || s.point_fetch; }) ||
+					    std::any_of(program.memory_info.begin(),program.memory_info.end(),[](const auto& m){ return m.kind == IR::ResourceKind::Image && (m.image_sample_flags & Decoder::ImageSampleFlagOffset) != 0u; }))
+						members.emplace_back(ComparisonPointSamplerBase, 32u,
+						                     "sampler comparison_points [[id(" + std::to_string(ComparisonPointSamplerBase) + ")]][32];");
 					break;
 				case IR::DescriptorBindingKind::Gds:
 					members.emplace_back(kMslGdsBinding, 1u,
@@ -2995,7 +3482,12 @@ inline float kyty_med3f(float a, float b, float c) {
 	// Vertex shaders are emitted as an inline implementation plus a thin main0: RECTLIST draws give only three
 	// vertices and the hardware derives the fourth corner (v1 + v2 - v0), which the wrapper reproduces for vid 3.
 	const bool vs_wrap = program.stage == ShaderType::Vertex && has_out && !has_in;
-	if (vs_wrap) {
+	if (program.stage == ShaderType::Mesh) {
+		out << "inline void kyty_ngg_guest(constant KytyArgumentBuffer& ab, constant PushData& pc_data, "
+		       "constant uint* sizes, constant uint* mesh_draw, device const uchar* mesh_indices, uint3 tgid, uint liid, uint lane, "
+		       "threadgroup uint* kyty_lds, threadgroup uint* kyty_allocation, thread KytyStageOut& out, "
+		       "thread KytyStageOut& out_h, thread uint& kyty_primitive, thread uint& kyty_primitive_h) {\n";
+	} else if (vs_wrap) {
 		out << "inline KytyStageOut kyty_vs_impl(constant KytyArgumentBuffer& ab, constant PushData& pc_data, "
 		       "constant uint* sizes, uint vid, uint iid) {\n";
 	} else {
@@ -3013,26 +3505,32 @@ inline float kyty_med3f(float a, float b, float c) {
 			out << ", uint vid [[vertex_id]], uint iid [[instance_id]]";
 		} else if (program.stage == ShaderType::Pixel) {
 			out << ", uint prim_id_arg [[primitive_id]]";
+			if (nan_trace_) out << ", device atomic_uint* kyty_nan_dbg [[buffer(28)]]";
 		} else if (program.stage == ShaderType::Compute) {
 			out << ", uint3 gid [[thread_position_in_grid]], "
 			    << "uint3 tid [[thread_position_in_threadgroup]], "
 			    << "uint3 tgid [[threadgroup_position_in_grid]], "
 			    << "uint liid [[thread_index_in_threadgroup]]";
 			if (nan_trace_) out << ", device atomic_uint* kyty_nan_dbg [[buffer(28)]]";
+			if (store_trace_) out << ", device atomic_uint* kyty_store_dbg [[buffer(27)]]";
+			if (!value_trace_.empty()) out << ", device uint* kyty_value_dbg [[buffer(29)]]";
 		}
 		out << ") {\n";
 	}
-	if (has_out) {
+	if (has_out && program.stage != ShaderType::Mesh) {
 		out << "\tKytyStageOut out = {};\n";
 	}
 	out << "\t(void)ab; (void)pc_data; (void)sizes;\n";
-	if (UsesLds()) {
-		if (program.stage == ShaderType::Compute) {
+	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh && std::any_of(program.memory_info.begin(),program.memory_info.end(),[](const auto& m) { return m.kind == IR::ResourceKind::Gds; }))
+		unsupported.push_back("graphics GDS requires shared device-memory execution support");
+	if (UsesLds() && program.stage != ShaderType::Mesh) {
+		if (!pixel_lds_slots.empty()) {
+			// Every load below has a dominating, sufficiently predicated store.
+			out << "\tuint kyty_pixel_lds[" << pixel_lds_slot_count << "];\n";
+		} else if (program.stage == ShaderType::Compute) {
 			out << "\tthreadgroup uint kyty_lds[" << LdsDwords() << "];\n";
 		} else {
-			// Non-kernel stages cannot use the threadgroup address space; per-thread
-			// scratch is an approximation that keeps the shader compiling.
-			out << "\tuint kyty_lds[2048];\n";
+			unsupported.push_back("graphics LDS requires shared workgroup execution; per-invocation scratch is invalid");
 		}
 	}
 
@@ -3074,10 +3572,6 @@ inline float kyty_med3f(float a, float b, float c) {
 		const auto* block = program.blocks[index];
 		if (use_goto) {
 			body << "L" << index << ": {\n";
-			if (program.block_info[index].terminator.loop_header) {
-				// Bound runaway loops so one bad guest loop cannot wedge the whole device queue.
-				body << "\t\tif (++kyty_iterations > " << MslLoopCap() << "u) { return" << (has_out ? " out" : "") << "; }\n";
-			}
 		} else {
 			body << "\tcase " << index << ": {\n";
 		}
@@ -3121,7 +3615,7 @@ inline float kyty_med3f(float a, float b, float c) {
 				const auto& targets = by_code ? term.indirect_selector_targets : term.indirect_targets;
 				const size_t count  = std::min(values.size(), targets.size());
 				if (info.indirect_target.IsEmpty() || count == 0) {
-					body << "\t\treturn" << (has_out ? " out" : "") << ";\n";
+					body << "\t\treturn" << ReturnValue() << ";\n";
 					break;
 				}
 				body << "\t\t{\n\t\t\tconst uint kyty_sel = as_type<uint>(" << Expr(info.indirect_target) << ");\n";
@@ -3133,35 +3627,29 @@ inline float kyty_med3f(float a, float b, float c) {
 				body << "\t\t\t} else {\n\t\t\t\tpc = 0xffffffffu;\n\t\t\t}\n\t\t}\n\t\tbreak;\n";
 				break;
 			}
-			default: body << "\t\treturn" << (has_out ? " out" : "") << ";\n"; break;
+			default: body << "\t\treturn" << ReturnValue() << ";\n"; break;
 		}
 		body << "\t}\n";
 	}
 
-	// Apple GPUs kill the queue when a shader stops making progress. Bound the
-	// dispatcher iterations per invocation so a mistranslated guest loop cannot wedge
-	// the whole device (mirrors KYTY_LOOP_CAP in the SPIR-V backend).
+	// Execute the complete guest control flow, including long finite loops.
 	if (structured) {
-		out << "\tuint kyty_iterations = 0u;\n";
-		out << body.str();
+			out << body.str();
 		out << "}\n";
 	} else if (use_goto) {
-		out << "\tuint kyty_iterations = 0u;\n";
-		out << body.str();
-		out << "\treturn" << (has_out ? " out" : "") << ";\n";
+			out << body.str();
+		out << "\treturn" << ReturnValue() << ";\n";
 		out << "}\n";
 	} else {
 	out << "\tuint pc = 0u;\n";
-	out << "\tuint kyty_iterations = 0u;\n";
 	out << "\twhile (true) {\n";
-	out << "\t\tif (++kyty_iterations > " << MslDispatcherCap() << "u) { return" << (has_out ? " out" : "")
-	    << "; }\n";
 	out << "\t\tswitch (pc) {\n";
 	out << body.str();
-	out << "\t\tdefault: return" << (has_out ? " out" : "") << ";\n";
+	out << "\t\tdefault: return" << ReturnValue() << ";\n";
 	out << "\t\t}\n\t}\n";
 	out << "}\n";
 	}
+	if (program.stage == ShaderType::Mesh) EmitMeshEntry(out);
 	if (vs_wrap) {
 		// Parameters can carry packed integers as float bits. Identical corner
 		// components must survive without FP arithmetic (which flushes small
@@ -3213,7 +3701,12 @@ inline float kyty_med3f(float a, float b, float c) {
 		out << "\t\tKytyStageOut b = k == 1u ? v2 : (k == 2u ? v0 : v1);\n";
 		out << "\t\tKytyStageOut c = k == 1u ? v0 : (k == 2u ? v1 : v2);\n";
 		out << "\t\tconst uint slot = vid - rect_base;\n";
-		out << "\t\tif (slot == 0u) return a;\n\t\tif (slot == 1u) return b;\n\t\tif (slot == 2u) return c;\n";
+		// The strip (a, b, c, r) must wind the way the reference (tessellated) RECTLIST emulation does, because a pixel shader can read
+		// front_facing of a rectangle: the FC 27 light-cell pass sets its list-A bit for front-facing and its list-B bit for
+		// back-facing rectangles. With the corners in the order a, b, c every rectangle came out front-facing, list B stayed empty, the
+		// light classifier never picked the classes that apply the second light list (classes 4-7) and the lit scene lost its fill
+		// light. Swapping the two non-corner vertices preserves the guest rectangle winding.
+		out << "\t\tif (slot == 0u) return a;\n\t\tif (slot == 1u) return c;\n\t\tif (slot == 2u) return b;\n";
 		out << "\t\tKytyStageOut r = b;\n";
 		for (const auto& field: out_fields) {
 			if (field.type == "float4") {
@@ -3235,36 +3728,8 @@ inline float kyty_med3f(float a, float b, float c) {
 } // namespace
 
 bool Wave64Pair(ShaderType stage, uint32_t wave_size, ShaderStageInputInfo input_info, uint64_t shader_hash) {
-	static const bool s_on = [] {
-		// On by default (KYTY_MSL_WAVE64=0 turns it off). RDNA compute kernels assume one 64-lane wave (LDS handed between lanes with no
-		// barrier, cross-lane operations over 64 lanes); a 64-thread Metal group is two 32-lane simdgroups that do not run in lockstep, so
-		// without the pair lowering every reduction / lighting kernel races and the menu is noise and streaks. An earlier note recorded
-		// crashes in the loading phase with it on; that did not reproduce in the ~25 launches of 2026-10-27..11-01 (all survived 150-420 s).
-		const char* value = std::getenv("KYTY_MSL_WAVE64");
-		return value == nullptr || value[0] != '0';
-	}();
-	if (!s_on || stage != ShaderType::Compute || wave_size != 64u) return false;
-	static const std::pair<uint32_t, uint32_t> s_range = [] {
-		uint32_t lo = 0, hi = 256;
-		if (const char* value = std::getenv("KYTY_MSL_WAVE64_RANGE")) std::sscanf(value, "%u,%u", &lo, &hi);
-		return std::pair<uint32_t, uint32_t> {lo, hi};
-	}();
-	if (shader_hash != 0) {
-		const uint32_t bucket = static_cast<uint32_t>((shader_hash >> 4) & 255u);
-		if (bucket < s_range.first || bucket >= s_range.second) return false;
-		// KYTY_MSL_WAVE64_SKIP=<hash>[,<hash>...]: these kernels keep the plain 32-lane lowering (per-kernel A/B).
-		static const std::vector<uint64_t> s_skip = [] {
-			std::vector<uint64_t> v;
-			for (const char* p = std::getenv("KYTY_MSL_WAVE64_SKIP"); p != nullptr && *p != '\0';) {
-				char* end = nullptr;
-				v.push_back(std::strtoull(p, &end, 0));
-				if (end == p) break;
-				p = *end == ',' ? end + 1 : end;
-			}
-			return v;
-		}();
-		if (std::find(s_skip.begin(), s_skip.end(), shader_hash) != s_skip.end()) return false;
-	}
+	(void)shader_hash;
+	if ((stage != ShaderType::Compute && stage != ShaderType::Mesh) || wave_size != 64u) return false;
 	const auto* cs = ShaderWorkgroupInput(stage, input_info);
 	if (cs == nullptr || cs->host_subgroup_size != 32u) return false;
 	const uint32_t total = std::max(cs->threads_num[0], 1u) * std::max(cs->threads_num[1], 1u) * std::max(cs->threads_num[2], 1u);
@@ -3290,6 +3755,14 @@ bool Wave64PairCompiled(uint64_t shader_hash, bool* pair, uint32_t* threads) {
 EmitResult EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info) {
 	Emitter emitter(program, std::move(input_info));
 	EmitResult result;
+	if (program.stage != ShaderType::Vertex && program.stage != ShaderType::Pixel && program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh) {
+		result.unsupported.push_back("native shader stage requires a dedicated execution model");
+		return result;
+	}
+	if (program.stage == ShaderType::Mesh && (input_info.vertex == nullptr || input_info.vertex->mesh.threads_num[0] == 0)) {
+		result.unsupported.push_back("NGG requires explicit workgroup metadata");
+		return result;
+	}
 	result.source      = emitter.Emit();
 	result.wave64_pair = emitter.pair_;
 	if (program.stage == ShaderType::Compute) {

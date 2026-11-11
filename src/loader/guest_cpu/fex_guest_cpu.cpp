@@ -734,6 +734,20 @@ void Init() {
 	             EnvInt("KYTY_FEX_SMC", FEXCore::Config::CONFIG_SMC_MTRACK), g->trace_limit);
 }
 
+void TraceBurstPoll() {
+	static const char* trigger = std::getenv("KYTY_FEX_TRACE_TRIGGER");
+	if (trigger == nullptr || *trigger == '\0' || g == nullptr) return;
+	static std::chrono::steady_clock::time_point last {};
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::milliseconds(200)) return;
+	last = now;
+	if (std::remove(trigger) != 0) return;
+	static const int burst = EnvInt("KYTY_FEX_TRACE_BURST", 20000);
+	g->traced.store(0, std::memory_order_relaxed);
+	__atomic_store_n(&g->trace_limit, burst, __ATOMIC_RELAXED);
+	std::fprintf(stderr, "[fex] HLE trace burst: the next %d guest->host calls are logged (begin and end)\n", burst);
+}
+
 uint64_t CallGuest(uint64_t entry, const uint64_t* args, size_t count, uint64_t guest_stack_top) {
 	GuestCallArgs a;
 	for (size_t i = 0; i < count && i < 6; i++) {

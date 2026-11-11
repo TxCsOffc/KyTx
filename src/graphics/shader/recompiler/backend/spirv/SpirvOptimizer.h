@@ -11,7 +11,7 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 // None is byte-preserving. Failed optimization leaves the original module intact.
 [[nodiscard]] bool Optimize(std::vector<uint32_t>& code, Config::ShaderOptimizationType mode,
-                            std::string& diagnostics);
+                            std::string& diagnostics, bool allow_dynamic_sample_offset = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

@@ -9,6 +9,7 @@ xcrun clang++ -std=c++20 -fobjc-arc -I"$repo_dir/src" -I"$repo_dir/_Build/macos-
     "$repo_dir/tests/metalMslTests.mm" \
     "$repo_dir/src/graphics/shader/recompiler/backend/msl/MslEmitter.cpp" \
     "$repo_dir/src/graphics/host_gpu/metal/metalIndirect.mm" \
+    "$repo_dir/src/graphics/host_gpu/metal/metalSampler.mm" \
     "$repo_dir/src/graphics/shader/recompiler/frontend/decode/ImageOps.cpp" \
     "$repo_dir/src/graphics/shader/shaderPixelParameter.cpp" \
     "$ir_dir/Block.cpp" "$ir_dir/Program.cpp" "$ir_dir/Type.cpp" "$ir_dir/Value.cpp" \

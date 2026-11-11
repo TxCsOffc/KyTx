@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <vector>
 #include "graphics/host_gpu/metal/metalContext.h"
+#include "graphics/host_gpu/metal/metalHostBudget.h"
 #include "graphics/host_gpu/metal/metalOrder.h"
 #include "graphics/host_gpu/metal/metalIndirect.h"
 #include "common/logging/log.h"
@@ -29,6 +30,10 @@ namespace Libs::Graphics::Metal {
 
 std::string KytyTakeCbOps();  // metalDraw.mm: op labels since the last commit (KYTY_MTL_GPU_TIME)
 std::string KytyDescribeGds(); // metalRenderer.mm: the first GDS dwords (work-queue counters of a hung kernel)
+
+void KytyBudgetedCommit(id commandBuffer) {
+	HostBudget::Commit((id<MTLCommandBuffer>)commandBuffer);
+}
 
 MetalContext& MetalContext::Instance() {
 	static MetalContext context;
@@ -46,6 +51,7 @@ bool MetalContext::Initialize() {
 	if (m_initialized) {
 		return true;
 	}
+	(void)HostBudget::Get(); // Validate policy and start the footprint monitor before GPU setup.
 
 	@autoreleasepool {
 		m_device = MTLCreateSystemDefaultDevice();
@@ -89,6 +95,7 @@ void MetalContext::Shutdown() {
 
 	WaitUntilIdle();
 	EndCurrentEncoder();
+	HostBudget::Finish();
 
 	@autoreleasepool {
 		m_current_command_buffer = nil;
@@ -145,7 +152,7 @@ void MetalContext::QueryCapabilities() {
 	}
 }
 
-static uint64_t GpuWatchdogCommitted(const std::string& ops);
+static uint64_t GpuWatchdogCommitted(const std::string& ops, id<MTLCommandBuffer> command);
 static void     GpuWatchdogCompleted(uint64_t id);
 
 id<MTLCommandBuffer> MetalContext::GetCurrentCommandBuffer() {
@@ -156,14 +163,14 @@ id<MTLCommandBuffer> MetalContext::GetCurrentCommandBuffer() {
 	static const bool s_sync_encoders = KYTY_ENV("KYTY_SYNC_ENCODERS") != nullptr;
 	if (s_sync_encoders && m_current_command_buffer && m_command_buffer_handed_out && !m_active_render_encoder && !m_active_compute_encoder) {
 		dispatch_semaphore_t semaphore = m_inflight_semaphore;
-		const uint64_t wd_id = GpuWatchdogCommitted("sync-encoders: " + (KYTY_ENV("KYTY_MTL_GPU_TIME") != nullptr ? KytyTakeCbOps() : std::string()));
+		const uint64_t wd_id = GpuWatchdogCommitted("sync-encoders: " + (KYTY_ENV("KYTY_MTL_GPU_TIME") != nullptr ? KytyTakeCbOps() : std::string()), m_current_command_buffer);
 		[m_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
 			GpuWatchdogCompleted(wd_id);
 			if (semaphore) dispatch_semaphore_signal(semaphore);
 		}];
 		PassTimerOnCommit(m_current_command_buffer);
 		if (m_cb_order_event != nil) [m_current_command_buffer encodeSignalEvent:m_cb_order_event value:++m_cb_order_value];
-		[m_current_command_buffer commit];
+		KytyBudgetedCommit(m_current_command_buffer);
 		[m_current_command_buffer waitUntilCompleted];
 		m_current_command_buffer = nil;
 	}
@@ -231,6 +238,11 @@ void MetalContext::SetActiveComputeEncoder(id<MTLComputeCommandEncoder> encoder)
 	if (encoder != nil) ++m_encoder_serial;
 }
 
+void MetalContext::QueueEncoderWriteback(std::function<void(id)> writeback, uint64_t key) {
+	if (key != 0) for (auto& pending:m_pending_writebacks) if (pending.key == key) { pending.encode=std::move(writeback); return; }
+	m_pending_writebacks.push_back({key,std::move(writeback)});
+}
+
 void MetalContext::EndCurrentEncoder() {
 	if (m_active_render_encoder) {
 		OrderEnd(m_active_render_encoder); [m_active_render_encoder endEncoding];
@@ -239,6 +251,11 @@ void MetalContext::EndCurrentEncoder() {
 	if (m_active_compute_encoder) {
 		OrderEnd(m_active_compute_encoder); [m_active_compute_encoder endEncoding];
 		m_active_compute_encoder = nil;
+	}
+	if (!m_pending_writebacks.empty()) {
+		std::vector<PendingWriteback> writebacks;
+		writebacks.swap(m_pending_writebacks);
+		for (const auto& writeback: writebacks) writeback.encode(m_current_command_buffer);
 	}
 	if (!m_pending_fills.empty()) {
 		std::vector<PendingBlitFill> fills;
@@ -290,21 +307,22 @@ static std::atomic<uint64_t> s_cb_completed {0};
 static std::mutex                       s_wd_mutex;
 struct WatchdogEntry {
 	std::chrono::steady_clock::time_point when;
+	id<MTLCommandBuffer>                   command;
 	std::string                           ops; // what the command buffer holds (KYTY_MTL_GPU_TIME=1) and which path committed it
 };
 // Keyed by commit order; a buffer is removed by its own completion (not "the oldest one"), so every path that commits and waits can register.
 static std::map<uint64_t, WatchdogEntry> s_wd_inflight;
 static uint64_t                          s_wd_next = 1;
-static uint64_t GpuWatchdogCommitted(const std::string& ops) {
+static uint64_t GpuWatchdogCommitted(const std::string& ops, id<MTLCommandBuffer> command) {
 	static const double limit = [] {
 		const char* v = std::getenv("KYTY_GPU_WATCHDOG_S");
 		return v != nullptr ? std::atof(v) : 20.0;
 	}();
-	uint64_t id = 0;
+	uint64_t watchdog_id = 0;
 	{
 		std::lock_guard<std::mutex> lock(s_wd_mutex);
-		id = s_wd_next++;
-		s_wd_inflight[id] = {std::chrono::steady_clock::now(), ops};
+		watchdog_id = s_wd_next++;
+		s_wd_inflight[watchdog_id] = {std::chrono::steady_clock::now(), command, ops};
 	}
 	static const bool started = [&] {
 		if (limit <= 0.0) return false;
@@ -316,18 +334,16 @@ static uint64_t GpuWatchdogCommitted(const std::string& ops) {
 			double last_sample = 0.0;
 			for (;;) {
 				std::this_thread::sleep_for(std::chrono::seconds(1));
-				// Compute-indirect arguments the total-groups guard had to zero (garbage counts where a producer's should be).
-				const std::string guard_line = Libs::Graphics::Metal::KytyPollIndirectGuard();
-				if (!guard_line.empty()) std::fprintf(stderr, "%s\n", guard_line.c_str());
 				double      age = 0.0;
 				uint64_t    oldest_id = 0;
 				std::string ops;
+				id<MTLCommandBuffer> oldest_command = nil;
 				{
 					std::lock_guard<std::mutex> lock(s_wd_mutex);
 					if (!s_wd_inflight.empty()) {
 						oldest_id = s_wd_inflight.begin()->first;
 						age = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_wd_inflight.begin()->second.when).count();
-						if (age > limit) ops = s_wd_inflight.begin()->second.ops;
+						if (age > limit) { ops = s_wd_inflight.begin()->second.ops; oldest_command = s_wd_inflight.begin()->second.command; }
 					}
 				}
 				if (oldest_id != last_sample_id) {
@@ -340,6 +356,11 @@ static uint64_t GpuWatchdogCommitted(const std::string& ops) {
 				}
 				if (age > limit) {
 					std::fprintf(stderr, "[GpuWatchdog] a command buffer has been running for %.0f s (limit %.0f s): exiting before the system watchdog fires\n", age, limit);
+					if (oldest_command) std::fprintf(stderr,
+					    "[GpuWatchdog] Metal status=%ld GPU=%.9f..%.9f kernel=%.9f..%.9f error=%s\n",
+					    (long)oldest_command.status, oldest_command.GPUStartTime, oldest_command.GPUEndTime,
+					    oldest_command.kernelStartTime, oldest_command.kernelEndTime,
+					    oldest_command.error ? oldest_command.error.localizedDescription.UTF8String : "none");
 					if (!ops.empty()) std::fprintf(stderr, "[GpuWatchdog] ops of the stuck command buffer: %s\n", ops.c_str());
 					// The shared argument buffers still hold what the GPU wrote last: for a hung indirect op, its own arguments.
 					std::fprintf(stderr, "[GpuWatchdog] indirect snapshots: %s\n", Libs::Graphics::Metal::KytyDescribeIndirectArguments().c_str());
@@ -352,7 +373,7 @@ static uint64_t GpuWatchdogCommitted(const std::string& ops) {
 		return true;
 	}();
 	(void)started;
-	return id;
+	return watchdog_id;
 }
 static void GpuWatchdogCompleted(uint64_t id) {
 	std::lock_guard<std::mutex> lock(s_wd_mutex);
@@ -363,7 +384,7 @@ static void GpuWatchdogCompleted(uint64_t id) {
 // named too. Call before commit. `what` says which path.
 void KytyWatchCommandBuffer(id commandBuffer, const char* what) {
 	if (commandBuffer == nil) return;
-	const uint64_t id_ = GpuWatchdogCommitted(std::string(what));
+	const uint64_t id_ = GpuWatchdogCommitted(std::string(what), (id<MTLCommandBuffer>)commandBuffer);
 	[(id<MTLCommandBuffer>)commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) { GpuWatchdogCompleted(id_); }];
 }
 
@@ -378,7 +399,7 @@ void MetalContext::CommitCommandBuffer(bool wait) {
 			cb_ops = KytyTakeCbOps();
 			m_current_command_buffer.label = [NSString stringWithUTF8String:cb_ops.c_str()];
 		}
-		const uint64_t wd_id = GpuWatchdogCommitted(cb_ops.empty() ? std::string("commit") : cb_ops);
+		const uint64_t wd_id = GpuWatchdogCommitted(cb_ops.empty() ? std::string("commit") : cb_ops, m_current_command_buffer);
 		if (semaphore) {
 			[m_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
 				// KYTY_GPU_BUSY=1: share of wall time the GPU spent executing our command buffers, every ~3 s (is the frame GPU-bound?).
@@ -439,7 +460,7 @@ void MetalContext::CommitCommandBuffer(bool wait) {
 		s_cb_committed.fetch_add(1, std::memory_order_relaxed);
 		PassTimerOnCommit(m_current_command_buffer);
 		if (m_cb_order_event != nil) [m_current_command_buffer encodeSignalEvent:m_cb_order_event value:++m_cb_order_value];
-		[m_current_command_buffer commit];
+		KytyBudgetedCommit(m_current_command_buffer);
 		if (wait) {
 			[m_current_command_buffer waitUntilCompleted];
 		}
@@ -452,14 +473,14 @@ void MetalContext::WaitUntilIdle() {
 	if (m_current_command_buffer) {
 		dispatch_semaphore_t semaphore = m_inflight_semaphore;
 		// The CPU waits here for everything recorded since the last commit (the CP's BufferWait): the watchdog must see this buffer too.
-		const uint64_t wd_id = GpuWatchdogCommitted("WaitUntilIdle: " + (KYTY_ENV("KYTY_MTL_GPU_TIME") != nullptr ? KytyTakeCbOps() : std::string()));
+		const uint64_t wd_id = GpuWatchdogCommitted("WaitUntilIdle: " + (KYTY_ENV("KYTY_MTL_GPU_TIME") != nullptr ? KytyTakeCbOps() : std::string()), m_current_command_buffer);
 		[m_current_command_buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
 			GpuWatchdogCompleted(wd_id);
 			if (semaphore) dispatch_semaphore_signal(semaphore);
 		}];
 		PassTimerOnCommit(m_current_command_buffer);
 		if (m_cb_order_event != nil) [m_current_command_buffer encodeSignalEvent:m_cb_order_event value:++m_cb_order_value];
-		[m_current_command_buffer commit];
+		KytyBudgetedCommit(m_current_command_buffer);
 		[m_current_command_buffer waitUntilCompleted];
 		m_current_command_buffer = nil;
 	}

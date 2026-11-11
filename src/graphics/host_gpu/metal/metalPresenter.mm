@@ -461,7 +461,7 @@ bool MetalPresenter::PresentTexture(void* texture) {
 					}
 				}
 				KytyWatchCommandBuffer(dump_cb, "metalPresenter.mm:dump_cb#1");
-				[dump_cb commit];
+				KytyBudgetedCommit(dump_cb);
 				[dump_cb waitUntilCompleted];
 
 				FILE* f = std::fopen(dump_path, "wb");
@@ -502,7 +502,7 @@ bool MetalPresenter::PresentTexture(void* texture) {
 		}
 
 		[cmd_buf presentDrawable:drawable];
-		[cmd_buf commit];
+		KytyBudgetedCommit(cmd_buf);
 		return true;
 	}
 }
@@ -538,7 +538,7 @@ bool MetalPresenter::DumpTextureToPpm(void* texture, const char* path) {
 			         destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
 			[bl endEncoding];
 			KytyWatchCommandBuffer(sb, "metalPresenter.mm:sb#2");
-			[sb commit];
+			KytyBudgetedCommit(sb);
 			[sb waitUntilCompleted];
 			std::fprintf(stderr, "[DumpTex] 3D source %lux%lux%lu slice %lu copied\n", (unsigned long)src.width,
 			             (unsigned long)src.height, (unsigned long)src.depth, (unsigned long)slice);
@@ -599,7 +599,7 @@ bool MetalPresenter::DumpTextureToPpm(void* texture, const char* path) {
 			[blit endEncoding];
 		}
 		KytyWatchCommandBuffer(cmd, "metalPresenter.mm:cmd#3");
-		[cmd commit];
+		KytyBudgetedCommit(cmd);
 		[cmd waitUntilCompleted];
 
 		FILE* f = std::fopen(path, "wb");
@@ -678,7 +678,7 @@ bool MetalPresenter::PresentFrame(const void* guest_vaddr, uint32_t width, uint3
 			id<MTLRenderCommandEncoder> enc = [cmd_buf renderCommandEncoderWithDescriptor:pass];
 			if (enc) [enc endEncoding];
 			[cmd_buf presentDrawable:drawable];
-			[cmd_buf commit];
+			KytyBudgetedCommit(cmd_buf);
 			return true;
 		}
 
@@ -744,7 +744,7 @@ bool MetalPresenter::PresentFrame(const void* guest_vaddr, uint32_t width, uint3
 		}
 
 		[cmd_buf presentDrawable:drawable];
-		[cmd_buf commit];
+		KytyBudgetedCommit(cmd_buf);
 		return true;
 	}
 }

@@ -679,7 +679,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+	auto spirv = options.emit_spirv ? Spirv::EmitProgram(ir, options.input_info, options.spirv_for_metal)
+	                                : std::vector<uint32_t>{};
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
@@ -687,11 +688,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
-	if (options.optimization_type != Config::ShaderOptimizationType::None) {
+	if (options.emit_spirv && options.optimization_type != Config::ShaderOptimizationType::None) {
 		const auto  optimize_begin = std::chrono::steady_clock::now();
 		const auto  original_words = spirv.size();
 		std::string diagnostics;
-		const bool  optimized = Spirv::Optimize(spirv, options.optimization_type, diagnostics);
+		const bool  optimized = Spirv::Optimize(spirv, options.optimization_type, diagnostics, options.spirv_for_metal);
 		LOGF("%s SPIR-V optimize: stage=%s hash=0x%016" PRIx64
 		     " mode=%s words=%zu->%zu elapsed_ms=%" PRIu64 " fallback=%s\n",
 		     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,

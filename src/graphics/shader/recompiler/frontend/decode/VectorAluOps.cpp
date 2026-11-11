@@ -306,6 +306,10 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x159u, Opcode::V_MED3_U32},
     {0x357u, Opcode::V_MED3_F16},
     {0x358u, Opcode::V_MED3_I16},
+    {0x14du, Opcode::V_LERP_U8},
+    {0x15au, Opcode::V_SAD_U8},
+    {0x15bu, Opcode::V_SAD_HI_U8},
+    {0x15cu, Opcode::V_SAD_U16},
     {0x15du, Opcode::V_SAD_U32},
     {0x15eu, Opcode::V_CVT_PK_U8_F32},
     {0x178u, Opcode::V_XOR3_B32},
@@ -1416,9 +1420,14 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 	}
 }
 
+bool IsUnsignedSadOpcode(Opcode opcode) {
+	return opcode == Opcode::V_SAD_U8 || opcode == Opcode::V_SAD_HI_U8 ||
+	       opcode == Opcode::V_SAD_U16 || opcode == Opcode::V_SAD_U32;
+}
+
 bool SupportsNativeVop3Clamp(Opcode opcode) {
 	return SupportsNativeVop3ResultModifiers(opcode) || UsesInexactClampControl(opcode) ||
-	       opcode == Opcode::V_MAD_I16;
+	       opcode == Opcode::V_MAD_I16 || IsUnsignedSadOpcode(opcode);
 }
 
 bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mix,
@@ -1429,6 +1438,9 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 	const bool result_modifiers = SupportsNativeVop3ResultModifiers(opcode);
 	const bool clamp_modifier   = SupportsNativeVop3Clamp(opcode);
 
+	if (IsUnsignedSadOpcode(opcode)) {
+		return abs != 0u || op_sel != 0u || omod != 0u || neg != 0u;
+	}
 	if (permlane) {
 		return abs != 0u || (op_sel & ~0x3u) != 0u || clamp != 0u || omod != 0u || neg != 0u;
 	}

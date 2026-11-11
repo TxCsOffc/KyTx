@@ -19,11 +19,18 @@ static void Check(bool ok, const char* what, const char* family, uint32_t eb, ui
 	}
 }
 
+#include "metalTilingVolumeTests.inc"
+#include "metalMipViewTests.inc"
+#include "metalArrayUploadTests.inc"
+
 int main() {
 	@autoreleasepool {
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
 		if (device == nil) { std::fprintf(stderr, "Metal device unavailable\n"); return 1; }
+		ArrayUploadTests(device);
+		MipViewTests(device);
 		id<MTLCommandQueue> queue = [device newCommandQueue];
+		VolumeTiling(device, queue);
 		const TileBlockFamily families[] = {TileBlockFamily::Standard256B, TileBlockFamily::Standard4KB, TileBlockFamily::Standard64KB,
 		                                    TileBlockFamily::Prt64KB, TileBlockFamily::RenderTarget64KB, TileBlockFamily::Depth64KB};
 		const char* names[] = {"Std256B", "Std4KB", "Std64KB", "Prt64KB", "RT64KB", "Depth64KB"};

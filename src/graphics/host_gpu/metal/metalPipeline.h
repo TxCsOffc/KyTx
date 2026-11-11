@@ -30,6 +30,25 @@ enum MTLColorWriteMask : NSUInteger;
 
 namespace Libs::Graphics::Metal {
 
+// DB_DEPTH_VIEW.Z_READ_ONLY overrides DB_DEPTH_CONTROL.Z_WRITE_ENABLE.
+// The same result drives the Metal state and the depth-feedback resource path.
+inline HW::DepthControl ResolveGuestDepthControl(const HW::Context& context) {
+	auto depth = context.GetDepthControl();
+	depth.z_write_enable = depth.z_write_enable && !context.GetDepthRenderTarget().depth_view.depth_write_disable &&
+	                       !context.GetRenderControl().depth_clear_enable;
+	return depth;
+}
+
+inline bool GuestDepthWritesEnabled(const HW::Context& context) {
+	const auto depth = ResolveGuestDepthControl(context);
+	return depth.z_enable && depth.z_write_enable;
+}
+
+inline bool GuestStencilClearEnabled(const HW::Context& context) {
+	return context.GetRenderControl().stencil_clear_enable &&
+	       !context.GetDepthRenderTarget().depth_view.stencil_write_disable;
+}
+
 // Mapping helper functions
 MTLCompareFunction   TranslateCompareFunction(uint8_t func);
 MTLStencilOperation  TranslateStencilOperation(uint8_t op);
@@ -120,6 +139,9 @@ void MaskUnwrittenColorAttachments(MetalRenderPipelineKey& key, uint32_t color_e
 
 // Keep slot numbers (including holes) consistent between the pass and its pipeline.
 uint32_t NativeColorTargetMask(const HW::Context& context);
+// DB can rasterize depth/stencil without executing the still-bound PS. Side-effect
+// shaders remain active when EXEC_ON_NOOP or a depth/coverage export requests them.
+bool NativePixelShaderActive(const HW::Context& context, uint64_t shader_address);
 void ConfigureNativeColorTarget(MetalRenderPipelineKey& key, const HW::Context& context,
                                 uint32_t slot, MTLPixelFormat format);
 
@@ -205,6 +227,7 @@ public:
 
 private:
 #ifdef __OBJC__
+	id<MTLFunction> m_fixed_depth_stencil_fragment = nil;
 	std::unordered_map<MetalDepthStencilKey, id<MTLDepthStencilState>, MetalDepthStencilKeyHash>
 	    m_depth_stencil_cache;
 	std::unordered_map<MetalRenderPipelineKey, id<MTLRenderPipelineState>, MetalRenderPipelineKeyHash>

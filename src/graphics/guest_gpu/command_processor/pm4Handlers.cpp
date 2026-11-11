@@ -56,17 +56,6 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr uint32_t GcrGl2MetadataInvalidate = 1u << 1u;
-constexpr uint32_t GcrGl0VectorInvalidate   = 1u << 2u;
-constexpr uint32_t GcrGl1Invalidate         = 1u << 3u;
-constexpr uint32_t GcrGl2Unshared           = 1u << 4u;
-constexpr uint32_t GcrGl2Invalidate         = 1u << 8u;
-constexpr uint32_t GcrGl2Writeback          = 1u << 9u;
-constexpr uint32_t GcrOrder012              = 1u << 10u;
-constexpr uint32_t GcrOrder210              = 2u << 10u;
-constexpr uint32_t GcrKnownMask             = GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate |
-                                              GcrGl1Invalidate | GcrGl2Unshared | GcrGl2Invalidate |
-                                              GcrGl2Writeback | GcrOrder012 | GcrOrder210;
 constexpr uint32_t RegisterSelectorMask     = 0x70000000u;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
@@ -74,20 +63,16 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 }
 
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
-	return eop_event_type != 0x28u ||
-	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
-	                    GcrGl2Invalidate | GcrGl2Writeback)) != 0;
+	return eop_event_type != 0x28u || Pm4::DecodeReleaseGcr(gcr_cntl).Any();
 }
 
 uint32_t ReleaseMemCacheActionFromGcr(uint32_t gcr_cntl) {
-	return ((gcr_cntl & GcrGl2Writeback) != 0 ? 0x38u : 0x00u);
+	return Pm4::DecodeReleaseGcr(gcr_cntl).l2_wb ? 0x38u : 0x00u;
 }
 
 void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
-	const uint32_t unknown = (gcr_cntl & ~GcrKnownMask);
-	if (unknown != 0) {
-		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
-	}
+	const uint32_t unknown = Pm4::DecodeReleaseGcr(gcr_cntl).unknown;
+	if (unknown != 0) LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n",unknown);
 }
 
 } // namespace
@@ -1306,9 +1291,12 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
-	return (cmd_id == 0xc0061050 ? 7 : 6);
+	const uint32_t payload = KYTY_PM4_LEN(cmd_id)-1u;
+	EXIT_NOT_IMPLEMENTED(dw < payload+1u);
+	const auto acquire = Pm4::DecodeAcquireMem(cmd_id,std::span(buffer,payload));
+	EXIT_NOT_IMPLEMENTED(!acquire.has_value());
+	cp.AcquireMem(*acquire);
+	return payload;
 }
 
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
@@ -2278,21 +2266,24 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
-
-	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
-	uint32_t eop_event_type     = buffer[0] & 0x3fu;
-	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;
-	uint32_t gcr_cntl           = (buffer[0] >> 12u) & 0xfffu;
-	uint32_t release_dst        = (buffer[1] >> 16u) & 0x3u;
-	uint32_t event_write_dest   = 0;
-	uint32_t data_sel           = (buffer[1] >> 29u) & 0x7u;
-	uint32_t interrupt_selector = (buffer[1] >> 24u) & 0x7u;
-	auto*    dst_gpu_addr =
-	    reinterpret_cast<void*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
-	uint64_t value                = buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u);
-	uint32_t interrupt_context_id = buffer[6] & 0x07ffffffu;
+	EXIT_NOT_IMPLEMENTED(dw < 8);
+	const auto release = Pm4::DecodeReleaseMem(cmd_id,std::span(buffer,7));
+	EXIT_NOT_IMPLEMENTED(!release.has_value());
+	// MES actions / conditional execution are not AGC release operations.
+	// Reject them explicitly rather than silently treating them as a label write.
+	EXIT_NOT_IMPLEMENTED(release->execute || release->mes_control != 0);
+	if (release->wait_dma) cp.EmitGlobalBarrier();
+	uint32_t cache_policy = release->cache_policy;
+	uint32_t eop_event_type = release->event_type;
+	uint32_t event_index = release->event_index;
+	uint32_t gcr_cntl = release->gcr_control;
+	uint32_t release_dst = release->destination;
+	uint32_t event_write_dest = 0;
+	uint32_t data_sel = release->data_select;
+	uint32_t interrupt_selector = release->interrupt_select;
+	auto* dst_gpu_addr = reinterpret_cast<void*>(release->label_address);
+	uint64_t value = release->value;
+	uint32_t interrupt_context_id = release->interrupt_context;
 
 	constexpr uint32_t ReleaseMemDstMemory = 0;
 	constexpr uint32_t ReleaseMemDstTcL2   = 1;
@@ -2302,7 +2293,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	LogUnknownReleaseMemGcr(gcr_cntl);
 
-	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
+	const bool gl2_writeback = release->cache.l2_wb;
 
 	auto trigger_interrupt = [&]() {
 		switch (interrupt_selector) {
@@ -3688,10 +3679,8 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	// Toolkit state restoration emits the compiler's GS-front allocation
-	// metadata here. Native GS resource registers already carry that allocation.
-	g_hw_sh_indirect_func[0x0ca] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		cp.GetShCtx().SetEsShaderResource1(value);
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
@@ -3711,6 +3700,9 @@ void GraphicsInitJmpTablesShIndirect() {
 	};
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		cp.GetShCtx().SetLsShaderResource1(value);
 	};
 	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS;
 	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS; offset++) {

@@ -1398,14 +1398,6 @@ static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI KernelFsync(int fd) {
-	PRINT_NAME();
-
-	LOGF("\t fd = %d\n", fd);
-
-	return OK;
-}
-
 static void KYTY_SYSV_ABI KernelSync() {
 	PRINT_NAME();
 }
@@ -1988,6 +1980,16 @@ int KYTY_SYSV_ABI mkdir(const char* path, uint16_t mode) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelMkdir(path, mode));
 }
 
+int KYTY_SYSV_ABI rmdir(const char* path) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelRmdir(path));
+}
+
+int KYTY_SYSV_ABI fsync(int descriptor) {
+	return POSIX_CALL(LibKernel::FileSystem::KernelFsync(descriptor));
+}
+
 int64_t KYTY_SYSV_ABI lseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 
@@ -2162,6 +2164,22 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWait(volatile uint32_t* address, uint32_t e
 	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
 
+int KYTY_SYSV_ABI KernelSyncOnAddressWait8(volatile uint8_t* address, uint8_t expected,
+                                           const uint32_t* timeout_micros) {
+	static std::atomic_bool logged {false};
+	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait8");
+	return LibKernel::SyncOnAddress::Wait8(address, expected, timeout_micros,
+	                                       LibKernel::KernelDispatchPendingSignalForCurrentThread);
+}
+
+int KYTY_SYSV_ABI KernelSyncOnAddressWait16(volatile uint16_t* address, uint16_t expected,
+                                            const uint32_t* timeout_micros) {
+	static std::atomic_bool logged {false};
+	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait16");
+	return LibKernel::SyncOnAddress::Wait16(address, expected, timeout_micros,
+	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+}
+
 int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t expected,
                                             const uint32_t* timeout_micros) {
 	static std::atomic_bool logged {false};
@@ -2294,6 +2312,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
+	LIB_FUNC("juWbTNM+8hw", Posix::fsync);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
 	LIB_FUNC("YCV5dGGBcCo", Posix::sem_wait);
@@ -3338,6 +3357,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("4qGrR6eoP9Y", LibKernel::PthreadDetach);
 	LIB_FUNC("3kg7rT0NQIs", LibKernel::PthreadExit);
 	LIB_FUNC("qBDmpCyGssE", LibKernel::PthreadCancel);
+	LIB_FUNC("LapIb799SSE", LibKernel::PthreadTestcancel);
 	LIB_FUNC("OAmWq+OHSjw", LibKernel::PthreadSetcancelstate);
 	LIB_FUNC("sCJd99Phct0", LibKernel::PthreadSetcanceltype);
 	LIB_FUNC("How7B8Oet6k", LibKernel::PthreadGetname);
@@ -3443,6 +3463,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("z0dtnPxYgtg", chmod);
 	LIB_FUNC("VAzswvTOCzI", FileSystem::KernelUnlink);
 	LIB_FUNC("JGMio+21L4c", Posix::mkdir);
+	LIB_FUNC("c7ZnT7V1B98", Posix::rmdir);
 	LIB_FUNC("wuCroIGjt2g", FileSystem::KernelOpen);
 	LIB_FUNC("bY-PO6JhzhQ", FileSystem::KernelClose);
 	LIB_FUNC("FN4gaPmuFV8", FileSystem::KernelWrite);
@@ -3490,7 +3511,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
 	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
-	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
+	LIB_FUNC("fTx66l5iWIA", FileSystem::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);
 	LIB_FUNC("9BcDykPmo1I", LibKernel::get_error_addr);
@@ -3539,6 +3560,9 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("DLORcroUqbc", LibKernel::KernelGetOpenPsId);
 	LIB_FUNC("zE-wXIZjLoM", LibKernel::KernelDebugRaiseExceptionOnReleaseMode);
 	LIB_FUNC("Hc4CaR6JBL0", Posix::KernelSyncOnAddressWait);
+	LIB_FUNC("3k6kx-zOOSQ", Memory::KernelMlock);
+	LIB_FUNC("dFym5b41JLU", Posix::KernelSyncOnAddressWait8);
+	LIB_FUNC("XgVs4jRehcY", Posix::KernelSyncOnAddressWait16);
 	LIB_FUNC("B2n8aDorSH4", Posix::KernelSyncOnAddressWait32);
 	LIB_FUNC("PZQhiiLXRFs", Posix::KernelSyncOnAddressWait64);
 	LIB_FUNC("q2y-wDIVWZA", Posix::KernelSyncOnAddressWake);

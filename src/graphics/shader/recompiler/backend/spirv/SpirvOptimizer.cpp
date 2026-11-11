@@ -6,7 +6,7 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 bool Optimize(std::vector<uint32_t>& code, Config::ShaderOptimizationType mode,
-              std::string& diagnostics) {
+              std::string& diagnostics, bool allow_dynamic_sample_offset) {
 	diagnostics.clear();
 	if (mode == Config::ShaderOptimizationType::None) {
 		return true;
@@ -41,6 +41,9 @@ bool Optimize(std::vector<uint32_t>& code, Config::ShaderOptimizationType mode,
 	}
 
 	spvtools::OptimizerOptions options;
+	spvtools::ValidatorOptions validator_options;
+	validator_options.SetAllowOffsetTextureOperand(allow_dynamic_sample_offset);
+	options.set_validator_options(validator_options);
 	options.set_preserve_bindings(true);
 	options.set_preserve_spec_constants(true);
 	std::vector<uint32_t> optimized;
@@ -49,7 +52,7 @@ bool Optimize(std::vector<uint32_t>& code, Config::ShaderOptimizationType mode,
 	}
 	spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_3);
 	validator.SetMessageConsumer(consume);
-	if (!validator.Validate(optimized)) {
+	if (!validator.Validate(optimized.data(),optimized.size(),validator_options)) {
 		return false;
 	}
 	code = std::move(optimized);

@@ -1016,7 +1016,13 @@ void WindowContext::UpdateTitle() {
 	(void)has_app_ver;
 	(void)processor_name;
 	(void)graphic_ctx;
-	auto text = fmt::format("KyTx | {}{}{}{}{} | frame: {}, fps: {:.0f}", (has_title ? title : ""), (has_title && has_title_id ? " (" : ""),
+	// Which rendering path this window runs: the product's RDNA->MSL Metal path, or the Vulkan (SPIR-V) reference on KosmicKrisp / MoltenVK.
+	const char* path_label = "Metal (RDNA->MSL)";
+	if (!Metal::UseNativeMetalBackend()) {
+		const char* icd = std::getenv("VK_DRIVER_FILES");
+		path_label = (icd != nullptr && std::strstr(icd, "kosmickrisp") != nullptr) ? "Vulkan (SPIR-V) / KosmicKrisp" : "Vulkan (SPIR-V) / MoltenVK";
+	}
+	auto text = fmt::format("KyTx [{}] | {}{}{}{}{} | frame: {}, fps: {:.0f}", path_label, (has_title ? title : ""), (has_title && has_title_id ? " (" : ""),
 	                        (has_title_id ? title_id : ""), (has_title && has_title_id ? ")" : ""), (!has_title && !has_title_id ? "no game" : ""),
 	                        frame_num, current_fps);
 	text += Libs::Graphics::Metal::GpuCaptureTitleSuffix();

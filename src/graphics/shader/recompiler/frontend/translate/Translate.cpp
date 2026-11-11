@@ -1142,7 +1142,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Mesh) {
 			const auto& mesh = options.input_info.vertex->mesh;
-			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 64u ||
+			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > (mesh.native_execution ? 256u : 64u) ||
 			                     total_threads > 15u * options.wave_size);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 			const auto draw = [&](uint32_t index) {
@@ -1183,6 +1183,24 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
+			if (mesh.native_execution) {
+				// GFX10 NGG s2: subgroup counts, not per-wave counts. AMD LLPC
+				// initWaveThreadInfo decodes vertices[20:12], primitives[30:22].
+				const auto primitive_total = entry_ir.Select(entry_ir.ULessThan(draw(0), size), u32(0),
+				    entry_ir.IAdd(IR::U32(entry_ir.Emit(IR::ValueOpcode::UDiv32,
+				        {subtract_saturate(draw(0),size),step})),u32(1)));
+				const auto complete_groups = IR::U32(entry_ir.Emit(IR::ValueOpcode::UDiv32,
+				    {primitive_total,u32(mesh.primitives_per_group)}));
+				const auto remaining = entry_ir.ISub(primitive_total,
+				    entry_ir.IMul(complete_groups,u32(mesh.primitives_per_group)));
+				const auto group_count = entry_ir.IAdd(complete_groups,
+				    entry_ir.Select(entry_ir.INotEqual(remaining,u32(0)),u32(1),u32(0)));
+				const auto ordered_id=entry_ir.BitwiseAnd(entry_ir.IAdd(group,
+				    entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId,1),group_count)),u32(0xfff));
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),entry_ir.BitwiseOr(ordered_id,
+				    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(vertices,u32(12)),
+				                       entry_ir.ShiftLeftLogical(primitives,u32(22)))));
+			}
 			if (mesh.fast_launch) {
 				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), entry_ir.IAdd(draw(1), group));
@@ -1208,16 +1226,32 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 					input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
 				} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
 					const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
-					first = entry_ir.IAdd(first, parity);
-					second = entry_ir.ISub(second, parity);
+					if (mesh.native_execution && mesh.provoking_vertex == 0) {
+						second = entry_ir.IAdd(second,parity); third = entry_ir.ISub(third,parity);
+					} else {
+						first = entry_ir.IAdd(first, parity); second = entry_ir.ISub(second, parity);
+					}
 				}
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
-				                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
-				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
-				                      entry_ir.ShiftLeftLogical(third, u32(2)));
+				if (mesh.ngg_vertex) {
+					// Passthrough NGG's v0 is the 3x10-bit primitive export payload,
+					// not the merged GS pair of LDS adjacency byte offsets.
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0), entry_ir.BitwiseOr(first,
+					    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(second, u32(10)),
+					                       entry_ir.ShiftLeftLogical(third, u32(20)))));
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2), entry_ir.IAdd(primitive_chunk,local));
+				} else {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
+					    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
+					                       entry_ir.ShiftLeftLogical(second, u32(18))));
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1), entry_ir.ShiftLeftLogical(third, u32(2)));
+				}
 				const auto index_bytes  = draw(3);
 				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
+				IR::U32 index;
+				if (mesh.native_execution) {
+					index = IR::U32(entry_ir.Emit(IR::ValueOpcode::MeshIndex,
+					    {entry_ir.IAdd(input_vertex, draw(4)), index_bytes, entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))}));
+				} else {
 				const auto index_low    = draw(4);
 				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
 				                                           entry_ir.IMul(input_vertex, index_bytes));
@@ -1231,10 +1265,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
 				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
 				    IR::MemoryFlags {.index = memory_index});
-				const auto index = IR::U32(entry_ir.Emit(
+				index = IR::U32(entry_ir.Emit(
 				    IR::ValueOpcode::BitFieldUExtract,
 				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
 				     entry_ir.IMul(index_bytes, u32(8))}));
+				}
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
 				entry_ir.SetVectorReg(

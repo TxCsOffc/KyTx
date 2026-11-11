@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/backend/msl/MslEmitter.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -653,7 +654,7 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
+                         const std::vector<uint32_t>& spirv, bool spirv_for_metal) {
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
@@ -665,7 +666,9 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        static_cast<int>(position.column), static_cast<int>(position.index),
 		                        message);
 	});
-	if (tools.Validate(spirv)) {
+	spvtools::ValidatorOptions validation_options;
+	validation_options.SetAllowOffsetTextureOperand(spirv_for_metal);
+	if (tools.Validate(spirv.data(),spirv.size(),validation_options)) {
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -786,6 +789,79 @@ struct PipelineCache::ProgramCache {
 		return hash;
 	}
 
+	// Opt-in paired compiler artifacts for a real guest shader. Both sources use
+	// the same specialized IR; no shader/resource is replaced in the live run.
+	static void DumpShaderPair(const ShaderRecompiler::CompileResult& result,
+	                           const ShaderRecompiler::CompileOptions& options,
+	                           const ShaderRecompiler::Msl::EmitResult& msl, uint64_t native_hash) {
+		const char* dir=std::getenv("KYTY_SHADER_PAIR_DIR");
+		const char* filter=std::getenv("KYTY_SHADER_PAIR_HASH");
+		if (!dir || !filter) return;
+		bool wanted=std::string_view(filter)=="all";
+		for (const char* p=filter;!wanted && *p;) {
+			char* end=nullptr; const auto hash=std::strtoull(p,&end,16);
+			if (end==p) break;
+			wanted |= hash==options.shader_hash || (hash<=UINT32_MAX && hash==(options.shader_hash>>32u));
+			p=*end==','?end+1:end;
+		}
+		if (!wanted) return;
+		std::error_code ec;std::filesystem::create_directories(dir,ec);
+		if (ec) { std::fprintf(stderr,"[ShaderPair] cannot create capture directory: %s\n",ec.message().c_str()); return; }
+		const auto prefix=std::filesystem::path(dir)/fmt::format("{:016x}-{:016x}",options.shader_hash,native_hash);
+		const auto write=[&](const char* extension,const void* data,size_t size) {
+			const auto path=prefix.string()+extension; FILE* file=std::fopen(path.c_str(),"wb");
+			if (!file) return false;
+			const bool ok=std::fwrite(data,1,size,file)==size;std::fclose(file);return ok;
+		};
+		const auto& program=result.program;
+		const auto abi=Metal::ComputeSpvcAbiLayout(program.bindings,options.stage);
+		const auto* group=ShaderWorkgroupInput(options.stage,options.input_info);
+		std::string meta=fmt::format("{{\"guest_hash\":\"{:016x}\",\"native_hash\":\"{:016x}\",\"stage\":{},\"wave_size\":{},\"native_success\":{},\"workgroup\":[{},{},{}],\"bindings\":[",
+		    options.shader_hash,native_hash,uint32_t(options.stage),program.wave_size,msl.success,
+		    group?group->threads_num[0]:0,group?group->threads_num[1]:0,group?group->threads_num[2]:0);
+		for (size_t i=0;i<abi.entries.size();++i) {
+			const auto& e=abi.entries[i];
+			using K=ShaderRecompiler::IR::DescriptorBindingKind;
+			const char* category=e.kind==K::Samplers?"sampler":ShaderRecompiler::IR::ImageBindingResourceClass(e.kind)!=ShaderRecompiler::IR::ImageResourceClass::None?"image":"buffer";
+			meta+=fmt::format("{}{{\"kind\":{},\"binding\":{},\"count\":{},\"base\":{},\"category\":\"{}\",\"resources\":[",i?",":"",uint32_t(e.kind),e.binding,e.count,e.base_id,category);
+			for(const auto& binding:program.bindings.descriptors)if(binding.kind==e.kind)
+				for(size_t j=0;j<binding.resources.size();++j)meta+=fmt::format("{}{}",j?",":"",binding.resources[j]);
+			meta+="]}";
+		}
+		meta+=fmt::format("],\"push_data_start\":{},\"memory_offset_dword\":{},\"memory_offset_count\":{},\"samplers\":[",program.bindings.push_data_start_dword,program.bindings.memory_offset_dword,program.bindings.memory_offset_count);
+		for(size_t i=0;i<program.info.samplers.size();++i){const auto& sampler=program.info.samplers[i];
+			meta+=fmt::format("{}{{\"resource\":{},\"compare\":{},\"point_fetch\":{},\"force_point\":{}}}",i?",":"",i,sampler.depth_compare,sampler.point_fetch,sampler.force_point_filtering);}
+		meta+="],\"buffers\":[";
+		for (size_t i=0;i<program.info.buffers.size();++i) {
+			const auto& b=program.info.buffers[i];
+			meta+=fmt::format("{}{{\"resource\":{},\"read\":{},\"written\":{},\"extent\":{}}}",i?",":"",i,b.read,b.written,b.max_byte_extent);
+		}
+		meta+="],\"images\":[";
+		for (size_t i=0;i<program.info.images.size();++i) {
+			const auto& image=program.info.images[i];
+			meta+=fmt::format("{}{{\"resource\":{},\"dimension\":{},\"numeric_class\":{},\"read\":{},\"written\":{},\"compare\":{},\"mips\":{}}}",
+			    i?",":"",i,uint32_t(image.dimension),uint32_t(image.numeric_class),image.read,image.written,image.depth_compare,image.mip_count);
+		}
+		meta+="],\"image_ops\":[";
+		bool first=true;
+		for (const auto* block:program.blocks) for (const auto& inst:*block) {
+			const auto op=inst.GetOpcode();
+			const char* name=op==ShaderRecompiler::IR::ValueOpcode::ImageSampleRaw?"sample":op==ShaderRecompiler::IR::ValueOpcode::ImageGatherRaw?"gather":nullptr;
+			if (!name) continue;
+			const auto index=inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index;
+			if (index>=program.memory_info.size()) continue;
+			const auto& m=program.memory_info[index];
+			meta+=fmt::format("{}{{\"kind\":\"{}\",\"image\":{},\"sampler\":{},\"flags\":{},\"data_bits\":{},\"address_components\":{}}}",
+			    first?"":",",name,m.resource,m.sampler,m.image_sample_flags,m.data_bits,m.image_address_components);first=false;
+		}
+		meta+="]}\n";
+		const std::string ir=ShaderRecompiler::IR::ProgramToString(program);
+		const bool ok=write(".ir",ir.data(),ir.size()) && write(".spv",result.spirv.data(),result.spirv.size()*sizeof(uint32_t)) &&
+		    write(".metal",msl.source.data(),msl.source.size()) && write(".json",meta.data(),meta.size());
+		std::fprintf(stderr,"[ShaderPair] guest=%016llx native=%016llx complete=%d prefix=%s\n",
+		    (unsigned long long)options.shader_hash,(unsigned long long)native_hash,ok?1:0,prefix.c_str());
+	}
+
 	Permutation CompilePermutation(const char*                                  stage_name,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
@@ -831,12 +907,12 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		if (options.emit_spirv && !ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv, options.spirv_for_metal)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
-		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		if (options.emit_spirv) DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
 #if defined(__APPLE__)
 		if (Metal::UseNativeMetalBackend()) {
@@ -867,45 +943,11 @@ struct PipelineCache::ProgramCache {
 				auto msl = ShaderRecompiler::Msl::EmitProgram(result.program, options.input_info);
 				uint64_t msl_hash = Metal::NativeMslFunctionKey(
 				    metal_hash, static_cast<uint32_t>(options.stage), msl.source, msl.success);
-				// KYTY_MSL_OVERRIDE_FILE=<path> KYTY_MSL_OVERRIDE_HASH=<hash>: compile the given MSL file
-				// instead of the emitted source for that one shader (diagnostic probes only).
-				if (const char* ov_file = std::getenv("KYTY_MSL_OVERRIDE_FILE")) {
-					const char* ov_hash = std::getenv("KYTY_MSL_OVERRIDE_HASH");
-					if (ov_hash != nullptr && (msl_hash == std::strtoull(ov_hash, nullptr, 0) ||
-					                           metal_hash == std::strtoull(ov_hash, nullptr, 0))) {
-						if (std::FILE* f = std::fopen(ov_file, "rb")) {
-							std::string text;
-							char buf[4096];
-							size_t n = 0;
-							while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
-							std::fclose(f);
-							msl.source = std::move(text);
-							msl.success = true;
-							std::fprintf(stderr, "[MSL] override hash=0x%016llx from %s\n",
-							           static_cast<unsigned long long>(msl_hash), ov_file);
-						}
-					}
-				}
-				// KYTY_MSL_SKIP_STAGE=<n>: treat every shader of that stage as unsupported (bisect only).
-				if (const char* skip_stage = std::getenv("KYTY_MSL_SKIP_STAGE")) {
-					if (static_cast<uint32_t>(options.stage) == static_cast<uint32_t>(std::atoi(skip_stage))) {
-						msl.success = false;
-					}
-				}
-				// KYTY_MSL_SKIP_HASH=<hash>[,<hash>...]: treat these shaders as unsupported (their draws/dispatches are
-				// skipped). Used to bisect which shader causes a GPU fault.
-				if (const char* skip = std::getenv("KYTY_MSL_SKIP_HASH")) {
-					const std::string list = std::string(",") + skip + ",";
-					const std::string needle = ",0x" + fmt::format("{:016x}", msl_hash) + ",";
-					const std::string legacy_needle = ",0x" + fmt::format("{:016x}", metal_hash) + ",";
-					if (list.find(needle) != std::string::npos || list.find(legacy_needle) != std::string::npos) {
-						msl.success = false;
-					}
-				}
 				// Include every baked resource format/stride and static state, not only fragment exports.
 				// Recompute after diagnostics so a failed/overridden permutation cannot reuse another function.
 				msl_hash = Metal::NativeMslFunctionKey(
 				    metal_hash, static_cast<uint32_t>(options.stage), msl.source, msl.success);
+				DumpShaderPair(result,options,msl,msl_hash);
 				if (std::getenv("KYTY_MSL_DUMP_BY_HASH") != nullptr) {
 					std::fprintf(stderr, "[MSL] variant 0x%016llx from shader 0x%016llx\n",
 					             static_cast<unsigned long long>(msl_hash), static_cast<unsigned long long>(options.shader_hash));
@@ -974,11 +1016,14 @@ struct PipelineCache::ProgramCache {
 				     options.shader_hash, msl.unsupported.size());
 			}
 			const auto spvc_abi = Metal::ComputeSpvcAbiLayout(result.program.bindings, options.stage);
+			// The same guest shader can produce different specialized SPIR-V. Include
+			// its contents so the Metal cache cannot reuse a previous translation.
+			const auto spvc_hash = metal_hash ^ XXH3_64bits(result.spirv.data(),result.spirv.size()*sizeof(uint32_t));
 			Metal::MetalShaderManager::Instance().CompileSpirvToFunction(
-			    result.spirv, "main0", static_cast<uint32_t>(options.stage), metal_hash, &spvc_abi);
+			    result.spirv, "main0", static_cast<uint32_t>(options.stage), spvc_hash, &spvc_abi);
 			const auto id = ++next_shader_id;
 			auto info = std::move(result.program).TakeCompiledInfo();
-			info.shader_hash = metal_hash;
+			info.shader_hash = spvc_hash;
 			return {
 			    .specialization = std::move(specialization),
 			    .program        = std::move(info),
@@ -1087,6 +1132,10 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::CompileOptions options;
 		options.optimization_type = Config::GetShaderOptimizationType();
 		options.stage       = stage;
+#if defined(__APPLE__)
+		options.spirv_for_metal = Metal::UseNativeMetalBackend();
+		options.emit_spirv = !(Metal::UseNativeMetalBackend() && std::getenv("KYTY_MSL_ONLY") && std::getenv("KYTY_MSL_ONLY")[0] == '1');
+#endif
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;
@@ -1099,7 +1148,7 @@ struct PipelineCache::ProgramCache {
 			options.user_data_base = 8;
 			options.wave_size = input_info.wave_size;
 			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
-				options.user_data_base = 0;
+				options.user_data_base = stage == ShaderType::Mesh && input_info.mesh.ngg_vertex ? 8u : 0u;
 				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
 			}
 		} else {
@@ -1447,8 +1496,55 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		ProfileDetailScope prepare("cpu_prepare_vertex_program", vertex_regs.es_regs.data_addr);
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
+#if defined(__APPLE__)
+	const bool native_ngg = Metal::UseNativeMetalBackend() && std::getenv("KYTY_MSL_ONLY") &&
+	                        std::getenv("KYTY_MSL_ONLY")[0] == '1';
+	if (native_ngg && vertex_info[0].logical_stage == ShaderType::Vertex) {
+		static std::mutex ngg_cache_mutex;
+		static std::unordered_map<uint64_t,bool> ngg_exports;
+		const bool exports_primitive = [&] {
+			std::lock_guard lock(ngg_cache_mutex);
+			if (const auto found=ngg_exports.find(vertex_params[0].hash);found!=ngg_exports.end()) return found->second;
+			ShaderRecompiler::Decoder::Program decoded;
+			ShaderRecompiler::Decoder::DecodeProgram(vertex_params[0].code, decoded);
+			const bool exports=std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+				return inst.family == ShaderRecompiler::Decoder::Family::EXP && inst.exp.target == 20u && inst.exp.en != 0;
+			});
+			ngg_exports.emplace(vertex_params[0].hash,exports);return exports;
+		}();
+		if (exports_primitive) {
+			auto& info = vertex_info[0]; auto& mesh = info.mesh;
+			info.logical_stage = ShaderType::Mesh; mesh.ngg_vertex = true;
+			const auto primitive = user_config.GetPrimType();
+			if (primitive != Prospero::PrimitiveType::kPointList && primitive != Prospero::PrimitiveType::kLineList &&
+			    primitive != Prospero::PrimitiveType::kTriList && primitive != Prospero::PrimitiveType::kTriStrip &&
+			    primitive != Prospero::PrimitiveType::kTriFan && !Prospero::IsRectList(primitive)) EXIT("native NGG input topology %u requires dedicated assembly\n",uint32_t(primitive));
+			mesh.input_primitive = static_cast<uint32_t>(user_config.GetPrimType());
+			mesh.wave_size = info.wave_size;
+			mesh.provoking_vertex = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
+			mesh.lds_size_dwords = uint32_t(vertex_regs.gs_regs.rsrc2.lds_size) * 128u;
+			mesh.scratch_size_dwords = info.scratch_size_dwords;
+			const auto& ge = user_config.GetGeControl();
+			mesh.primitives_per_group = std::min(uint32_t(ge.primitive_group_size), mesh.InputPrimitiveCount(ge.vertex_group_size));
+			if (mesh.primitives_per_group == 0) EXIT("NGG has an empty GE subgroup\n");
+			mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
+			mesh.max_vertices = mesh.vertices_per_group; mesh.max_primitives = mesh.primitives_per_group;
+			mesh.threads_num[0] = ((std::max(mesh.max_vertices,mesh.max_primitives)+mesh.wave_size-1)/mesh.wave_size)*mesh.wave_size;
+			mesh.threads_num[1] = mesh.threads_num[2] = 1;
+			if (std::getenv("KYTY_LOG_NGG")) {
+				static std::atomic<uint32_t> logged{0};
+				if (logged.fetch_add(1)<40) std::fprintf(stderr,"[NativeNGG] guest=%016llx primitive=%u wave=%u vertices=%u primitives=%u threads=%u LDS=%u\n",
+				    (unsigned long long)vertex_params[0].hash,mesh.input_primitive,mesh.wave_size,mesh.vertices_per_group,mesh.primitives_per_group,mesh.threads_num[0],mesh.lds_size_dwords);
+			}
+		}
+	}
+	if (native_ngg && vertex_info[0].logical_stage == ShaderType::Mesh) {
+		auto& mesh = vertex_info[0].mesh;
+		mesh.native_execution = true; mesh.host_subgroup_size = 32;
+	}
+#endif
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
-	if (mesh_active) {
+	if (mesh_active && !vertex_info[0].mesh.native_execution) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
@@ -1529,6 +1625,18 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		if (vertex_info[0].mesh.native_execution && Prospero::IsRectList(static_cast<Prospero::PrimitiveType>(vertex_info[0].mesh.input_primitive))) {
+			auto& mesh=vertex_info[0].mesh; std::vector<uint32_t> active;
+			for (const auto& input:pixel_info.stage.program->info.inputs)
+				if (input.kind==ShaderRecompiler::IR::StageInputKind::Parameter) active.push_back(input.location);
+			for (const auto& input:pixel_info.stage.program->info.inputs) {
+				if (input.kind!=ShaderRecompiler::IR::StageInputKind::Parameter) continue;
+				const auto location=ShaderPixelParameterLocation(pixel_info,active,input.location);
+				if (location>=32) EXIT("NGG fragment parameter exceeds native interface\n");
+				mesh.parameter_source[location]=ShaderPixelParameterMappedLocation(pixel_info,input.location);
+				if (input.force_flat || ShaderPixelParameterIsFlat(pixel_info,input.location)) mesh.flat_parameter_mask|=1u<<location;
+			}
+		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);

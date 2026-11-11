@@ -1,8 +1,10 @@
+#include "graphics/host_gpu/metal/metalDepthBounds.h"
 #include "graphics/host_gpu/metal/metalEnv.h"
 #include "graphics/host_gpu/metal/metalPipeline.h"
 #include "graphics/host_gpu/metal/metalContext.h"
 #include "graphics/host_gpu/metal/metalRenderer.h"
 #include "common/logging/log.h"
+#include "graphics/host_gpu/metal/metalUnsupported.h"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -14,18 +16,28 @@
 namespace Libs::Graphics::Metal {
 
 uint32_t NativeColorTargetMask(const HW::Context& context) {
-	static const uint32_t slot_count = [] {
-		const char* value = KYTY_ENV("KYTY_MSL_MRT");
-		return value && value[0] == '0' ? 1u : 8u; // Diagnostic A/B against the former RT0-only path.
-	}();
 	const uint32_t write_mask = context.GetRenderTargetMask() & context.GetShaderRegisters().m_cbShaderMask;
 	uint32_t slots = 0;
-	for (uint32_t i = 0; i < slot_count; ++i) {
+	for (uint32_t i = 0; i < 8u; ++i) {
 		// Preserve RT0 for raster/depth-only draws whose color writes are disabled.
 		if (context.GetRenderTarget(i).base.addr != 0 && (i == 0 || ((write_mask >> (i * 4u)) & 0xfu) != 0))
 			slots |= 1u << i;
 	}
 	return slots;
+}
+
+bool NativePixelShaderActive(const HW::Context& context, uint64_t shader_address) {
+	if (shader_address == 0) return false;
+	const auto& sh = context.GetShaderRegisters();
+	const auto& db = sh.db_shader_control;
+	if (db.shader_kill_enable || db.shader_z_export_enable || db.shader_mask_export_enable ||
+	    db.shader_dual_export_enable || db.shader_execute_on_noop) return true;
+	if (context.GetColorControl().mode == 0u) return false;
+	const uint32_t write_mask = context.GetRenderTargetMask() & sh.m_cbShaderMask;
+	for (uint32_t slot = 0; slot < 8u; ++slot)
+		if (sh.target_output_mode[slot] != 0 && ((write_mask >> (4u * slot)) & 0xfu) != 0)
+			return true;
+	return false;
 }
 
 void ConfigureNativeColorTarget(MetalRenderPipelineKey& key, const HW::Context& context,
@@ -98,7 +110,7 @@ size_t MetalRenderPipelineKeyHash::operator()(const MetalRenderPipelineKey& k) c
 }
 
 MTLCompareFunction TranslateCompareFunction(uint8_t func) {
-	switch (func & 0x7u) {
+	switch (func) {
 		case 0: return MTLCompareFunctionNever;
 		case 1: return MTLCompareFunctionLess;
 		case 2: return MTLCompareFunctionEqual;
@@ -107,12 +119,12 @@ MTLCompareFunction TranslateCompareFunction(uint8_t func) {
 		case 5: return MTLCompareFunctionNotEqual;
 		case 6: return MTLCompareFunctionGreaterEqual;
 		case 7: return MTLCompareFunctionAlways;
-		default: return MTLCompareFunctionAlways;
+		default: RejectMetalState("depth/stencil compare function " + std::to_string(func));
 	}
 }
 
 MTLStencilOperation TranslateStencilOperation(uint8_t op) {
-	switch (op & 0x7u) {
+	switch (op) {
 		case 0: return MTLStencilOperationKeep;
 		case 1: return MTLStencilOperationZero;
 		case 2: return MTLStencilOperationReplace;
@@ -121,7 +133,7 @@ MTLStencilOperation TranslateStencilOperation(uint8_t op) {
 		case 5: return MTLStencilOperationInvert;
 		case 6: return MTLStencilOperationIncrementWrap;
 		case 7: return MTLStencilOperationDecrementWrap;
-		default: return MTLStencilOperationKeep;
+		default: RejectMetalState("stencil operation " + std::to_string(op));
 	}
 }
 
@@ -146,7 +158,7 @@ MTLBlendFactor TranslateBlendFactor(uint8_t factor) {
 		case Prospero::BlendFactor::kOneMinusSrc1Alpha: return MTLBlendFactorOneMinusSource1Alpha;
 		case Prospero::BlendFactor::kConstantAlpha: return MTLBlendFactorBlendAlpha;
 		case Prospero::BlendFactor::kOneMinusConstantAlpha: return MTLBlendFactorOneMinusBlendAlpha;
-		default: return MTLBlendFactorZero;
+		default: RejectMetalState("blend factor " + std::to_string(factor));
 	}
 }
 
@@ -157,13 +169,13 @@ MTLBlendOperation TranslateBlendOperation(uint8_t op) {
 		case Prospero::BlendOp::kMin: return MTLBlendOperationMin;
 		case Prospero::BlendOp::kMax: return MTLBlendOperationMax;
 		case Prospero::BlendOp::kReverseSubtract: return MTLBlendOperationReverseSubtract;
-		default: return MTLBlendOperationAdd;
+		default: RejectMetalState("blend operation " + std::to_string(op));
 	}
 }
 
 MTLCullMode TranslateCullMode(const HW::ModeControl& mode) {
 	if (mode.cull_front && mode.cull_back) {
-		return MTLCullModeFront;
+		RejectMetalState("culling both primitive faces requires a raster-discard pipeline");
 	}
 	if (mode.cull_front) {
 		return MTLCullModeFront;
@@ -218,6 +230,7 @@ MetalPipelineManager::~MetalPipelineManager() {
 
 void MetalPipelineManager::ClearCaches() {
 	@autoreleasepool {
+		m_fixed_depth_stencil_fragment = nil;
 		m_depth_stencil_cache.clear();
 		m_render_pipeline_cache.clear();
 		m_compute_pipeline_cache.clear();
@@ -235,13 +248,6 @@ struct StencilFace {
 	uint32_t           write_mask = 0;
 	uint32_t           reference  = 0;
 };
-
-void LogStencilOnce(const char* what, uint32_t a, uint32_t b) {
-	static std::atomic<uint32_t> s_count {0};
-	if (s_count.fetch_add(1) < 16) {
-		std::fprintf(stderr, "[Stencil] unsupported/unrepresentable guest state: %s (%u, %u); treated as keep\n", what, a, b);
-	}
-}
 
 // Guest (DB_STENCIL_CONTROL) operation -> Metal, as the Vulkan backend's ConvertStencilOp.
 MTLStencilOperation ConvertGuestStencilOp(uint8_t value, uint8_t write_mask, uint8_t op_value) {
@@ -261,11 +267,10 @@ MTLStencilOperation ConvertGuestStencilOp(uint8_t value, uint8_t write_mask, uin
 		case Prospero::StencilOp::kXor:
 			if ((write_mask & op_value) == 0) return MTLStencilOperationKeep;
 			if ((write_mask & ~op_value) != 0) {
-				LogStencilOnce("xor operands", write_mask, op_value);
-				return MTLStencilOperationKeep;
+				RejectMetalState("stencil XOR requires per-operation write masks");
 			}
 			return MTLStencilOperationInvert;
-		default: LogStencilOnce("operation", value, 0); return MTLStencilOperationKeep;
+		default: RejectMetalState("guest stencil operation " + std::to_string(value));
 	}
 }
 
@@ -274,6 +279,15 @@ MTLStencilOperation ConvertGuestStencilOp(uint8_t value, uint8_t write_mask, uin
 StencilFace ConvertGuestStencilFace(uint8_t compare, uint8_t fail_op, uint8_t zpass_op, uint8_t zfail_op, uint8_t op_value,
                                     uint8_t compare_mask, uint8_t write_mask, uint8_t test_value) {
 	const std::array<uint8_t, 3> operations = {fail_op, zpass_op, zfail_op};
+	const auto keep = uint8_t(Prospero::StencilOp::kKeep), xor_op = uint8_t(Prospero::StencilOp::kXor);
+	const bool has_xor = std::find(operations.begin(), operations.end(), xor_op) != operations.end();
+	if (has_xor && (write_mask & ~op_value) != 0) {
+		// For XOR/KEEP-only faces, restricting the common mask is exact: only
+		// bits selected by the XOR operand change, on every stencil/depth path.
+		if (!std::all_of(operations.begin(), operations.end(), [&](uint8_t op) { return op == keep || op == xor_op; }))
+			RejectMetalState("mixed stencil XOR requires per-operation write masks");
+		write_mask &= op_value;
+	}
 	uint8_t reference     = test_value;
 	uint8_t required_bits = compare_mask;
 	if (compare == 7u /*always*/ || compare == 0u /*never*/) {
@@ -290,8 +304,7 @@ StencilFace ConvertGuestStencilFace(uint8_t compare, uint8_t fail_op, uint8_t zp
 			replacement = op_value;
 		}
 		if (((reference ^ replacement) & required_bits & write_mask) != 0) {
-			LogStencilOnce("replacement conflicts with the test", compare, write_mask);
-			continue;
+			RejectMetalState("stencil replacement conflicts with its comparison reference");
 		}
 		reference     = static_cast<uint8_t>((reference & ~write_mask) | (replacement & write_mask));
 		required_bits = static_cast<uint8_t>(required_bits | write_mask);
@@ -323,6 +336,8 @@ id<MTLDepthStencilState> MetalPipelineManager::GetOrCreateDepthStencilState(
     bool has_stencil_attachment,
     bool stencil_ops_disabled,
     MetalStencilRefs* refs) {
+	if (depth_ctrl.depth_bounds_enable && !SupportsNativeDepthBounds(MetalContext::Instance().GetDevice()))
+		RejectMetalState("depth bounds requires Apple10 and macOS26 or a software lowering");
 	const bool use_stencil = has_stencil_attachment && depth_ctrl.stencil_enable;
 	StencilFace front, back;
 	if (use_stencil) {
@@ -374,11 +389,7 @@ id<MTLDepthStencilState> MetalPipelineManager::GetOrCreateDepthStencilState(
 
 	@autoreleasepool {
 		MTLDepthStencilDescriptor* desc = [[MTLDepthStencilDescriptor alloc] init];
-		static const bool s_no_depth = [] {
-			const char* value = KYTY_ENV("KYTY_NO_DEPTH");
-			return value != nullptr && value[0] == '1';
-		}();
-		if (depth_ctrl.z_enable && !s_no_depth) {
+		if (depth_ctrl.z_enable) {
 			desc.depthCompareFunction = TranslateCompareFunction(depth_ctrl.zfunc);
 			desc.depthWriteEnabled = depth_ctrl.z_write_enable ? YES : NO;
 		} else {
@@ -417,11 +428,7 @@ MetalRasterizerState MetalPipelineManager::TranslateRasterizerState(
     const HW::ModeControl& mode_ctrl,
     const HW::ClipControl& clip_ctrl) {
 	MetalRasterizerState state {};
-	static const bool s_no_cull = [] {
-		const char* value = KYTY_ENV("KYTY_NO_CULL");
-		return value != nullptr && value[0] == '1';
-	}();
-	state.cull_mode = s_no_cull ? MTLCullModeNone : TranslateCullMode(mode_ctrl);
+	state.cull_mode = TranslateCullMode(mode_ctrl);
 	state.winding = TranslateWinding(mode_ctrl.face);
 	state.fill_mode = TranslateFillMode(mode_ctrl);
 	state.depth_clip_mode = TranslateDepthClipMode(clip_ctrl);
@@ -433,107 +440,17 @@ id<MTLRenderPipelineState> MetalPipelineManager::GetOrCreateRenderPipeline(
     const MetalRenderPipelineKey& key,
     id<MTLFunction> vertex_function,
     id<MTLFunction> fragment_function) {
-	static const bool s_debug_ps_enabled = [] {
-		const char* value = KYTY_ENV("KYTY_DEBUG_PS");
-		return value != nullptr && value[0] == '1';
-	}();
-	static const uint64_t s_debug_ps_after = [] {
-		const char* value = KYTY_ENV("KYTY_DEBUG_PS_AFTER");
-		return value != nullptr ? std::strtoull(value, nullptr, 0) : 0ull;
-	}();
-	// KYTY_DEBUG_PS_ANY=1 widens the gate from RG11B10Float targets to every color target.
-	static const bool s_debug_ps_any = KYTY_ENV("KYTY_DEBUG_PS_ANY") != nullptr;
-	const bool debug_ps_active =
-	    s_debug_ps_enabled && key.color_target_count > 0 &&
-	    (s_debug_ps_any || key.color_targets[0].pixel_format == MTLPixelFormatRG11B10Float) &&
-	    MetalDrawSequence() >= s_debug_ps_after;
-	// Substitute through a distinct cache key: otherwise a pipeline built before the
-	// gate was reached keeps serving the guest pixel shader.
-	MetalRenderPipelineKey cache_key = key;
-	if (debug_ps_active) {
-		cache_key.fs_hash ^= 0x9E3779B97F4A7C15ull;
-	}
+	const MetalRenderPipelineKey& cache_key = key;
 	auto it = m_render_pipeline_cache.find(cache_key);
 	if (it != m_render_pipeline_cache.end()) {
 		return it->second;
 	}
 
 	@autoreleasepool {
-		static const bool s_debug_quad = [] {
-			const char* value = KYTY_ENV("KYTY_DEBUG_QUAD");
-			return value != nullptr && value[0] == '1';
-		}();
-		static id<MTLFunction> s_debug_vs = nil;
-		static id<MTLFunction> s_debug_ps = nil;
-		static id<MTLFunction> s_debug_ps_func = nil;
-		if (debug_ps_active) {
-			if (s_debug_ps_func == nil) {
-				id<MTLDevice> dev = MetalContext::Instance().GetDevice();
-				NSString* src = @"#include <metal_stdlib>\n"
-				                 "using namespace metal;\n"
-				                 "struct VOut { float4 pos [[position]]; };\n"
-				                 "fragment float4 kyty_debug_ps(VOut in [[stage_in]]) {\n"
-				                 "  return float4(1.0, 0.0, 1.0, 1.0);\n"
-				                 "}\n";
-				NSError* err = nil;
-				id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
-				if (lib) {
-					s_debug_ps_func = [lib newFunctionWithName:@"kyty_debug_ps"];
-				}
-			}
-			if (s_debug_ps_func != nil) {
-				fragment_function = s_debug_ps_func;
-			}
-		}
-		if (s_debug_quad) {
-			dispatch_once_t once = 0;
-			(void)once;
-			if (s_debug_vs == nil || s_debug_ps == nil) {
-				id<MTLDevice> dev = MetalContext::Instance().GetDevice();
-				NSString* src = @"#include <metal_stdlib>\n"
-				                 "using namespace metal;\n"
-				                 "struct VOut { float4 pos [[position]]; };\n"
-				                 "vertex VOut kyty_debug_vs(uint vid [[vertex_id]]) {\n"
-				                 "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
-				                 "  VOut o; o.pos = float4(p * float2(2.0, -2.0) + float2(-1.0, 1.0), 0, 1);\n"
-				                 "  return o;\n"
-				                 "}\n"
-				                 "fragment float4 kyty_debug_ps(VOut in [[stage_in]]) {\n"
-				                 "  return float4(1.0, 0.0, 1.0, 1.0);\n"
-				                 "}\n";
-				NSError* err = nil;
-				id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
-				if (lib) {
-					s_debug_vs = [lib newFunctionWithName:@"kyty_debug_vs"];
-					s_debug_ps = [lib newFunctionWithName:@"kyty_debug_ps"];
-				}
-			}
-			const MTLPixelFormat target_format =
-			    key.color_target_count > 0 ? key.color_targets[0].pixel_format
-			                               : MTLPixelFormatInvalid;
-			const auto is_integer = [](MTLPixelFormat format) {
-				switch (format) {
-					case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint:
-					case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
-					case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
-					case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
-					case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint:
-					case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint:
-					case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
-					case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint:
-					case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint:
-					case MTLPixelFormatRGB10A2Uint: return true;
-					default: return false;
-				}
-			};
-			if (s_debug_vs && s_debug_ps && !is_integer(target_format) &&
-			    target_format == MTLPixelFormatRG11B10Float) {
-				vertex_function = s_debug_vs;
-				fragment_function = s_debug_ps;
-			}
-		}
 		MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
-		desc.vertexFunction = vertex_function;
+		desc.label = [NSString stringWithFormat:@"VS %016llx PS %016llx",(unsigned long long)key.vs_hash,(unsigned long long)key.fs_hash];
+		const bool mesh_pipeline = vertex_function.functionType == MTLFunctionTypeMesh;
+		if (!mesh_pipeline) desc.vertexFunction = vertex_function;
 		desc.fragmentFunction = fragment_function;
 
 		for (uint32_t i = 0; i < key.color_target_count; ++i) {
@@ -581,7 +498,46 @@ id<MTLRenderPipelineState> MetalPipelineManager::GetOrCreateRenderPipeline(
 		}
 
 		NSError* error = nil;
-		id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+		id<MTLRenderPipelineState> pipeline = nil;
+		if (mesh_pipeline) {
+			MTLMeshRenderPipelineDescriptor* mesh = [MTLMeshRenderPipelineDescriptor new];
+			mesh.label = desc.label;
+			mesh.meshFunction = vertex_function;
+			if (fragment_function == nil) {
+				if (key.fs_hash != 0) RejectMetalState("missing active fragment function in mesh pipeline");
+				for (uint32_t i = 0; i < key.color_target_count; ++i)
+					if (key.color_targets[i].pixel_format != MTLPixelFormatInvalid &&
+					    key.color_targets[i].write_mask != MTLColorWriteMaskNone)
+						RejectMetalState("PS-disabled mesh pipeline requests color writes");
+				// Mesh pipelines on Apple require a fragment entry even for DB-only
+				// rasterization. No guest PS is being translated here: preserve the
+				// interpolated raster depth and normal stencil operations, exporting
+				// no color/depth/mask and touching no guest resources.
+				if (!m_fixed_depth_stencil_fragment) {
+					auto library = [device newLibraryWithSource:
+					    @"#include <metal_stdlib>\nusing namespace metal;\nfragment void kyty_db_fixed_function() {}\n"
+					    options:nil error:&error];
+					m_fixed_depth_stencil_fragment = [library newFunctionWithName:@"kyty_db_fixed_function"];
+					if (!m_fixed_depth_stencil_fragment)
+						RejectMetalState(std::string("fixed depth/stencil rasterization compile failed: ") +
+						    (error ? error.localizedDescription.UTF8String : "missing entry"));
+				}
+				mesh.fragmentFunction = m_fixed_depth_stencil_fragment;
+			} else mesh.fragmentFunction = fragment_function;
+			mesh.depthAttachmentPixelFormat = desc.depthAttachmentPixelFormat;
+			mesh.stencilAttachmentPixelFormat = desc.stencilAttachmentPixelFormat;
+			mesh.rasterSampleCount = desc.rasterSampleCount;
+			for (uint32_t i = 0; i < key.color_target_count; ++i) {
+				auto a = desc.colorAttachments[i]; auto b = mesh.colorAttachments[i];
+				b.pixelFormat = a.pixelFormat; b.writeMask = a.writeMask; b.blendingEnabled = a.blendingEnabled;
+				b.sourceRGBBlendFactor = a.sourceRGBBlendFactor; b.destinationRGBBlendFactor = a.destinationRGBBlendFactor;
+				b.rgbBlendOperation = a.rgbBlendOperation; b.sourceAlphaBlendFactor = a.sourceAlphaBlendFactor;
+				b.destinationAlphaBlendFactor = a.destinationAlphaBlendFactor; b.alphaBlendOperation = a.alphaBlendOperation;
+			}
+			pipeline = [device newRenderPipelineStateWithMeshDescriptor:mesh options:MTLPipelineOptionNone reflection:nil error:&error];
+		} else {
+			pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+		}
 		if (!pipeline) {
 			static std::atomic<uint32_t> s_pipeline_failures {0};
 			const uint32_t count = s_pipeline_failures.fetch_add(1);

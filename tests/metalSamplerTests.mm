@@ -19,7 +19,7 @@ int main() {
 	@autoreleasepool {
 		id<MTLDevice> device = MTLCreateSystemDefaultDevice();
 		Check(device != nil, "Metal device unavailable");
-		std::array<ShaderSamplerResource, 6> descriptors {};
+		std::array<ShaderSamplerResource, 9> descriptors {};
 		descriptors[1].fields[0] = 2u | (2u << 3u) | (2u << 6u); // edge clamp
 		descriptors[2] = descriptors[1];
 		descriptors[2].fields[2] = (1u << 20u) | (1u << 22u); // bilinear
@@ -30,16 +30,22 @@ int main() {
 		descriptors[4].fields[3] = 2u << 30u; // opaque white border
 		descriptors[5] = descriptors[1];
 		descriptors[5].fields[0] |= 1u << 15u; // pixel coordinates
+		descriptors[6] = descriptors[2]; descriptors[6].fields[0] |= 1u << 29u; // minimum
+		descriptors[7] = descriptors[2]; descriptors[7].fields[0] |= 2u << 29u; // maximum
+		descriptors[8] = descriptors[5]; descriptors[8].fields[2] = 1u << 20u; // pixel: min point, mag linear
 
 		NSString* source = @"#include <metal_stdlib>\nusing namespace metal;\n"
-		    "struct Args { array<sampler, 6> s [[id(0)]]; };\n"
+		    "struct Args { array<sampler, 9> s [[id(0)]]; };\n"
 		    "kernel void test(constant Args& a [[buffer(0)]], device float4* out [[buffer(1)]], texture2d<float> t [[texture(0)]]) {\n"
 		    "out[0] = t.sample(a.s[0], float2(1.25, 0.5), level(0));\n"
 		    "out[1] = t.sample(a.s[1], float2(1.25, 0.5), level(0));\n"
 		    "out[2] = t.sample(a.s[2], float2(0.5, 0.5), level(0));\n"
 		    "out[3] = t.sample(a.s[3], float2(0.5, 0.5), level(1));\n"
 		    "out[4] = t.sample(a.s[4], float2(-0.5, 0.5), level(0));\n"
-		    "out[5] = t.sample(a.s[5], float2(1.5, 0.5));\n}\n";
+		    "out[5] = t.sample(a.s[5], float2(1.5, 0.5));\n"
+		    "out[6] = t.sample(a.s[6], float2(0.5, 0.5), level(0));\n"
+		    "out[7] = t.sample(a.s[7], float2(0.5, 0.5), level(0));\n"
+		    "out[8] = t.sample(a.s[8], float2(1.0, 0.5));\n}\n";
 		NSError* error = nil;
 		id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
 		if (!library) std::fprintf(stderr, "%s\n", error.localizedDescription.UTF8String);
@@ -63,7 +69,7 @@ int main() {
 		const float mip[4] {0, 0, 1, 1};
 		[texture replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:pixels bytesPerRow:sizeof(pixels)];
 		[texture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:1 withBytes:mip bytesPerRow:sizeof(mip)];
-		id<MTLBuffer> output = [device newBufferWithLength:6 * sizeof(mip) options:MTLResourceStorageModeShared];
+		id<MTLBuffer> output = [device newBufferWithLength:descriptors.size() * sizeof(mip) options:MTLResourceStorageModeShared];
 		id<MTLCommandQueue> queue = [device newCommandQueue];
 		id<MTLCommandBuffer> command = [queue commandBuffer];
 		id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
@@ -76,14 +82,15 @@ int main() {
 		[command commit];
 		[command waitUntilCompleted];
 		Check(command.status == MTLCommandBufferStatusCompleted, "GPU sampling failed");
-		const float expected[24] {1,0,0,1, 0,1,0,1, 0.5,0.5,0,1, 0,0,1,1, 1,1,1,1, 0,1,0,1};
+		const float expected[36] {1,0,0,1, 0,1,0,1, 0.5,0.5,0,1, 0,0,1,1, 1,1,1,1, 0,1,0,1,
+		                          0,0,0,1, 1,1,0,1, 0.5,0.5,0,1};
 		const auto* values = static_cast<const float*>(output.contents);
-		for (size_t i = 0; i < 24; ++i) {
+		for (size_t i = 0; i < std::size(expected); ++i) {
 			if (std::fabs(values[i] - expected[i]) > 0.001f || !std::isfinite(values[i])) {
 				std::fprintf(stderr, "sample %zu component %zu: %g expected %g\n", i / 4, i % 4, values[i], expected[i]);
 				return 1;
 			}
 		}
-		std::puts("Metal sampler GPU tests passed (wrap, clamp, bilinear, mip, border, pixel coordinates, argument buffers)");
+		std::puts("Metal sampler GPU tests passed (wrap, clamp, bilinear, mip, border, pixel coordinates, min/max reduction, argument buffers)");
 	}
 }

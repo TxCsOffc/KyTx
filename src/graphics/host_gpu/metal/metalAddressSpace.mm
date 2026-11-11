@@ -20,7 +20,7 @@ constexpr uint64_t kLeafEntries = 1ull << 10;
 constexpr uint64_t kLowerSize = 1ull << 40;
 constexpr uint64_t kPackedSize = kLowerSize + LibKernel::Memory::kExtendedMemorySize;
 constexpr uint64_t kRootEntries = kPackedSize / (kPageSize * kLeafEntries);
-constexpr uint64_t kChunkSize = 64ull << 20;
+constexpr uint64_t kChunkSize = MetalBufferManager::kBackingChunkSize;
 
 uint64_t PackedAddress(uint64_t address) {
 	if (address < kLowerSize) return address;
@@ -91,10 +91,9 @@ private:
 				if (chunk != cur_chunk) {
 					auto& buffer = m_chunks[chunk];
 					if (!buffer) {
-						buffer = std::make_unique<MetalBuffer>();
-						const auto start = chunk * kChunkSize;
-						if (!buffer->WrapHostMemory(reinterpret_cast<void*>(alias + start),
-						                           std::min(kChunkSize, size - start), "GuestAddressBacking")) {
+						// The same chunk buffers as the guest range bindings (MetalBufferManager), so both see one Metal buffer per physical byte.
+						buffer = MetalBufferManager::Instance().GetBackingChunk(chunk);
+						if (!buffer) {
 							m_chunks.erase(chunk);
 							return false;
 						}
@@ -137,7 +136,7 @@ private:
 	uint64_t m_generation = 0;
 	id<MTLBuffer> m_root = nil;
 	id<MTLBuffer> m_leaves = nil;
-	std::map<uint64_t, std::unique_ptr<MetalBuffer>> m_chunks;
+	std::map<uint64_t, std::shared_ptr<MetalBuffer>> m_chunks;
 	std::vector<id<MTLResource>> m_resources;
 };
 }

@@ -100,6 +100,11 @@ uint32_t MeshPrimitivePointer(EmitterState& state) {
 	                   ConstantU32(state, state.lane_half));
 }
 
+uint32_t EmitMeshIndex(ValueEmitContext&, const IR::Inst&) {
+	EXIT("native Metal index-buffer ABI reached the SPIR-V backend\n");
+	std::abort();
+}
+
 void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto first = state.builder.AllocateId();

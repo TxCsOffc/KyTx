@@ -127,11 +127,14 @@ struct GuestBackingMapping {
 };
 // Returns a consistent snapshot only when the physical mappings changed since generation.
 bool GetGuestBackingMappings(uint64_t& generation, std::vector<GuestBackingMapping>& mappings);
+// Changes whenever a guest range is mapped to other physical backing (cheap; for caches keyed by guest address).
+[[nodiscard]] uint64_t GetGuestBackingGeneration();
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+int KYTY_SYSV_ABI KernelMlock(const void* addr, size_t len);
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

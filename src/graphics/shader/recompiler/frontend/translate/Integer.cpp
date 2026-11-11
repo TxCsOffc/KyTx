@@ -288,12 +288,56 @@ void Translator::V_MAD_U64_U32(const Decoder::Instruction& inst) {
 	}
 }
 
+// Packed-byte averages round independently; only bit 0 of each src2 byte is used.
+void Translator::V_LERP_U8(const Decoder::Instruction& inst) {
+	const auto lhs      = ReadU32(inst.src0);
+	const auto rhs      = ReadU32(inst.src1);
+	const auto rounding = ReadU32(inst.src2);
+	auto       result   = IR::U32(IR::Value(0u));
+	for (uint32_t bit = 0; bit < 32u; bit += 8u) {
+		const auto extract = [&](IR::U32 word, uint32_t width) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract,
+			                       {word, IR::Value(bit), IR::Value(width)}));
+		};
+		const auto sum =
+		    ir.IAdd(ir.IAdd(extract(lhs, 8u), extract(rhs, 8u)), extract(rounding, 1u));
+		const auto average = ir.ShiftRightLogical(sum, IR::U32(IR::Value(1u)));
+		result = ir.BitwiseOr(result, ir.ShiftLeftLogical(average, IR::U32(IR::Value(bit))));
+	}
+	WriteOperand(DestinationOperand(inst), result);
+}
+
+void Translator::V_SUBWORD_SAD(const Decoder::Instruction& inst, uint32_t bits, uint32_t shift) {
+	const auto lhs = ReadU32(inst.src0);
+	const auto rhs = ReadU32(inst.src1);
+	auto       sum = IR::U32(IR::Value(0u));
+	for (uint32_t bit = 0; bit < 32u; bit += bits) {
+		const auto extract = [&](IR::U32 word) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract,
+			                       {word, IR::Value(bit), IR::Value(bits)}));
+		};
+		const auto a = extract(lhs), b = extract(rhs);
+		const auto lo = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {a, b}));
+		const auto hi = IR::U32(ir.Emit(IR::ValueOpcode::UMax32, {a, b}));
+		sum           = ir.IAdd(sum, ir.ISub(hi, lo));
+	}
+	if (shift != 0u) sum = ir.ShiftLeftLogical(sum, IR::U32(IR::Value(shift)));
+	auto result = ir.IAdd(sum, ReadU32(inst.src2));
+	if (inst.dst.clamp)
+		result = ir.Select(ir.ULessThan(result, sum), IR::U32(IR::Value(UINT32_MAX)), result);
+	WriteOperand(DestinationOperand(inst), result);
+}
+
 void Translator::V_SAD_U32(const Decoder::Instruction& inst) {
-	const auto lhs    = ReadU32(inst.src0);
-	const auto rhs    = ReadU32(inst.src1);
-	const auto lo     = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {lhs, rhs}));
-	const auto hi     = IR::U32(ir.Emit(IR::ValueOpcode::UMax32, {lhs, rhs}));
-	const auto result = ir.IAdd(ir.ISub(hi, lo), ReadU32(inst.src2));
+	const auto lhs        = ReadU32(inst.src0);
+	const auto rhs        = ReadU32(inst.src1);
+	const auto lo         = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {lhs, rhs}));
+	const auto hi         = IR::U32(ir.Emit(IR::ValueOpcode::UMax32, {lhs, rhs}));
+	const auto difference = ir.ISub(hi, lo);
+	auto       result     = ir.IAdd(difference, ReadU32(inst.src2));
+	if (inst.dst.clamp)
+		result =
+		    ir.Select(ir.ULessThan(result, difference), IR::U32(IR::Value(UINT32_MAX)), result);
 	WriteOperand(DestinationOperand(inst), result);
 }
 

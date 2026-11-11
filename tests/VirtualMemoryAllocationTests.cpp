@@ -39,6 +39,11 @@
 #include <unistd.h>
 #endif
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -3416,7 +3421,48 @@ void TestSmallFiberStacksAndMigration() {
 
 } // namespace
 
+void TestGuestMemoryMlock() {
+	constexpr const char* test="GuestMemoryMlock";
+	namespace Memory=Libs::LibKernel::Memory;
+	const uint64_t size=SceKernelPageSize*3;
+	const auto base=Memory::AllocateProgramMemory(0x904000000,size,Common::VirtualMemory::Mode::ReadWrite,"mlock_test");
+	Check(test,base!=0,"allocate guest mlock fixture");
+	CheckOk(test,Memory::KernelMlock(nullptr,0),"zero-size lock");
+	Check(test,Memory::KernelMlock(reinterpret_cast<void*>(UINT64_MAX-7),16)==Libs::LibKernel::KERNEL_ERROR_EINVAL,"overflow rejected");
+	Check(test,Memory::KernelMlock(reinterpret_cast<void*>(base+size),1)==Libs::LibKernel::KERNEL_ERROR_ENOMEM,"unmapped page rejected");
+	Check(test,Memory::KernelMlock(reinterpret_cast<void*>(base+size-1),2)==Libs::LibKernel::KERNEL_ERROR_ENOMEM,"partly mapped span rejected");
+	uint8_t host_byte=0;
+	Check(test,Memory::KernelMlock(&host_byte,1)==Libs::LibKernel::KERNEL_ERROR_ENOMEM,"host-only address rejected");
+#if defined(__APPLE__)
+	const auto wired_count=[&](uint64_t address) {
+		mach_vm_address_t region=address; mach_vm_size_t length=0;
+		vm_region_basic_info_data_64_t info{};
+		mach_msg_type_number_t count=VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t object=MACH_PORT_NULL;
+		const auto status=mach_vm_region(mach_task_self(),&region,&length,VM_REGION_BASIC_INFO_64,
+		    reinterpret_cast<vm_region_info_t>(&info),&count,&object);
+		if(object!=MACH_PORT_NULL) mach_port_deallocate(mach_task_self(),object);
+		Check(test,status==KERN_SUCCESS && region<=address && address-region<length,"query wired guest page");
+		return info.user_wired_count;
+	};
+	Check(test,wired_count(base)==0,"fresh guest page is not wired");
+#endif
+	CheckOk(test,Memory::KernelMlock(reinterpret_cast<void*>(base+3),5),"unaligned subpage lock");
+#if defined(__APPLE__)
+	Check(test,wired_count(base)!=0,"mlock actually wires the host mapping");
+#endif
+	CheckOk(test,Memory::KernelMlock(reinterpret_cast<void*>(base+SceKernelPageSize),SceKernelPageSize+1),"multi-page lock");
+	*reinterpret_cast<volatile uint8_t*>(base)=0x63;
+	Check(test,*reinterpret_cast<volatile uint8_t*>(base)==0x63,"locked guest pages remain writable");
+	Check(test,Memory::FreeGuestMemory(base,size),"unmap implicitly unlocks guest pages");
+	Check(test,Memory::KernelMlock(reinterpret_cast<void*>(base),1)==Libs::LibKernel::KERNEL_ERROR_ENOMEM,"retired mapping rejected");
+}
+
 int main(int argc, char** argv) {
+	if(argc==2 && std::strcmp(argv[1],"--mlock-only")==0) {
+		InitSubsystems(); RunTest(TestGuestMemoryMlock);
+		return g_failed_tests!=0 ? 1 : 0;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--backing-mappings-only") == 0) {
 		InitSubsystems();
 		RunTest(TestFlexibleMemoryUsesSharedBacking);
@@ -3500,6 +3546,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolMultiRangeDecommit);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
+	RunTest(TestGuestMemoryMlock);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 
 	if (g_failed_tests != 0) {

@@ -790,6 +790,8 @@ constexpr uint32_t SPI_SHADER_PGM_LO_GS            = 0x88;
 constexpr uint32_t SPI_SHADER_PGM_HI_GS            = 0x89;
 
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS                        = 0x8A;
+constexpr uint32_t SPI_SHADER_PGM_RSRC1_ES                        = 0xCA;
+constexpr uint32_t SPI_SHADER_PGM_RSRC1_LS                        = 0x14A;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_VGPRS_SHIFT            = 0;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_VGPRS_MASK             = 0x3F;
 constexpr uint32_t SPI_SHADER_PGM_RSRC1_GS_PRIORITY_SHIFT         = 10;

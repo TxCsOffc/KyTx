@@ -24,6 +24,7 @@ class UserConfig;
 
 namespace Libs::Graphics {
 class PipelineCache;
+namespace Pm4 { struct AcquireMemInfo; }
 } // namespace Libs::Graphics
 
 namespace Libs::Graphics::Metal {
@@ -91,6 +92,9 @@ public:
 	void Flush();
 	void CaptureFrameTick(uint64_t frame);
 	void WaitIdle();
+	// GPU execution boundary only: copied-image writeback is a separate
+	// coherence operation. This never submits or waits on the CPU.
+	void MemoryBarrier(const Pm4::AcquireMemInfo* acquire = nullptr);
 	// GDS copies run under the encoding lock (Present flushes from another thread).
 	void GdsDmaGuarded(bool dst_gds, bool src_gds, uint64_t dst, uint64_t src, uint32_t bytes);
 	void GdsFillGuarded(uint64_t dst_offset, uint32_t bytes, uint32_t value);

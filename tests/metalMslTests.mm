@@ -1,6 +1,7 @@
 // Focused native IR -> MSL -> Metal GPU tests. No graphics backend is initialized.
 #include "graphics/shader/recompiler/backend/msl/MslEmitter.h"
 #include "graphics/host_gpu/metal/metalIndirect.h"
+#include "graphics/host_gpu/metal/metalSampler.h"
 #include "common/assert.h"
 
 #import <Metal/Metal.h>
@@ -57,19 +58,29 @@ struct Fixture {
 
 static id<MTLDevice> device;
 
-static id<MTLFunction> Compile(Fixture& fixture, const ShaderPixelInputInfo* pixel_options = nullptr) {
+
+static id<MTLFunction> Compile(Fixture& fixture, const ShaderPixelInputInfo* pixel_options = nullptr, const ShaderVertexInputInfo* vertex_options = nullptr, const ShaderComputeInputInfo* compute_options = nullptr) {
 	ShaderComputeInputInfo compute {};
 	compute.lds_size_dwords = fixture.lds_dwords;
+	if(compute_options)compute=*compute_options;
 	ShaderPixelInputInfo pixel {};
 	pixel.dual_source_blending = true;
 	ShaderStageInputInfo input {};
-	input.compute = &compute;
 	if (fixture.program.stage == ShaderType::Pixel) input.pixel = pixel_options ? pixel_options : &pixel;
+	else if(fixture.program.stage == ShaderType::Vertex || fixture.program.stage == ShaderType::Mesh) input.vertex = vertex_options;
+	else input.compute = &compute;
 	auto result = ShaderRecompiler::Msl::EmitProgram(fixture.program, input);
 	for (const auto& reason: result.unsupported) std::fprintf(stderr, "%s\n", reason.c_str());
 	Check(result.success, "native MSL emission failed");
 	NSError* error = nil;
-	id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:result.source.c_str()] options:nil error:&error];
+	MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+	if (@available(macOS 15.0, *)) {
+		options.mathMode = MTLMathModeSafe;
+		options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+	} else {
+		options.fastMathEnabled = NO;
+	}
+	id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:result.source.c_str()] options:options error:&error];
 	if (!library) std::fprintf(stderr, "%s\n%s\n", error.localizedDescription.UTF8String, result.source.c_str());
 	Check(library != nil, "emitted MSL failed to compile");
 	return [library newFunctionWithName:@"main0"];
@@ -90,6 +101,7 @@ static std::array<uint8_t, 32> Run(Fixture& fixture, uint32_t size0 = 32) {
 	id<MTLBuffer> argbuf = [device newBufferWithLength:arguments.encodedLength options:MTLResourceStorageModeShared];
 	[arguments setArgumentBuffer:argbuf offset:0];
 	[arguments setBuffer:a offset:0 atIndex:0];
+	for (uint32_t image=0; image<fixture.program.info.images.size(); ++image) [arguments setTexture:nil atIndex:64+image];
 	if (fixture.program.info.buffers.size() > 1) [arguments setBuffer:b offset:0 atIndex:1];
 	std::vector<id<MTLBuffer>> address_resources;
 	for (const auto& binding: fixture.program.bindings.descriptors) {
@@ -171,7 +183,7 @@ static void ImageSampling() {
 	    {"array gather alpha", Dimension::Dim2DArray, 0.51f, false, 3, 1},
 	};
 	unsigned failures = 0;
-	for (const auto& test: cases) {
+	for (const auto& test: cases) for (bool null_descriptor : {false,true}) {
 		try {
 			const bool arrayed = test.dimension == Dimension::Dim2DArray;
 			const bool volume = test.dimension == Dimension::Dim3D;
@@ -259,7 +271,7 @@ static void ImageSampling() {
 			id<MTLBuffer> argbuf = [device newBufferWithLength:arguments.encodedLength options:MTLResourceStorageModeShared];
 			[arguments setArgumentBuffer:argbuf offset:0];
 			[arguments setBuffer:output offset:0 atIndex:0];
-			[arguments setTexture:texture atIndex:64];
+			[arguments setTexture:null_descriptor ? nil : texture atIndex:64];
 			[arguments setSamplerState:sampler atIndex:128];
 			uint32_t push[32] {}, sizes[64] {16};
 			id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
@@ -272,7 +284,7 @@ static void ImageSampling() {
 			Check(command.status == MTLCommandBufferStatusCompleted, "image sampling dispatch failed");
 			const auto* actual = static_cast<const float*>(output.contents);
 			for (uint32_t i = 0; i < 4; ++i) {
-				const float expected = 1 + test.expected_layer * 100 + (gather ? test.gather_component : 20 + i);
+				const float expected = null_descriptor ? 0.f : 1 + test.expected_layer * 100 + (gather ? test.gather_component : 20 + i);
 				if (actual[i] != expected) {
 					std::fprintf(stderr, "%s: component %u expected %g, got %g\n", test.name, i, expected, actual[i]);
 					throw std::runtime_error("image sampling result mismatch");
@@ -283,9 +295,16 @@ static void ImageSampling() {
 			std::fprintf(stderr, "%s: %s\n", test.name, error.what());
 		}
 	}
-	std::printf("Image sampling: %zu GPU cases / %u failures\n", std::size(cases), failures);
+	std::printf("Image sampling: %zu GPU cases / %u failures\n", std::size(cases)*2, failures);
 	Check(failures == 0, "image sampling regressions");
 }
+
+#if KYTX_COMPARE_SPIRV_PATH
+#include "metalShaderPathReference.inc"
+#endif
+#include "metalMslDepthCompareTests.inc"
+#include "metalMslOrdinarySampleTests.inc"
+#include "metalMslComparisonPixelTests.inc"
 
 static void FormattedStores() {
 	Fixture f;
@@ -796,6 +815,82 @@ static void LocalAppendConsume() {
     std::puts("LDS append/consume: 6 GPU cases passed (full/partial/empty masks and wraparound)");
 }
 
+static void BitScans32() {
+	const uint32_t inputs[] = {0u, 1u, 2u, 0x10u, 0x80000000u, 0xffffffffu, 0x7fffffffu, 0x01000100u};
+	for (uint32_t input: inputs) {
+		Fixture f;
+		const auto handle = f.Buffer(0);
+		const auto memory = f.Memory(0);
+		const ValueOpcode ops[] = {ValueOpcode::FindILsb32, ValueOpcode::FindUMsb32};
+		for (uint32_t i = 0; i < 2; ++i)
+			f.Store(0, handle, i * 4, f.Emit(0, ops[i], {Value(input)}), memory);
+		const uint32_t expected[] = {input == 0 ? UINT32_MAX : static_cast<uint32_t>(std::countr_zero(input)),
+		                             input == 0 ? UINT32_MAX : 31u - static_cast<uint32_t>(std::countl_zero(input))};
+		const auto output = Run(f);
+		Check(std::memcmp(output.data(), expected, sizeof(expected)) == 0, "32-bit bit-scan position/zero sentinel incorrect");
+	}
+	std::puts("Bit scans: 16 GPU values passed (zero sentinel, low/high bits, mixed/all bits)");
+}
+
+static void CycleTrig() {
+	const uint32_t cases[] = {0u, 0x80000000u, 0x3e000000u, 0x3e800000u, 0x3f000000u, 0x3f400000u,
+	                          0x3fa00000u, 0xbe800000u, 0xbe000000u, 0x4b000000u, 0xcb000000u,
+	                          0x7f800000u, 0x7fc00000u};
+	for (uint32_t bits: cases) {
+		Fixture f;
+		const auto handle = f.Buffer(0);
+		const auto memory = f.Memory(0);
+		const auto x = f.Emit(0, ValueOpcode::BitCastF32U32, {Value(bits)});
+		for (uint32_t i = 0; i < 2; ++i) {
+			const auto y = f.Emit(0, i == 0 ? ValueOpcode::FPSin : ValueOpcode::FPCos, {x});
+			f.Store(0, handle, i * 4, f.Emit(0, ValueOpcode::BitCastU32F32, {y}), memory);
+		}
+		const auto output = Run(f);
+		const float input = std::bit_cast<float>(bits);
+		const float cycle = std::isfinite(input) && std::fabs(input) >= 8388608.0f ? 0.0f : input - std::floor(input);
+		const double angle = double(cycle) * double(std::bit_cast<float>(0x40c90fdbu));
+		for (uint32_t i = 0; i < 2; ++i) {
+			float actual;
+			std::memcpy(&actual, output.data() + i * 4, 4);
+			const double expected = i == 0 ? std::sin(angle) : std::cos(angle);
+			Check(std::isnan(expected) ? std::isnan(actual) : std::fabs(double(actual) - expected) < 1e-6,
+			      "RDNA sine/cosine cycle argument incorrect");
+			if (i == 0 && (bits & 0x7fffffffu) == 0)
+				Check(std::signbit(actual) == std::signbit(input), "sine did not preserve signed zero");
+		}
+	}
+	std::puts("Cycle trig: 26 GPU values passed (fractional/negative turns, period reduction, large integers, signed zero, inf/NaN)");
+}
+
+static void FloatComparisons() {
+	const uint32_t cases[][2] = {
+	    {0x7fc00000u, 0u}, {0u, 0x7fc00000u}, {0x7f800001u, 0x3f800000u}, {0x3f800000u, 0x7f800001u},
+	    {0x7f800000u, 0x7f800000u}, {0x3f800000u, 0x40000000u}, {0x80000000u, 0u}, {0xbf800000u, 0xbf800000u},
+	};
+	const ValueOpcode ops[] = {ValueOpcode::FPOrdEqual32, ValueOpcode::FPOrdNotEqual32,
+	                          ValueOpcode::FPOrdLessThan32, ValueOpcode::FPOrdLessThanEqual32,
+	                          ValueOpcode::FPOrdGreaterThan32, ValueOpcode::FPOrdGreaterThanEqual32,
+	                          ValueOpcode::FPUnordEqual32, ValueOpcode::FPUnordNotEqual32};
+	for (const auto& bits: cases) {
+		Fixture f;
+		const auto handle = f.Buffer(0);
+		const auto memory = f.Memory(0);
+		const auto a = f.Emit(0, ValueOpcode::BitCastF32U32, {Value(bits[0])});
+		const auto b = f.Emit(0, ValueOpcode::BitCastF32U32, {Value(bits[1])});
+		for (uint32_t i = 0; i < std::size(ops); ++i) {
+			const auto result = f.Emit(0, ops[i], {a, b});
+			f.Store(0, handle, i * 4, f.Emit(0, ValueOpcode::SelectU32, {result, Value(1u), Value(0u)}), memory);
+		}
+		const float x = std::bit_cast<float>(bits[0]), y = std::bit_cast<float>(bits[1]);
+		const bool unordered = std::isnan(x) || std::isnan(y);
+		const uint32_t expected[] = {x == y, !unordered && x != y, x < y, x <= y, x > y, x >= y,
+		                             unordered || x == y, unordered || x != y};
+		const auto output = Run(f);
+		Check(std::memcmp(output.data(), expected, sizeof(expected)) == 0, "ordered/unordered float comparison incorrect");
+	}
+	std::puts("Float comparisons: 64 GPU cases passed (qNaN/sNaN on either side, infinity, signed zero, unequal/equal finite values)");
+}
+
 static void FloatClasses() {
     // sNaN, qNaN, -inf, -normal, -subnormal, -zero, +zero, +subnormal, +normal, +inf.
     const uint32_t bits[] = {0x7f800001u, 0xffc12345u, 0xff800000u, 0xbf800000u, 0x80000001u,
@@ -855,14 +950,30 @@ static void Shifts64() {
 	}
 }
 
+#include "metalMslBufferSwizzleTests.inc"
+#include "metalStrictShaderTests.inc"
+#include "metalMeshTests.inc"
+#include "metalMeshRectTests.inc"
+#include "metalPixelLaneMemoryTests.inc"
+#include "metalWaveControlTests.inc"
+
 int main() {
 	@autoreleasepool {
 		try {
 			device = MTLCreateSystemDefaultDevice(); Check(device != nil, "Metal device unavailable");
-			ImageSampling(); PixelInterpolation(); LocalAppendConsume(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
-			IndirectRectList(); LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();
+			if (std::getenv("KYTX_MSL_WAVE_ONLY")) { WaveControlOperations(); return 0; }
+			if (std::getenv("KYTX_MSL_PIXEL_LDS_ONLY")) { PixelLaneStorage(); return 0; }
+			if (std::getenv("KYTX_MSL_MESH_ONLY")) { NativeMeshExports(); NativeMeshPrimitiveOutputs(); NativeMeshRectangles(); return 0; }
+			if (std::getenv("KYTX_MSL_ORDINARY_ONLY") != nullptr) { OrdinarySampleOffsets(); return 0; }
+			if (std::getenv("KYTX_MSL_COMPARE_ONLY") != nullptr) { DepthCompareSampling(); ComparisonPixelSampling(); OrdinarySampleOffsets(); return 0; }
+			if (std::getenv("KYTX_MSL_NULL_ONLY")) { NullDescriptorOperations(); ImageSampling(); return 0; }
+			if (std::getenv("KYTX_MSL_STRICT_ONLY")) { LongShaderLoops(); setenv("KYTY_MSL_DISPATCHER","1",1); LongShaderLoops(); RejectedShaderApproximations(); VertexAuxiliaryOutputs(); return 0; }
+			NativeMeshExports(); NativeMeshPrimitiveOutputs(); NativeMeshRectangles(); PixelLaneStorage(); WaveControlOperations();
+			BufferStrideSwizzle();
+			NullDescriptorOperations(); ImageSampling(); DepthCompareSampling(); ComparisonPixelSampling(); OrdinarySampleOffsets(); PixelInterpolation(); LocalAppendConsume(); BitScans32(); CycleTrig(); FloatComparisons(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
+			RejectedShaderApproximations(); VertexAuxiliaryOutputs(); LongShaderLoops(); IndirectRectList(); LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();
 			setenv("KYTY_MSL_DISPATCHER", "1", 1);
-			LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();
+			LongShaderLoops(); LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();
 			unsetenv("KYTY_MSL_DISPATCHER");
 			std::puts("Native MSL GPU tests passed (formatted stores, bounds, subword and guest address loads, dual-source blending, phi swaps, diamond, nested loops, dispatcher fallback)");
 		} catch (const std::exception& error) { std::fprintf(stderr, "%s\n", error.what()); return 1; }

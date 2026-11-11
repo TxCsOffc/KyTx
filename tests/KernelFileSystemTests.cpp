@@ -10,10 +10,13 @@
 #include "common/threads.h"
 #include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
+#include "loader/guest_cpu/guest_cpu.h"
 
 #include <algorithm>
 #include <array>
@@ -29,6 +32,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace Libs::LibKernelApr {
@@ -37,6 +41,10 @@ void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 
 namespace Libs {
 void InitLibKernel_1(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibcInternal {
+void InitLibcInternal_1(Loader::SymbolDatabase* symbols);
 }
 
 namespace Libs::LibAmpr {
@@ -1037,9 +1045,11 @@ void CheckSocketWakeup() {
         "closed descriptor fails without clearing input fd_set");
 }
 
+#include "UpstreamPortContracts.inc"
+
 } // namespace
 
-int main(int, char**) {
+int main(int argc, char** argv) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -1058,7 +1068,17 @@ int main(int, char**) {
   graphics->CreateVulkan();
 
   TempDirectory temporary;
+  CheckOpenFileCoherence(temporary.Path());
+  TestLibcStringExports();
+  TestPm4FrontResourceState(*graphics->render_context);
   FileSystem::Initialize();
+  if(argc==2 && std::strcmp(argv[1],"--port-contracts-only")==0) {
+    FileSystem::Mount(temporary.Path(),"/savedata0");
+    TestFsyncAndRmdir(temporary.Path());
+    FileSystem::Shutdown(); graphics.reset(); subsystems.Destroy();
+    std::puts("Upstream port contracts: file coherence, libc ABI, PM4 front resources, fsync/rmdir passed");
+    return 0;
+  }
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());
   CheckArchiveMount(temporary.Path());
@@ -1067,6 +1087,7 @@ int main(int, char**) {
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
+  TestFsyncAndRmdir(temporary.Path());
   TestSaveOpenVisibility();
   TestTruncate(temporary.Path());
   TestAioBatches();

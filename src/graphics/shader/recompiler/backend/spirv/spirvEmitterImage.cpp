@@ -87,6 +87,9 @@ uint32_t ZeroF32(EmitterState& state) {
 uint32_t GatherMip(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                    const IR::Inst& address, const ImageSampleLayout& layout, uint32_t mip_count) {
 	auto& state = ctx.state;
+	// Non-LOD gathers use the base view. NoImageComponent is a sentinel,
+	// not an address component to decode (which would walk UINT32_MAX entries).
+	if (layout.lod == NoImageComponent) return ConstantU32(state, 0);
 	const auto Extract = [&](uint32_t word, uint32_t first, uint32_t count) {
 		return EmitBitFieldUExtract(state, word, ConstantU32(state, first),
 		                           ConstantU32(state, count));
@@ -324,9 +327,23 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 }
 
 uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                      const ImageSampleLayout& layout, ImageDimension dimension) {
+                      const ImageSampleLayout& layout, ImageDimension dimension, uint32_t& mask) {
 	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
 	const auto zero       = ConstantI32(ctx.state, 0);
+	const auto value = address.Arg(layout.offset).Resolve();
+	if (value.IsImmediate()) {
+		uint32_t values[3] {};
+		for (uint32_t index = 0; index < components; ++index) {
+			const auto bits = (value.U32() >> (index * 8u)) & 0x3fu;
+			values[index] = ConstantI32(ctx.state, static_cast<int32_t>(bits ^ 0x20u) - 0x20);
+		}
+		mask |= spv::ImageOperandsConstOffsetMask;
+		if (components == 1u) return values[0];
+		return ctx.state.builder.Constant(spv::OpConstantComposite, TypeI32Vector(ctx.state, components),
+		                                  std::span(values).first(components));
+	}
+	ctx.state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
+	mask |= spv::ImageOperandsOffsetMask;
 	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
 		if (components == 1u) return zero;
 		const auto result = ctx.state.builder.AllocateId();
@@ -710,8 +727,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				operand_mask = spv::ImageOperandsConstOffsetsMask;
 				offset = HorizontalOffsets(state, dimension);
 			} else if (layout.offset != NoImageComponent) {
-				operand_mask = spv::ImageOperandsOffsetMask;
-				offset = PackedOffset(ctx, mem, *address, layout, dimension);
+				offset = PackedOffset(ctx, mem, *address, layout, dimension, operand_mask);
 			}
 			const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
 			const auto EmitGather = [&](uint32_t mip) {
@@ -775,9 +791,21 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operand_mask |= spv::ImageOperandsBiasMask;
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
+		if (layout.offset != NoImageComponent && !address->Arg(layout.offset).Resolve().IsImmediate() &&
+		    !state.allow_dynamic_sample_offset) {
+			// Like current upstream: dynamic sample offsets need maintenance8.
+			// Metal SPIRV-Cross has an explicit target contract; Vulkan needs the feature.
+			ctx.Fail(inst, "requires maintenance8 for a dynamic sample texel offset");
+			return;
+		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
 		const auto EmitSample = [&](uint32_t resource) {
 			const auto& candidate = state.program.info.images[resource];
+			auto sample_mask = operand_mask;
+			auto sample_args = operands;
+			if (layout.offset != NoImageComponent) {
+				sample_args.push_back(PackedOffset(ctx, mem, *address, layout, candidate.dimension, sample_mask));
+			}
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
@@ -788,9 +816,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			if (dref) {
 				sample_operands.push_back(dref_value);
 			}
-			if (operand_mask != 0u) {
-				sample_operands.push_back(operand_mask);
-				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
+			if (sample_mask != 0u) {
+				sample_operands.push_back(sample_mask);
+				sample_operands.insert(sample_operands.end(), sample_args.begin(), sample_args.end());
 			}
 			state.builder.AddFunction(opcode, sample_operands);
 			return sample;

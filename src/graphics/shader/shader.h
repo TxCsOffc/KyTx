@@ -90,6 +90,13 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
 	bool     fast_launch          = false;
+	// Independent native Metal execution; unmerged NGG receives packed connectivity.
+	bool     native_execution     = false;
+	bool     ngg_vertex           = false;
+	uint32_t flat_parameter_mask  = 0;
+	std::array<uint8_t,32> parameter_source = [] {
+		std::array<uint8_t,32> result{}; for (uint8_t i=0;i<32;++i) result[i]=i; return result;
+	}();
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -162,6 +169,7 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       wave_size                    = 64;
 	uint32_t                                       ps_system_input_base         = 0;
+	uint32_t                                       extra_lds_size_dwords        = 0;
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;

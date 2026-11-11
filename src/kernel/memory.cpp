@@ -9,6 +9,12 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#if defined(__APPLE__)
+#include "graphics/host_gpu/metal/metalGuestWrites.h"
+namespace Libs::Graphics::Metal {
+[[nodiscard]] bool UseNativeMetalBackend() noexcept;
+} // namespace Libs::Graphics::Metal
+#endif
 
 #include <algorithm>
 #include <array>
@@ -170,6 +176,17 @@ static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 #endif
 
 #include "memoryAddressSpace.inc"
+
+// The native Metal backend keeps copies of guest bytes (canonical images) valid by write generations
+// (metalGuestWrites.h); these hooks report the writes and protection changes that it cannot see itself.
+static bool NativeGuestWrites() {
+#if defined(__APPLE__)
+	return Libs::Graphics::Metal::UseNativeMetalBackend();
+#else
+	return false;
+#endif
+}
+
 
 enum class VirtualRangeType {
 	Reserved,
@@ -875,8 +892,13 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	const bool ok = g_guest_address_space != nullptr &&
+	                g_guest_address_space->TryWriteBacking(vaddr, data, size);
+#if defined(__APPLE__)
+	// A backing-store write does not fault on a write-protected alias.
+	if (ok && NativeGuestWrites()) ::Libs::Graphics::Metal::GuestWrites::NoteWrite(vaddr, size);
+#endif
+	return ok;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -924,6 +946,9 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
+#if defined(__APPLE__)
+	if (NativeGuestWrites()) ::Libs::Graphics::Metal::GuestWrites::InvalidateHostWrite(vaddr, size);
+#endif
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
@@ -933,6 +958,12 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+#if defined(__APPLE__)
+	if (access == Graphics::PageFaultAccess::Write && NativeGuestWrites() &&
+	    ::Libs::Graphics::Metal::GuestWrites::HandleCpuWriteFault(fault_vaddr)) {
+		return true;
+	}
+#endif
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
@@ -984,6 +1015,10 @@ bool GetGuestBackingAlias(uint64_t* base, uint64_t* size) {
 bool TryGetGuestBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_offset) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryGetContiguousBackingOffset(vaddr, size, backing_offset);
+}
+
+uint64_t GetGuestBackingGeneration() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingGeneration() : 0;
 }
 
 bool GetGuestBackingMappings(uint64_t& generation, std::vector<GuestBackingMapping>& mappings) {
@@ -3795,6 +3830,10 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 		*old_mode = static_cast<VirtualMemory::Mode>(
 		    ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	}
+#if defined(__APPLE__)
+	// The guest protection replaces the write protection of watched pages.
+	if (NativeGuestWrites()) ::Libs::Graphics::Metal::GuestWrites::InvalidateHostWrite(aligned_addr, aligned_size);
+#endif
 	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, mode)) {
 		return false;
 	}
@@ -3818,6 +3857,40 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	(void)RequireGuestRuntimeMemory(vaddr, mapped_size);
 	UnmapGpuRange(vaddr, mapped_size);
 	return FreeGuestMemoryOwner(vaddr, mapped_size);
+}
+
+int KYTY_SYSV_ABI KernelMlock(const void* addr, size_t len) {
+	PRINT_NAME();
+	if (len == 0) return OK;
+	constexpr uint64_t page_size = 0x4000;
+	const auto address = reinterpret_cast<uint64_t>(addr);
+	if (len > UINT64_MAX-address || address+len > UINT64_MAX-(page_size-1)) return KERNEL_ERROR_EINVAL;
+	const auto begin = address & ~(page_size-1);
+	const auto end = (address+len+page_size-1) & ~(page_size-1);
+	std::lock_guard<std::recursive_mutex> lock(g_memory_operation_mutex);
+	std::vector<VirtualRanges::Range> ranges;
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->QuerySpan(begin,end-begin,&ranges) ||
+	    std::any_of(ranges.begin(),ranges.end(),[](const auto& range) { return !IsCommittedRangeType(range.type); })) {
+		return KERNEL_ERROR_ENOMEM;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (::VirtualLock(reinterpret_cast<void*>(begin),end-begin)) return OK;
+	switch (::GetLastError()) {
+	case ERROR_NOT_ENOUGH_QUOTA: return KERNEL_ERROR_EAGAIN;
+	case ERROR_ACCESS_DENIED: return KERNEL_ERROR_EPERM;
+	case ERROR_INVALID_PARAMETER: return KERNEL_ERROR_EINVAL;
+	default: return KERNEL_ERROR_ENOMEM;
+	}
+#else
+	if (::mlock(reinterpret_cast<const void*>(begin),end-begin) == 0) return OK;
+	switch (errno) {
+	case EAGAIN: return KERNEL_ERROR_EAGAIN;
+	case EPERM: return KERNEL_ERROR_EPERM;
+	case ENOMEM: return KERNEL_ERROR_ENOMEM;
+	case EINVAL: return KERNEL_ERROR_EINVAL;
+	default: return KERNEL_ERROR_EIO;
+	}
+#endif
 }
 
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
@@ -3860,6 +3933,9 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
+#if defined(__APPLE__)
+	if (NativeGuestWrites()) ::Libs::Graphics::Metal::GuestWrites::InvalidateHostWrite(aligned_addr, aligned_len);
+#endif
 	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
 
 	if (!ok) {
