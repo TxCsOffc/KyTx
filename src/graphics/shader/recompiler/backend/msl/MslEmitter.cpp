@@ -3003,10 +3003,10 @@ void Emitter::EmitAlu(const Inst& inst) {
 			                        Expr(inst.Arg(2)) + ")");
 			return;
 		case IR::ValueOpcode::FPMin32:
-			EmitAssignment(inst, "fmin(" + Expr(inst.Arg(0)) + ", " + Expr(inst.Arg(1)) + ")");
+			EmitAssignment(inst, "kyty_fmin(" + Expr(inst.Arg(0)) + ", " + Expr(inst.Arg(1)) + ")");
 			return;
 		case IR::ValueOpcode::FPMax32:
-			EmitAssignment(inst, "fmax(" + Expr(inst.Arg(0)) + ", " + Expr(inst.Arg(1)) + ")");
+			EmitAssignment(inst, "kyty_fmax(" + Expr(inst.Arg(0)) + ", " + Expr(inst.Arg(1)) + ")");
 			return;
 		case IR::ValueOpcode::FPMinTri32:
 			EmitAssignment(inst, "fmin(" + Expr(inst.Arg(0)) + ", fmin(" + Expr(inst.Arg(1)) +
@@ -3418,6 +3418,20 @@ inline float kyty_med3f(float a, float b, float c) {
 	float minimum = fmin(fmin(a, b), c);
 	float median  = fmax(fmin(a, b), fmin(fmax(a, b), c));
 	return (isnan(a) || isnan(b) || isnan(c)) ? minimum : median;
+}
+// RDNA min/max: a NaN operand (quiet or signalling) yields the other operand; min(-0,+0) = -0, max(-0,+0) = +0 regardless of order.
+// MSL fmin/fmax do not guarantee either rule, so emulate the RDNA semantics explicitly.
+inline float kyty_fmin(float a, float b) {
+	if (isnan(a)) return b;
+	if (isnan(b)) return a;
+	if (a == b) return as_type<float>(as_type<uint>(a) | as_type<uint>(b));
+	return a < b ? a : b;
+}
+inline float kyty_fmax(float a, float b) {
+	if (isnan(a)) return b;
+	if (isnan(b)) return a;
+	if (a == b) return as_type<float>(as_type<uint>(a) & as_type<uint>(b));
+	return a > b ? a : b;
 }
 )";
 	bool uses_trig = false;
