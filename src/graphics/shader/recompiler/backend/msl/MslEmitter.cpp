@@ -3175,6 +3175,10 @@ void Emitter::EmitAlu(const Inst& inst) {
 			// The IR requests a bit index, not the RDNA instruction's leading-zero count. The frontend performs that conversion.
 			EmitAssignment(inst, "(" + Expr(inst.Arg(0)) + " == 0u ? 0xffffffffu : 31u - clz(" + Expr(inst.Arg(0)) + "))");
 			return;
+		case IR::ValueOpcode::FindUMsb64:
+			// The IR requests a bit index, not the RDNA instruction's leading-zero count. The frontend performs that conversion.
+			EmitAssignment(inst, "(" + Expr(inst.Arg(0)) + " == 0ull ? 0xffffffffu : 63u - clz(" + Expr(inst.Arg(0)) + "))");
+			return;
 		case IR::ValueOpcode::GetInterpolationParameter: {
 			// Interpolation modes are not distinguished yet; read the varying directly.
 			const auto attr = ImmU32(inst.Arg(0));
