@@ -640,6 +640,28 @@ bool LabelPageCpuPolled(uint64_t address);  // bufferCache.cpp
 static std::atomic<uint32_t> g_wait_by_order_logged {0};
 static std::atomic<uint64_t> g_wait_by_order_count {0};
 
+// KYTY_METAL_WBO (native Metal, default on; 0 disables): the end-of-pipe labels Metal publishes on completion (CPU labels) take part in
+// KYTY_WAIT_BY_ORDER like Vulkan GPU labels. A graphics-queue WAIT_REG_MEM on a label recorded earlier in the same
+// stream with the awaited value is then satisfied by Metal's in-order execution instead of a submit + GPU round
+// trip. What the real CP would have done only after that wait on the CPU side (WRITE_DATA, DMA_DATA and COPY_DATA
+// memory writes, which this emulator performs while parsing) first waits for the label's tick: g_wbo_guard_tick.
+static bool MetalWaitByOrderEnabled() {
+#if defined(__APPLE__)
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_METAL_WBO");
+		return Metal::UseNativeMetalBackend() && !(value != nullptr && value[0] == '0');
+	}();
+	return enabled;
+#else
+	return false;
+#endif
+}
+static uint64_t g_wbo_guard_tick = 0;  // GPU thread only: newest tick of a label whose wait was satisfied by order
+static std::atomic<uint64_t> g_wbo_guard_waits {0};
+// Why an unsatisfied wait was not elided (KYTY_METAL_WBO report): no pending label, CPU-polled page, label already
+// published, value does not satisfy the compare, other (size/queue).
+static std::atomic<uint64_t> g_wbo_miss[5] {};
+
 // KYTY_LABEL_COALESCE (default on; 0 disables; lazy label mode only): a GPU label that would be
 // submitted at once stays in the open buffer. The label watchdog submits it within LabelWindowNs(),
 // and a WAIT_REG_MEM on it or a guest read of its page submits it before the value is needed.
@@ -849,11 +871,24 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			// Only graphics-queue waits on a label the guest CPU never polls: the buffers a wait
 			// guards are snapshotted at record time, so a CPU write made while the real CP would
 			// have been stalled must still be visible to them.
-			const bool eligible = found != g_pending_gpu_labels.end() && found->second.owner == this &&
-			                      !IsAsyncComputeQueue() && found->second.size == sizeof(T) &&
+			// Native Metal (KYTY_METAL_WBO): one GPU thread encodes every guest queue into one in-order Metal stream, so a
+			// label already recorded by any queue precedes everything encoded after it.
+			const bool any_queue = MetalWaitByOrderEnabled();
+			const bool eligible = found != g_pending_gpu_labels.end() && (any_queue || (found->second.owner == this &&
+			                      !IsAsyncComputeQueue())) && found->second.size == sizeof(T) &&
 			                      !LabelPageCpuPolled(reinterpret_cast<uint64_t>(addr)) &&
-			                      !GetScheduler().IsFree(found->second.tick) &&
+			                      // Metal: a completed tick whose label the priority runner has not published yet is just as
+			                      // ordered (its work is done); waiting for the runner only adds a submit and a retry loop.
+			                      (any_queue || !GetScheduler().IsFree(found->second.tick)) &&
 			                      TestWaitRegMemValue(found->second.value, ref, mask, func);
+			if (!eligible && MetalWaitByOrderEnabled()) {
+				const size_t why = found == g_pending_gpu_labels.end()                       ? 0
+				                   : LabelPageCpuPolled(reinterpret_cast<uint64_t>(addr))   ? 1
+				                   : GetScheduler().IsFree(found->second.tick)              ? 2
+				                   : !TestWaitRegMemValue(found->second.value, ref, mask, func) ? 3
+				                                                                                : 4;
+				g_wbo_miss[why].fetch_add(1, std::memory_order_relaxed);
+			}
 			if (eligible) {
 				if (g_wait_by_order_logged.fetch_add(1, std::memory_order_relaxed) < 50) {
 					std::fprintf(stderr,
@@ -872,6 +907,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 				static const bool s_no_wbo_shortcut = std::getenv("KYTY_NO_WBO_SHORTCUT") != nullptr;
 				if (Metal::UseNativeMetalBackend() && !s_no_wbo_shortcut) {
 					g_wait_by_order_count.fetch_add(1, std::memory_order_relaxed);
+					g_wbo_guard_tick = std::max(g_wbo_guard_tick, found->second.tick);
 					return;
 				}
 #endif
@@ -929,6 +965,15 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
+	if (g_wbo_guard_tick != 0) {
+		// A wait before this packet was satisfied by stream order: its label's work must be done before the CPU touches memory.
+		if (!GetScheduler().IsFree(g_wbo_guard_tick)) {
+			g_wbo_guard_waits.fetch_add(1, std::memory_order_relaxed);
+			BufferFlush("cp_wait_regmem");
+			GetScheduler().Wait(g_wbo_guard_tick);
+		}
+		g_wbo_guard_tick = 0;
+	}
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
 
@@ -955,6 +1000,15 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
+	if (g_wbo_guard_tick != 0) {
+		// A wait before this packet was satisfied by stream order: its label's work must be done before the CPU touches memory.
+		if (!GetScheduler().IsFree(g_wbo_guard_tick)) {
+			g_wbo_guard_waits.fetch_add(1, std::memory_order_relaxed);
+			BufferFlush("cp_wait_regmem");
+			GetScheduler().Wait(g_wbo_guard_tick);
+		}
+		g_wbo_guard_tick = 0;
+	}
 	if (dst_address == 0 || (num_bytes != sizeof(uint32_t) && num_bytes != sizeof(uint64_t)) ||
 	    (dst_address & (num_bytes - 1u)) != 0) {
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
@@ -979,6 +1033,15 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	EXIT_NOT_IMPLEMENTED(engine > 1);
 	if (num_bytes == 0) {
 		return;
+	}
+	if (g_wbo_guard_tick != 0) {
+		// A wait before this packet was satisfied by stream order: its label's work must be done before the CPU touches memory.
+		if (!GetScheduler().IsFree(g_wbo_guard_tick)) {
+			g_wbo_guard_waits.fetch_add(1, std::memory_order_relaxed);
+			BufferFlush("cp_wait_regmem");
+			GetScheduler().Wait(g_wbo_guard_tick);
+		}
+		g_wbo_guard_tick = 0;
 	}
 	{
 		// Watch guest DMA traffic to the video-out flip buffers.
@@ -2140,14 +2203,19 @@ static int PublishEopLabel(Libs::Graphics::BufferCache& cache,
 			const auto gpu_count         = g_eop_labels_gpu.exchange(0);
 			std::fprintf(stderr,
 			             "[eop] labels deferred=%llu immediate=%llu gpu_labels=%llu cpu_labels=%llu label_flushes=%llu"
-			             " cbs=%llu flips=%llu cbs_per_flip=%.1f\n",
+			             " cbs=%llu flips=%llu cbs_per_flip=%.1f wbo=%llu wbo_guard=%llu miss=%llu/%llu/%llu/%llu/%llu\n",
 			             static_cast<unsigned long long>(deferred_count),
 			             static_cast<unsigned long long>(immediate_count),
 			             static_cast<unsigned long long>(gpu_count),
 			             static_cast<unsigned long long>(deferred_count + immediate_count),
 			             static_cast<unsigned long long>(g_eop_label_flushes.exchange(0)),
 			             static_cast<unsigned long long>(d_submits), static_cast<unsigned long long>(d_flips),
-			             d_flips != 0 ? static_cast<double>(d_submits) / static_cast<double>(d_flips) : 0.0);
+			             d_flips != 0 ? static_cast<double>(d_submits) / static_cast<double>(d_flips) : 0.0,
+			             static_cast<unsigned long long>(g_wait_by_order_count.exchange(0)),
+			             static_cast<unsigned long long>(g_wbo_guard_waits.exchange(0)),
+			             static_cast<unsigned long long>(g_wbo_miss[0].exchange(0)), static_cast<unsigned long long>(g_wbo_miss[1].exchange(0)),
+			             static_cast<unsigned long long>(g_wbo_miss[2].exchange(0)), static_cast<unsigned long long>(g_wbo_miss[3].exchange(0)),
+			             static_cast<unsigned long long>(g_wbo_miss[4].exchange(0)));
 			std::fprintf(stderr,
 			             "[flush] cp_buffer_flush=%llu cp_flush_eop=%llu cp_flip_wait=%llu cp_suspend_point=%llu"
 			             " cp_wait_regmem=%llu budget=%llu idle=%llu other=%llu\n",
@@ -2165,6 +2233,14 @@ static int PublishEopLabel(Libs::Graphics::BufferCache& cache,
 	if (cpu_label) {
 		if (cache.DeferCpuLabel(address, value, size)) {
 			g_eop_labels_deferred.fetch_add(1, std::memory_order_relaxed);
+			if (MetalWaitByOrderEnabled() && (size == 4 || size == 8)) {
+				if (g_pending_gpu_labels.size() >= 4096) {
+					for (auto it = g_pending_gpu_labels.begin(); it != g_pending_gpu_labels.end();) {
+						it = scheduler.IsFree(it->second.tick) ? g_pending_gpu_labels.erase(it) : std::next(it);
+					}
+				}
+				g_pending_gpu_labels[address] = {owner, value, scheduler.CurrentTick(), size};
+			}
 			return 0;
 		}
 	} else if (g_eop_labels_in_flight.load(std::memory_order_acquire) == 0) {
@@ -2189,6 +2265,15 @@ static int PublishEopLabel(Libs::Graphics::BufferCache& cache,
 	}
 	g_eop_labels_deferred.fetch_add(1, std::memory_order_relaxed);
 	g_eop_labels_in_flight.fetch_add(1, std::memory_order_acq_rel);
+	if (MetalWaitByOrderEnabled() && (size == 4 || size == 8)) {
+		// Published by the priority runner once this tick completes: until then stream order is what makes it true.
+		if (g_pending_gpu_labels.size() >= 4096) {
+			for (auto it = g_pending_gpu_labels.begin(); it != g_pending_gpu_labels.end();) {
+				it = scheduler.IsFree(it->second.tick) ? g_pending_gpu_labels.erase(it) : std::next(it);
+			}
+		}
+		g_pending_gpu_labels[address] = {owner, value, scheduler.CurrentTick(), size};
+	}
 	scheduler.DeferPriorityOperation([address, value, size] {
 		Libs::LibKernel::Memory::WriteBacking(address, &value, size);
 		g_eop_labels_in_flight.fetch_sub(1, std::memory_order_acq_rel);
