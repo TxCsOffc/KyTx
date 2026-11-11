@@ -3009,11 +3009,11 @@ void Emitter::EmitAlu(const Inst& inst) {
 			EmitAssignment(inst, "kyty_fmax(" + Expr(inst.Arg(0)) + ", " + Expr(inst.Arg(1)) + ")");
 			return;
 		case IR::ValueOpcode::FPMinTri32:
-			EmitAssignment(inst, "fmin(" + Expr(inst.Arg(0)) + ", fmin(" + Expr(inst.Arg(1)) +
+			EmitAssignment(inst, "kyty_fmin(" + Expr(inst.Arg(0)) + ", kyty_fmin(" + Expr(inst.Arg(1)) +
 			                        ", " + Expr(inst.Arg(2)) + "))");
 			return;
 		case IR::ValueOpcode::FPMaxTri32:
-			EmitAssignment(inst, "fmax(" + Expr(inst.Arg(0)) + ", fmax(" + Expr(inst.Arg(1)) +
+			EmitAssignment(inst, "kyty_fmax(" + Expr(inst.Arg(0)) + ", kyty_fmax(" + Expr(inst.Arg(1)) +
 			                        ", " + Expr(inst.Arg(2)) + "))");
 			return;
 		case IR::ValueOpcode::FPMedTri32:
