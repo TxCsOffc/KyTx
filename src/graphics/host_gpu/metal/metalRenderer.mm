@@ -10390,11 +10390,34 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 		if (store_dbg) MetalDrawExecutor::Instance().SetComputeBuffer(store_dbg, 0, 27);
 		if (value_dbg) MetalDrawExecutor::Instance().SetComputeBuffer(value_dbg, 0, 29);
 	}
-	for (auto& writeback:canonical_writes) MetalContext::Instance().QueueEncoderWriteback(std::move(writeback));
+	// KYTY_GDS_TRIP_SPLIT_WB=1 (diagnostic): the checked kernel goes to the GPU in its own packet and the canonical writeback of
+	// its storage images in the next one, so a packet timeout names which of the two did not finish. Same work, same order.
+	const bool split_wb = compute_info.stage.program && GdsTrip().on && KYTY_ENV("KYTY_GDS_TRIP_SPLIT_WB") != nullptr &&
+	                      (GdsTrip().hash == trip_guest || GdsTrip().hash == cs_hash);
+	if (!split_wb)
+		for (auto& writeback:canonical_writes) MetalContext::Instance().QueueEncoderWriteback(std::move(writeback));
 	if (indirect_args) {
 		MetalDrawExecutor::Instance().DispatchIndirect(indirect_args, 0, host_w, host_h, host_d);
 	} else {
 		MetalDrawExecutor::Instance().Dispatch(thread_group_x, thread_group_y, thread_group_z, host_w, host_h, host_d);
+	}
+	if (split_wb) {
+		std::fprintf(stderr, "[GdsTrip] split: kernel packet then %zu writebacks\n", canonical_writes.size());
+		for (const auto& [res, binding]: canonical_images)
+			std::fprintf(stderr, "[GdsTrip]   canonical res=%u %lux%lu fmt=%lu levels=%lu type=%lu bytes=%llu spans=%zu\n", res,
+			             (unsigned long)binding.image.width, (unsigned long)binding.image.height, (unsigned long)binding.image.pixelFormat,
+			             (unsigned long)binding.image.mipmapLevelCount, (unsigned long)binding.image.textureType,
+			             (unsigned long long)binding.physical.size, binding.physical.spans.size());
+		std::fflush(stderr);
+		MetalContext::Instance().CommitCommandBuffer(false);
+		for (size_t i = 0; i < canonical_writes.size(); ++i) {
+			(void)MetalContext::Instance().GetCurrentCommandBuffer();
+			MetalContext::Instance().QueueEncoderWriteback(std::move(canonical_writes[i]));
+			MetalContext::Instance().EndCurrentEncoder();
+			std::fprintf(stderr, "[GdsTrip] writeback %zu committing\n", i);
+			std::fflush(stderr);
+			MetalContext::Instance().CommitCommandBuffer(false);
+		}
 	}
 	if (replay_dir && !gds_snapshot) {
 		const bool after_ok=ReplayDumpPhase(replay_dir,@"after",cs_buffers,replay_images,sizes,arg_ptrs[161] ? GdsBuffer() : nil);
