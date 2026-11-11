@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -90,8 +91,15 @@ struct MetalPresenter::Impl {
 			"}\n"
 			"fragment float4 fs_present_tex(VertexOut in [[stage_in]],\n"
 			"                              texture2d<float> src [[texture(0)]],\n"
+			"                              sampler smp [[sampler(0)]],\n"
 			"                              constant PresentUniforms& u [[buffer(0)]]) {\n"
 			"    float uv_y = (u.is_tiled & 2u) ? (1.0 - in.uv.y) : in.uv.y;\n"
+			"    float4 c;\n"
+			"    if ((u.is_tiled & 5u) == 4u) {\n"
+			"        // On-screen scaling: bilinear. A point read dropped every tenth source pixel when the drawable is smaller than the frame\n"
+			"        // (1728x957 for 1920x1080) and gave wobbly edges.\n"
+			"        c = src.sample(smp, float2(in.uv.x, uv_y));\n"
+			"    } else {\n"
 			"    uint x = clamp(uint(in.uv.x * float(u.width)), 0u, u.width - 1u);\n"
 			"    uint y = clamp(uint(uv_y * float(u.height)), 0u, u.height - 1u);\n"
 			"    uint tex_x = x;\n"
@@ -102,7 +110,8 @@ struct MetalPresenter::Impl {
 			"        tex_x = px_idx % u.width;\n"
 			"        tex_y = px_idx / u.width;\n"
 			"    }\n"
-			"    float4 c = src.read(uint2(tex_x, tex_y));\n"
+			"    c = src.read(uint2(tex_x, tex_y));\n"
+			"    }\n"
 			"    float3 rgb = clamp(c.rgb, 0.0, 1.0);\n"
 			"    // Display-referred formats (the game's final composite: 8-bit and RGB10A2 flip images) are already\n"
 			"    // encoded for the display, so they are copied straight; only linear HDR targets (RG11B10F, RGBA16F)\n"
@@ -306,6 +315,23 @@ bool MetalPresenter::PresentTexture(void* texture) {
 	id<MTLTexture> src_tex = (__bridge id<MTLTexture>)texture;
 
 	@autoreleasepool {
+		// The drawable follows the window's backing pixels (SDL leaves it at the size in points, 1728x957 here, so the 1920x1080 frame
+		// was shrunk by 0.9 and then doubled by the compositor). KYTY_PRESENT_NATIVE_SIZE=0 keeps the old size.
+		static const bool s_native_size = [] {
+			const char* env = std::getenv("KYTY_PRESENT_NATIVE_SIZE");
+			return env == nullptr || std::atoi(env) != 0;
+		}();
+		if (s_native_size) {
+			const CGSize  bounds = m_impl->layer.bounds.size;
+			const CGFloat scale  = m_impl->layer.contentsScale > 0.0 ? m_impl->layer.contentsScale : 1.0;
+			const CGSize  want   = CGSizeMake(std::round(bounds.width * scale), std::round(bounds.height * scale));
+			const CGSize  have   = m_impl->layer.drawableSize;
+			if (want.width >= 64.0 && want.height >= 64.0 && (std::fabs(want.width - have.width) > 0.5 || std::fabs(want.height - have.height) > 0.5)) {
+				m_impl->layer.drawableSize = want;
+				std::fprintf(stderr, "[MetalPresenter] drawable %.0fx%.0f -> %.0fx%.0f (layer %.0fx%.0f points, scale %.1f)\n", have.width, have.height, want.width,
+				             want.height, bounds.width, bounds.height, scale);
+			}
+		}
 		id<CAMetalDrawable> drawable = [m_impl->layer nextDrawable];
 		if (!drawable) {
 			return false;
@@ -347,6 +373,9 @@ bool MetalPresenter::PresentTexture(void* texture) {
 			s_env_detile = (env && std::atoi(env) != 0) ? 1 : 0;
 		}
 		u.is_tiled = static_cast<uint32_t>(s_env_flip_y | s_env_detile);
+		// Bit 2: bilinear sampling for the on-screen present (not for the 1:1 frame dump). KYTY_PRESENT_NEAREST=1 keeps the old point read.
+		static const bool s_present_nearest = std::getenv("KYTY_PRESENT_NEAREST") != nullptr;
+		const uint32_t    present_filter    = s_present_nearest ? 0u : 4u;
 
 		// KYTY_DUMP_FRAME=<n[,n...]> KYTY_DUMP_PATH=<file.ppm>: dump the listed
 		// presented frames to disk (PPM P6, top-down) so pixel content can be
@@ -413,6 +442,7 @@ bool MetalPresenter::PresentTexture(void* texture) {
 				if (denc) {
 					[denc setRenderPipelineState:m_impl->blit_tex_pipeline];
 					[denc setFragmentTexture:src_tex atIndex:0];
+					[denc setFragmentSamplerState:m_impl->linear_sampler atIndex:0];
 					[denc setFragmentBytes:&u length:sizeof(u) atIndex:0];
 					[denc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 					[denc endEncoding];
@@ -464,6 +494,8 @@ bool MetalPresenter::PresentTexture(void* texture) {
 		if (enc) {
 			[enc setRenderPipelineState:m_impl->blit_tex_pipeline];
 			[enc setFragmentTexture:src_tex atIndex:0];
+			[enc setFragmentSamplerState:m_impl->linear_sampler atIndex:0];
+			u.is_tiled |= present_filter;
 			[enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
 			[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 			[enc endEncoding];
@@ -548,6 +580,7 @@ bool MetalPresenter::DumpTextureToPpm(void* texture, const char* path) {
 		if (enc) {
 			[enc setRenderPipelineState:m_impl->blit_tex_pipeline];
 			[enc setFragmentTexture:src atIndex:0];
+			[enc setFragmentSamplerState:m_impl->linear_sampler atIndex:0];
 			[enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
 			[enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 			[enc endEncoding];

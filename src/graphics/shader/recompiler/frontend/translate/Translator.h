@@ -38,6 +38,7 @@ private:
 	void                   Write16Bits(const Decoder::Operand& operand, IR::U32 value);
 	void                   WriteF16(const Decoder::Operand& operand, IR::F32 value);
 	IR::U32                ReadU32(const Decoder::Operand& operand);
+	IR::U32                DsAddress(const Decoder::Instruction& inst, uint32_t index);
 	std::array<IR::U32, 2> ReadU32Pair(const Decoder::Operand& operand);
 	IR::U64                ReadU64(const Decoder::Operand& operand);
 	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool packed = false);

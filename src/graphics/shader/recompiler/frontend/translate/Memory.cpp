@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -580,7 +581,7 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                            bool returns_value) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(MemorySourceAt(inst, 1));
+	const auto address = DsAddress(inst, 1);
 	const auto data_src = MemorySourceAt(inst, 0);
 	const IR::Value value =
 	    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
@@ -777,9 +778,22 @@ void Translator::WriteSharedU32(uint32_t width, IR::U32 address,
 	}
 }
 
+// Byte address of a DS instruction. With GDS=1 the hardware adds the base of the dispatch's GDS partition, M0[31:16] (M0[15:0]
+// is its size): kernels that fill a GDS work queue with ds_append (which already used the base) and the kernel that consumes it with
+// ds_read/ds_inc_rtn must meet at the same dwords. Without the base the consumer read another partition's count, which nothing reset,
+// and its work loop grew every frame until the GPU watchdog fired. KYTY_GDS_NO_M0_BASE=1 restores the old absolute addresses.
+IR::U32 Translator::DsAddress(const Decoder::Instruction& inst, uint32_t index) {
+	const auto address = ReadU32(MemorySourceAt(inst, index));
+	static const bool s_no_base = std::getenv("KYTY_GDS_NO_M0_BASE") != nullptr;
+	if (!inst.gds || s_no_base) {
+		return address;
+	}
+	return ir.IAdd(address, ir.ShiftRightLogical(ir.GetM0(), IR::U32(IR::Value(16u))));
+}
+
 void Translator::DS_READ(const Decoder::Instruction& inst) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(MemorySourceAt(inst, 0));
+	const auto address = DsAddress(inst, 0);
 	if (memory.data_bits == 32u) {
 		const auto width  = memory.data_dwords;
 		const auto loaded = LoadSharedU32(width, address, memory, inst.pc);
@@ -797,7 +811,7 @@ void Translator::DS_READ(const Decoder::Instruction& inst) {
 void Translator::DS_READ2(const Decoder::Instruction& inst) {
 	const auto memory       = MemoryInfoFromDecoded(inst);
 	const auto width        = memory.data_dwords / 2u;
-	const auto address      = ReadU32(MemorySourceAt(inst, 0));
+	const auto address      = DsAddress(inst, 0);
 	auto       first        = memory;
 	first.data_dwords       = width;
 	first.component_count   = width;
@@ -823,7 +837,7 @@ void Translator::DS_WRITE(const Decoder::Instruction& inst) {
 	for (uint32_t index = 0; index < width; index++) {
 		values[index] = ReadU32(OffsetOperand(data_operand, index));
 	}
-	const auto address = ReadU32(MemorySourceAt(inst, 1));
+	const auto address = DsAddress(inst, 1);
 	if (memory.data_bits == 32u) {
 		WriteSharedU32(width, address, values, memory, inst.pc);
 		return;
@@ -837,7 +851,7 @@ void Translator::DS_WRITE(const Decoder::Instruction& inst) {
 void Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 	const auto               memory      = MemoryInfoFromDecoded(inst);
 	const auto               width       = memory.data_dwords / 2u;
-	const auto               address     = ReadU32(MemorySourceAt(inst, 1));
+	const auto               address     = DsAddress(inst, 1);
 	const auto               first_data  = MemorySourceAt(inst, 0);
 	const auto               second_data = MemorySourceAt(inst, 2);
 	std::array<IR::Value, 4> first_values {};

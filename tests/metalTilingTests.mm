@@ -135,6 +135,47 @@ int main() {
 			}
 		}
 		std::printf("guest mip decode: %u chains, %d cumulative failures\n", mip_cases, s_failures);
+		// Export distinct mip payloads into a shared allocation, including multiple levels in one tail tile.
+		for (const auto format : {Prospero::BufferFormat::k32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt}) {
+			TileSurfaceLayout layout {};
+			const TileSurfaceDescription desc {format, Prospero::TileMode::kStandard64KB, TileSurfaceDimension::Dim2D, 512, 512, 1, 8, 1};
+			Check(TileGetTiledTextureLayout(desc, layout), "mip export layout", "mip-export", 0);
+			const auto& block = layout.texture.block;
+			const uint32_t eb = block.bytes_per_element;
+			if (eb == 0) continue;
+			id<MTLBuffer> dst = [device newBufferWithLength:layout.total_size options:MTLResourceStorageModeShared];
+			std::memset(dst.contents, 0xa5, layout.total_size);
+			std::vector<uint8_t> expected(layout.total_size, 0xa5);
+			id<MTLCommandBuffer> cb = [queue commandBuffer];
+			for (uint32_t level = 0; level < desc.levels; ++level) {
+				const auto& mip = layout.mips[level];
+				const bool tail = level >= layout.first_tail_level;
+				std::vector<uint8_t> pixels(size_t(mip.width) * mip.height * eb);
+				for (auto& b : pixels) b = uint8_t(rng());
+				MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:TileElementFormat(eb)
+				    width:mip.width height:mip.height mipmapped:NO];
+				td.storageMode = MTLStorageModeShared;
+				td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+				id<MTLTexture> tex = [device newTextureWithDescriptor:td];
+				[tex replaceRegion:MTLRegionMake2D(0, 0, mip.width, mip.height) mipmapLevel:0 withBytes:pixels.data() bytesPerRow:mip.width * eb];
+				TileTables tables;
+				Check(BuildTileTables(block, mip.padded_width, mip.padded_height, tables), "mip export tables", "mip-export", eb, level);
+				Check(EncodeTileExport(device, cb, tex, dst, mip.offset, tables, mip.width, mip.height, 0,
+				                       tail ? mip.tail_x : 0, tail ? mip.tail_y : 0), "mip export encode", "mip-export", eb, level);
+				for (uint32_t y = 0; y < mip.height; ++y) for (uint32_t x = 0; x < mip.width; ++x) {
+					const uint32_t bx = tail ? 0 : x / block.block_width, by = tail ? 0 : y / block.block_height;
+					uint32_t within = 0, bank = 0;
+					TileGetBlockOffset(block, tail ? x + mip.tail_x : x % block.block_width,
+					                   tail ? y + mip.tail_y : y % block.block_height, 0, within);
+					TileGetBlockXor(block, bx, by, 0, bank);
+					const uint64_t off = mip.offset + uint64_t(by * (mip.padded_width / block.block_width) + bx) * block.block_size + (within ^ bank);
+					std::memcpy(expected.data() + off, pixels.data() + (size_t(y) * mip.width + x) * eb, eb);
+				}
+			}
+			[cb commit]; [cb waitUntilCompleted];
+			Check(cb.status == MTLCommandBufferStatusCompleted, "mip export GPU completed", "mip-export", eb);
+			Check(std::memcmp(dst.contents, expected.data(), expected.size()) == 0, "mip export matches full reference and preserves padding", "mip-export", eb);
+		}
 	}
 	return s_failures == 0 ? 0 : 1;
 }

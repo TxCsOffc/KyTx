@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/traceWindow.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -1393,6 +1394,20 @@ KYTY_CP_OP_PARSER(CpOpRewind) {
 	return 1;
 }
 
+// KYTY_LOG_COND=<first flip>[,<last flip>]: every COND_EXEC / conditional INDIRECT_BUFFER / SET_PREDICATION decision in that flip range,
+// with the guest value the command processor read on the CPU (memory a GPU pass writes later in the frame is still old here).
+static bool LogCondActive() {
+	static const std::pair<uint64_t, uint64_t> range = [] {
+		unsigned long long lo = 0, hi = ~0ull;
+		const char* v = std::getenv("KYTY_LOG_COND");
+		if (v == nullptr) return std::pair<uint64_t, uint64_t> {1, 0};
+		std::sscanf(v, "%llu,%llu", &lo, &hi);
+		return std::pair<uint64_t, uint64_t> {lo, hi};
+	}();
+	const uint64_t f = Libs::Graphics::TraceWindow::g_flip.load(std::memory_order_relaxed);
+	return f >= range.first && f <= range.second;
+}
+
 KYTY_CP_OP_PARSER(CpOpSetPredication) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1421,6 +1436,12 @@ KYTY_CP_OP_PARSER(CpOpSetPredication) {
 	auto  count_in_dwords = 0u;
 
 	cp.SetPredication(condition, op, wait_op, address, count_in_dwords);
+	if (LogCondActive()) {
+		std::fprintf(stderr, "[Cond] flip=%llu draw=%llu predication op=%u cond=%u wait=%u addr=0x%llx value=0x%llx\n",
+		             (unsigned long long)Libs::Graphics::TraceWindow::g_flip.load(), (unsigned long long)Libs::Graphics::TraceWindow::g_draw_in_frame.load(),
+		             op, condition, wait_op, (unsigned long long)address_value,
+		             address_value != 0 && op == 3 ? (unsigned long long)*reinterpret_cast<const volatile uint64_t*>(address_value) : 0ull);
+	}
 
 	return payload_dw;
 }
@@ -1447,6 +1468,11 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	const auto value = *reinterpret_cast<const volatile uint32_t*>(addr);
 	if (auto* scheduler = ProfileThread().scheduler)
 		scheduler->ProfileBufferUse("cpu_consume_cond_exec", addr, sizeof(value), value);
+	if (LogCondActive()) {
+		std::fprintf(stderr, "[Cond] flip=%llu draw=%llu cond_exec addr=0x%llx value=0x%x exec_dw=%u -> %s\n",
+		             (unsigned long long)Libs::Graphics::TraceWindow::g_flip.load(), (unsigned long long)Libs::Graphics::TraceWindow::g_draw_in_frame.load(),
+		             (unsigned long long)addr, value, exec_count, value == 0 ? "skip" : "run");
+	}
 	if (value == 0) {
 		return payload_dw + exec_count;
 	}
@@ -1483,6 +1509,12 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
 	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	if (LogCondActive()) {
+		std::fprintf(stderr, "[Cond] flip=%llu draw=%llu branch addr=0x%llx value=0x%llx ref=0x%llx mask=0x%llx fn=%u mode=%u -> %s (then %u dw, else %u dw)\n",
+		             (unsigned long long)Libs::Graphics::TraceWindow::g_flip.load(), (unsigned long long)Libs::Graphics::TraceWindow::g_draw_in_frame.load(),
+		             (unsigned long long)reinterpret_cast<uint64_t>(compare_addr), (unsigned long long)*compare_addr, (unsigned long long)reference,
+		             (unsigned long long)mask, function, mode, take_then ? "then" : "else", then_num_dw, else_num_dw);
+	}
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);

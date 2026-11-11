@@ -28,6 +28,7 @@ std::string MetalCacheReport();
 namespace Libs::Graphics::Metal {
 
 std::string KytyTakeCbOps();  // metalDraw.mm: op labels since the last commit (KYTY_MTL_GPU_TIME)
+std::string KytyDescribeGds(); // metalRenderer.mm: the first GDS dwords (work-queue counters of a hung kernel)
 
 MetalContext& MetalContext::Instance() {
 	static MetalContext context;
@@ -161,6 +162,7 @@ id<MTLCommandBuffer> MetalContext::GetCurrentCommandBuffer() {
 			if (semaphore) dispatch_semaphore_signal(semaphore);
 		}];
 		PassTimerOnCommit(m_current_command_buffer);
+		if (m_cb_order_event != nil) [m_current_command_buffer encodeSignalEvent:m_cb_order_event value:++m_cb_order_value];
 		[m_current_command_buffer commit];
 		[m_current_command_buffer waitUntilCompleted];
 		m_current_command_buffer = nil;
@@ -182,6 +184,14 @@ id<MTLCommandBuffer> MetalContext::GetCurrentCommandBuffer() {
 			m_current_command_buffer = [m_command_queue commandBufferWithDescriptor:cbd];
 		} else {
 			m_current_command_buffer = [m_command_queue commandBuffer];
+		}
+		// KYTY_CB_SERIAL=1 (experiment): each command buffer waits on the GPU for the previous one to finish (shared event), without
+		// stalling the CPU. Tells "two command buffers overlap on the GPU and race on aliased guest memory" (gone with this) from "the
+		// guest CPU overwrites data the GPU still reads" (still there), the two causes of frames that flicker between right and wrong.
+		static const bool s_cb_serial = KYTY_ENV("KYTY_CB_SERIAL") != nullptr;
+		if (s_cb_serial && m_current_command_buffer) {
+			if (m_cb_order_event == nil) m_cb_order_event = [m_device newSharedEvent];
+			if (m_cb_order_value != 0) [m_current_command_buffer encodeWaitForEvent:m_cb_order_event value:m_cb_order_value];
 		}
 		if (!m_current_command_buffer && m_inflight_semaphore) {
 			dispatch_semaphore_signal(m_inflight_semaphore);
@@ -243,6 +253,25 @@ void MetalContext::EndCurrentEncoder() {
 				[blit endEncoding];
 		}
 	}
+	if (!m_pending_texture_copies.empty()) {
+		std::vector<PendingTextureCopy> copies;
+		copies.swap(m_pending_texture_copies);
+		if (m_current_command_buffer) {
+			id<MTLBlitCommandEncoder> blit = [m_current_command_buffer blitCommandEncoder];
+			OrderBegin(blit);
+			for (const auto& c: copies) {
+				[blit copyFromTexture:(id<MTLTexture>)c.src sourceSlice:0 sourceLevel:0 toTexture:(id<MTLTexture>)c.dst destinationSlice:0
+				     destinationLevel:0 sliceCount:c.slices levelCount:c.levels];
+			}
+			OrderEnd(blit);
+			[blit endEncoding];
+		}
+	}
+}
+
+void MetalContext::QueueTextureCopy(id src, id dst, uint32_t slices, uint32_t levels) {
+	if (src == nil || dst == nil || slices == 0 || levels == 0) return;
+	m_pending_texture_copies.push_back({src, dst, slices, levels});
 }
 
 void MetalContext::QueueBlitFill(id buffer, uint64_t offset, uint64_t length, uint8_t value) {
@@ -280,25 +309,41 @@ static uint64_t GpuWatchdogCommitted(const std::string& ops) {
 	static const bool started = [&] {
 		if (limit <= 0.0) return false;
 		std::thread([] {
+			// KYTY_GPU_WATCHDOG_GDS_S=<seconds>: sample GDS while an in-flight command buffer ages.
+			const char* sample_env = std::getenv("KYTY_GPU_WATCHDOG_GDS_S");
+			const double sample_interval = sample_env != nullptr ? std::atof(sample_env) : 0.0;
+			uint64_t last_sample_id = 0;
+			double last_sample = 0.0;
 			for (;;) {
 				std::this_thread::sleep_for(std::chrono::seconds(1));
 				// Compute-indirect arguments the total-groups guard had to zero (garbage counts where a producer's should be).
 				const std::string guard_line = Libs::Graphics::Metal::KytyPollIndirectGuard();
 				if (!guard_line.empty()) std::fprintf(stderr, "%s\n", guard_line.c_str());
 				double      age = 0.0;
+				uint64_t    oldest_id = 0;
 				std::string ops;
 				{
 					std::lock_guard<std::mutex> lock(s_wd_mutex);
 					if (!s_wd_inflight.empty()) {
+						oldest_id = s_wd_inflight.begin()->first;
 						age = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_wd_inflight.begin()->second.when).count();
 						if (age > limit) ops = s_wd_inflight.begin()->second.ops;
 					}
+				}
+				if (oldest_id != last_sample_id) {
+					last_sample_id = oldest_id;
+					last_sample = 0.0;
+				}
+				if (sample_interval > 0.0 && age >= sample_interval && age - last_sample >= sample_interval) {
+					std::fprintf(stderr, "[GpuWatchdog] age=%.1f GDS: %s\n", age, KytyDescribeGds().c_str());
+					last_sample = age;
 				}
 				if (age > limit) {
 					std::fprintf(stderr, "[GpuWatchdog] a command buffer has been running for %.0f s (limit %.0f s): exiting before the system watchdog fires\n", age, limit);
 					if (!ops.empty()) std::fprintf(stderr, "[GpuWatchdog] ops of the stuck command buffer: %s\n", ops.c_str());
 					// The shared argument buffers still hold what the GPU wrote last: for a hung indirect op, its own arguments.
 					std::fprintf(stderr, "[GpuWatchdog] indirect snapshots: %s\n", Libs::Graphics::Metal::KytyDescribeIndirectArguments().c_str());
+					std::fprintf(stderr, "[GpuWatchdog] GDS: %s\n", KytyDescribeGds().c_str());
 					std::fflush(stderr);
 					_exit(3);
 				}
@@ -353,8 +398,14 @@ void MetalContext::CommitCommandBuffer(bool wait) {
 						s_sum    = 0.0;
 					}
 				}
+				// KYTY_MTL_GPU_TIME=<ms> sets the threshold (default 20 ms; "1" keeps the default).
+				static const double s_gpu_time_min = [] {
+					const char* v = KYTY_ENV("KYTY_MTL_GPU_TIME");
+					const double ms = v != nullptr ? std::atof(v) : 0.0;
+					return ms > 1.0 ? ms / 1000.0 : 0.02;
+				}();
 				if (KYTY_ENV("KYTY_MTL_GPU_TIME") != nullptr && buffer.GPUEndTime > buffer.GPUStartTime &&
-				    buffer.GPUEndTime - buffer.GPUStartTime > 0.02) {
+				    buffer.GPUEndTime - buffer.GPUStartTime > s_gpu_time_min) {
 					std::fprintf(stderr, "[GpuTime] command buffer %.1f ms ops: %s\n", (buffer.GPUEndTime - buffer.GPUStartTime) * 1000.0, buffer.label ? [buffer.label UTF8String] : "");
 				}
 				if (buffer.status == MTLCommandBufferStatusError) {
@@ -387,6 +438,7 @@ void MetalContext::CommitCommandBuffer(bool wait) {
 		}
 		s_cb_committed.fetch_add(1, std::memory_order_relaxed);
 		PassTimerOnCommit(m_current_command_buffer);
+		if (m_cb_order_event != nil) [m_current_command_buffer encodeSignalEvent:m_cb_order_event value:++m_cb_order_value];
 		[m_current_command_buffer commit];
 		if (wait) {
 			[m_current_command_buffer waitUntilCompleted];
@@ -406,6 +458,7 @@ void MetalContext::WaitUntilIdle() {
 			if (semaphore) dispatch_semaphore_signal(semaphore);
 		}];
 		PassTimerOnCommit(m_current_command_buffer);
+		if (m_cb_order_event != nil) [m_current_command_buffer encodeSignalEvent:m_cb_order_event value:++m_cb_order_value];
 		[m_current_command_buffer commit];
 		[m_current_command_buffer waitUntilCompleted];
 		m_current_command_buffer = nil;

@@ -77,6 +77,9 @@ public:
 	// A byte fill of guest memory requested while a render pass is open: it runs, in GPU order after that pass, in one blit encoder
 	// when the pass ends, instead of splitting the pass after every draw (hundreds of 1920x1080 load/store round trips per frame).
 	void QueueBlitFill(id buffer, uint64_t offset, uint64_t length, uint8_t value);
+	// A whole-texture copy (slices [0, slices) and mips [0, levels)) requested while an encoder is open: it runs when that encoder ends
+	// (a layered image grown during a storage binding receives its old slices this way; the open dispatch writes only new ones).
+	void QueueTextureCopy(id src, id dst, uint32_t slices, uint32_t levels);
 	void CommitCommandBuffer(bool wait = false);
 	void WaitUntilIdle();
 
@@ -92,6 +95,8 @@ private:
 	// Bounds committed-but-unfinished command buffers; IOGPU blocks forever in
 	// -[MTLCommandQueue commandBuffer] once its in-flight limit is reached.
 	dispatch_semaphore_t       m_inflight_semaphore     = nullptr;
+	id<MTLSharedEvent>         m_cb_order_event         = nil; // KYTY_CB_SERIAL: GPU-side order of command buffers
+	uint64_t                   m_cb_order_value         = 0;
 	static constexpr intptr_t  kMaxInflightCommandBuffers = 64;
 	id<MTLRenderCommandEncoder>  m_active_render_encoder  = nil;
 	id<MTLComputeCommandEncoder> m_active_compute_encoder = nil;
@@ -110,6 +115,13 @@ private:
 		uint8_t  value  = 0;
 	};
 	std::vector<PendingBlitFill> m_pending_fills;
+	struct PendingTextureCopy {
+		id       src = nullptr;
+		id       dst = nullptr;
+		uint32_t slices = 0;
+		uint32_t levels = 0;
+	};
+	std::vector<PendingTextureCopy> m_pending_texture_copies;
 	uint64_t                     m_encoder_serial = 0;
 	bool                         m_command_buffer_handed_out = false;
 

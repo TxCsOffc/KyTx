@@ -4,10 +4,12 @@
 #include <cstdlib>
 #include <mutex>
 
-// KYTY_ENCODER_FENCES=1: the encoders of the shared command stream run one after the other on the GPU, like the PS5 command processor runs
-// its packets. Guest memory is reached through several Metal objects at once (a buffer per start page, buffer-backed texture views, raw GPU
+// Encoder fences (default on; KYTY_ENCODER_FENCES=0 turns them off): the encoders of the shared command stream run one after the other on
+// the GPU, like the PS5 command processor runs its packets. Guest memory is reached through several Metal objects at once (a buffer per start page, buffer-backed texture views, raw GPU
 // addresses inside argument buffers); Metal only orders encoders that use the same object, so a producer kernel and the kernel that reads
-// its output can overlap (observed: indirect dispatch arguments read before the producer wrote them). Each encoder updates a fence when it
+// its output can overlap (observed: indirect dispatch arguments read before the producer wrote them; a render pass over a linear render target
+// writing into the memory of a compute queue buffer while the kernel still read it - the GPU hang of cs=0xf5875e8c tile queue, its per-tile
+// counts turned into the target's half floats 0x38003800, um136 vs codex145-147). Each encoder updates a fence when it
 // ends and the next one waits for it before its first command. No CPU wait.
 //
 // Call OrderBegin right after the encoder is created and OrderEnd right before endEncoding, for every encoder recorded into the shared
@@ -15,7 +17,7 @@
 namespace Libs::Graphics::Metal {
 
 inline bool EncoderFencesEnabled() {
-	static const bool on = std::getenv("KYTY_ENCODER_FENCES") != nullptr;
+	static const bool on = std::getenv("KYTY_ENCODER_FENCES") == nullptr || std::getenv("KYTY_ENCODER_FENCES")[0] != '0';
 	return on;
 }
 

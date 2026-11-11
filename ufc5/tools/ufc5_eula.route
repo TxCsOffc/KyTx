@@ -1,0 +1,7 @@
+wait 0.5
+dpad up
+wait 1.2
+shot
+tap cross
+wait 5.0
+shot

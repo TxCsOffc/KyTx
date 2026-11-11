@@ -1,0 +1,4 @@
+wait 0.5
+dpad down
+wait 1.5
+shot

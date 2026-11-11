@@ -129,8 +129,9 @@ namespace {
 const char* kTileMsl = R"MSL(
 #include <metal_stdlib>
 using namespace metal;
-struct P { uint width, height, columns, rows, block_w, block_h, block_bytes, eb, bank_v0, layer_xor, ncomp, comp_bytes; };
+struct P { uint width, height, columns, rows, block_w, block_h, block_bytes, eb, bank_v0, layer_xor, ncomp, comp_bytes, tile_x, tile_y; };
 static ulong tiled_offset(uint2 g, constant P& p, device const uint* ix, device const uint* iy, device const uint* bxt, device const uint* byt) {
+	g += uint2(p.tile_x, p.tile_y);
 	uint bx = g.x / p.block_w, by = g.y / p.block_h;
 	uint within = ix[g.x % p.block_w] ^ iy[g.y % p.block_h];
 	uint bank = bxt[bx] ^ byt[by] ^ p.bank_v0 ^ p.layer_xor;
@@ -177,7 +178,7 @@ Pipelines& GetPipelines(id<MTLDevice> device) {
 }
 
 struct Params {
-	uint32_t width, height, columns, rows, block_w, block_h, block_bytes, eb, bank_v0, layer_xor, ncomp, comp_bytes;
+	uint32_t width, height, columns, rows, block_w, block_h, block_bytes, eb, bank_v0, layer_xor, ncomp, comp_bytes, tile_x, tile_y;
 };
 
 // Layer term of TileGetBlockXor for the render-target and depth families (zero for every other family and for layer 0).
@@ -187,13 +188,15 @@ uint32_t LayerXor(const TileBlockLayout& block, uint32_t layer) {
 }
 
 bool Encode(id<MTLDevice> device, id<MTLCommandBuffer> cmd, bool exporting, id<MTLTexture> texture, id<MTLBuffer> tiled,
-            NSUInteger tiled_offset, const TileTables& t, uint32_t width, uint32_t height, uint32_t layer) {
+	            NSUInteger tiled_offset, const TileTables& t, uint32_t width, uint32_t height, uint32_t layer, uint32_t tile_x, uint32_t tile_y) {
 	if (!t.valid || texture == nil || tiled == nil || cmd == nil) return false;
+	if (tile_x > uint64_t(t.columns) * t.block.block_width || tile_y > uint64_t(t.rows) * t.block.block_height ||
+	    width > uint64_t(t.columns) * t.block.block_width - tile_x || height > uint64_t(t.rows) * t.block.block_height - tile_y) return false;
 	Pipelines& pl = GetPipelines(device);
 	id<MTLComputePipelineState> pso = exporting ? pl.exp : pl.imp;
 	if (pso == nil || texture.pixelFormat != TileElementFormat(t.block.bytes_per_element) || width > texture.width || height > texture.height) return false;
 	Params p {width, height, t.columns, t.rows, t.block.block_width, t.block.block_height, t.block.block_size, t.block.bytes_per_element,
-	          t.bank_v0, LayerXor(t.block, layer), std::max(t.block.bytes_per_element / 4u, 1u), std::min(t.block.bytes_per_element, 4u)};
+	          t.bank_v0, LayerXor(t.block, layer), std::max(t.block.bytes_per_element / 4u, 1u), std::min(t.block.bytes_per_element, 4u), tile_x, tile_y};
 	id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 	OrderBegin(enc);
 	[enc setComputePipelineState:pso];
@@ -214,13 +217,14 @@ bool Encode(id<MTLDevice> device, id<MTLCommandBuffer> cmd, bool exporting, id<M
 } // namespace
 
 bool EncodeTileExport(id<MTLDevice> device, id<MTLCommandBuffer> cmd, id<MTLTexture> texture, id<MTLBuffer> tiled,
-                      NSUInteger tiled_offset, const TileTables& tables, uint32_t width, uint32_t height, uint32_t layer) {
-	return Encode(device, cmd, true, texture, tiled, tiled_offset, tables, width, height, layer);
+                      NSUInteger tiled_offset, const TileTables& tables, uint32_t width, uint32_t height, uint32_t layer,
+                      uint32_t tile_x, uint32_t tile_y) {
+	return Encode(device, cmd, true, texture, tiled, tiled_offset, tables, width, height, layer, tile_x, tile_y);
 }
 
 bool EncodeTileImport(id<MTLDevice> device, id<MTLCommandBuffer> cmd, id<MTLBuffer> tiled, NSUInteger tiled_offset,
                       id<MTLTexture> texture, const TileTables& tables, uint32_t width, uint32_t height, uint32_t layer) {
-	return Encode(device, cmd, false, texture, tiled, tiled_offset, tables, width, height, layer);
+	return Encode(device, cmd, false, texture, tiled, tiled_offset, tables, width, height, layer, 0, 0);
 }
 
 } // namespace Libs::Graphics::Metal

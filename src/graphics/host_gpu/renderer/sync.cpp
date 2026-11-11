@@ -1,3 +1,6 @@
+#if defined(__APPLE__)
+#include "graphics/host_gpu/metal/metalRenderer.h"
+#endif
 #include "graphics/host_gpu/renderer/sync.h"
 
 #include "common/assert.h"
@@ -160,6 +163,16 @@ void WriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer& buffer,
 
 uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int flip_mode,
                              int64_t flip_arg) {
+#if defined(__APPLE__)
+	// KYTY_FLIP_SYNC=1 (experiment): the flip waits until the Metal GPU has executed everything recorded so far. The guest waits
+	// for its flips before it reuses per-frame memory, so it can no longer run more than a frame ahead of the host GPU and rewrite
+	// data (constants, skinning sources, vertex rings) that a still-running frame reads - a one-frame-in-flight CPU throttle.
+	static const bool s_flip_sync = std::getenv("KYTY_FLIP_SYNC") != nullptr;
+	if (s_flip_sync && Metal::UseNativeMetalBackend()) {
+		Metal::MetalRenderer::Instance().Flush();
+		Metal::MetalRenderer::Instance().WaitIdle();
+	}
+#endif
 	for (;;) {
 		uint64_t   request_id = 0;
 		auto&      video_out  = buffer.GetContext().GetVideoOut();

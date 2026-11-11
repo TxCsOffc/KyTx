@@ -47,6 +47,7 @@ static bool MslGdsEnabled() {
 
 // Dwords of the Metal GDS buffer (GdsBuffer() in metalRenderer.mm is 64 KiB).
 static constexpr uint32_t kMslGdsDwords = 16384u;
+static constexpr uint32_t kMslLoopTripGdsBase = 16376u; // KYTY_LOOP_TRIP_GDS counters, the last 8 GDS dwords
 
 namespace Libs::Graphics::ShaderRecompiler::Msl {
 namespace {
@@ -678,6 +679,17 @@ struct Emitter {
 
 	// GDS access that goes to the device GDS buffer (compute only, where the binding exists). The address is the guest
 	// address plus the static offset, without the M0 base, as in the SPIR-V path (only ds_append/consume use M0).
+	// KYTY_LOOP_TRIP_GDS=1: a compute shader with a GDS binding counts its runaway-loop guard trips in GDS dwords
+	// kMslLoopTripGdsBase + loop id (ids past 7 share the last one); the GPU watchdog prints them. Diagnostic only.
+	bool LoopTripGds() const {
+		static const bool on = std::getenv("KYTY_LOOP_TRIP_GDS") != nullptr;
+		if (!on) return false;
+		for (const auto& binding: program.bindings.descriptors) {
+			if (binding.kind == IR::DescriptorBindingKind::Gds) return true;
+		}
+		return false;
+	}
+
 	bool GdsMem(const IR::MemoryInfo& mem) const {
 		return mem.kind == IR::ResourceKind::Gds && program.stage == ShaderType::Compute && MslGdsEnabled();
 	}
@@ -1023,6 +1035,13 @@ struct Emitter {
 
 	void EmitSetAttribute(const Inst& inst) {
 		const auto& exp = program.export_info.at(inst.Flags<IR::ExportFlags>().index);
+		// An export with the valid-mask bit makes EXEC the pixel's coverage: a pixel out of it is dropped, colour and depth (the SPIR-V path
+		// kills it the same way). Without this, every pixel a shader rejects wrote zeros to all its targets and its depth: the body under a kit,
+		// which the game masks out, punched black holes into the shirt and shorts. Null exports carry the bit too, so this comes first.
+		static const bool s_no_kill = std::getenv("KYTY_MSL_NO_KILL") != nullptr;
+		if (program.stage == ShaderType::Pixel && exp.vm && !s_no_kill) {
+			body << "\t\tif (!(" << Expr(inst.Arg(1)) << ")) discard_fragment();\n";
+		}
 		if (exp.kind == IR::ExportTargetKind::Null || exp.en == 0u) {
 			return;
 		}
@@ -1481,9 +1500,17 @@ struct Emitter {
 					call = tex + ".sample(" + sampler + ", " + coord + array_arg + ")";
 				}
 				if (layout.dref >= 0) {
-					// Depth-compare sample: the depth is sampled as a float and compared with the reference (LESS_EQUAL,
-					// no percentage-closer filtering).
-					call = "kyty_sample_cmp(" + call + ", " + AddressF32(*address, mem, static_cast<uint32_t>(layout.dref)) + ")";
+					// Depth-compare sample: the depth is sampled as a float and compared with the reference (texel >= reference,
+					// no percentage-closer filtering). KYTY_MSL_CMP_FUNC=1: the sampler's own compare function instead (sizes[64 + slot]):
+					// right for the shadow samplers (GREATER) but um190/um194 lost the red room's light (some dref samplers carry
+					// NEVER/ALWAYS), so it stays opt-in.
+					// KYTY_MSL_CMP_FUNC=ref: reference <func> texel (the Vulkan reference's order), as the mirrored function of texel-first.
+					static const char* s_cmp_func = std::getenv("KYTY_MSL_CMP_FUNC");
+					const std::string slot_func = "sizes[" + std::to_string(64u + *sampler_slot) + "]";
+					const std::string func = s_cmp_func == nullptr ? std::string("6u")
+					                         : std::strcmp(s_cmp_func, "ref") == 0 ? "((0x73516240u >> (" + slot_func + " * 4u)) & 0xfu)"
+					                                                               : slot_func;
+					call = "kyty_sample_cmp(" + call + ", " + AddressF32(*address, mem, static_cast<uint32_t>(layout.dref)) + ", " + func + ")";
 				}
 				EmitAssignment(inst, TexelBits(image, call, &mem));
 				return;
@@ -1520,7 +1547,12 @@ struct Emitter {
 				                   ", int2(0), component::" + component + ")";
 				if ((mem.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u && layout.dref >= 0) {
 					// Depth-compare gather: compare the reference with each gathered texel (LESS_EQUAL).
-					call = "kyty_gather_cmp(" + call + ", " + AddressF32(*address, mem, static_cast<uint32_t>(layout.dref)) + ")";
+					static const char* s_cmp_func_g = std::getenv("KYTY_MSL_CMP_FUNC");
+					const std::string slot_func_g = "sizes[" + std::to_string(64u + *sampler_slot) + "]";
+					const std::string func_g = s_cmp_func_g == nullptr ? std::string("6u")
+					                           : std::strcmp(s_cmp_func_g, "ref") == 0 ? "((0x73516240u >> (" + slot_func_g + " * 4u)) & 0xfu)"
+					                                                                   : slot_func_g;
+					call = "kyty_gather_cmp(" + call + ", " + AddressF32(*address, mem, static_cast<uint32_t>(layout.dref)) + ", " + func_g + ")";
 				}
 				EmitAssignment(inst, TexelBits(image, call, &mem));
 				return;
@@ -1664,7 +1696,10 @@ struct Emitter {
 				body << "\twhile (true) {\n";
 				// A compute thread that ran out of iterations leaves the loop rather than the kernel: a `return` here left the
 				// rest of the threadgroup waiting at the next threadgroup_barrier for good (a GPU hang the watchdog ends).
-				if (program.stage == ShaderType::Compute) {
+				if (program.stage == ShaderType::Compute && LoopTripGds()) {
+					body << "\t\tif (++kyty_loop" << loop_id << " > " << MslLoopCap() << "u) { atomic_fetch_add_explicit(&ab.gds["
+					     << kMslLoopTripGdsBase + std::min(loop_id, 7u) << "u], 1u, memory_order_relaxed); break; }\n";
+				} else if (program.stage == ShaderType::Compute) {
 					body << "\t\tif (++kyty_loop" << loop_id << " > " << MslLoopCap() << "u) { break; }\n";
 				} else {
 					body << "\t\tif (++kyty_loop" << loop_id << " > " << MslLoopCap() << "u) { return" << (HasOutInterface() ? " out" : "") << "; }\n";
@@ -1717,7 +1752,11 @@ struct Emitter {
 			return;
 		}
 		body << "\t\t" << Name(inst) << " = " << expr << ";\n";
-		if (nan_trace_ && program.stage == ShaderType::Compute && std::strcmp(type_name, "float") == 0) {
+		// A bit cast is no float result: phi values and integers pass through as_type<float> here and would read as NaN.
+		const bool nan_cast_only = expr.rfind("as_type<float>(", 0) == 0;
+		if (nan_trace_ && program.stage == ShaderType::Compute && std::strcmp(type_name, "float") == 0 && nan_cast_only) {
+			// Not traced.
+		} else if (nan_trace_ && program.stage == ShaderType::Compute && std::strcmp(type_name, "float") == 0) {
 			// Compute: the smallest (id * 2 + half) over all threads goes into the debug buffer (buffer 28) with an atomic minimum; the host prints it
 			// after the traced dispatch ([NanTrace]). Ids are the numbers of the [NanId] lines printed here at compile time.
 			const std::string name  = Name(inst);
@@ -1785,8 +1824,22 @@ struct Emitter {
 			case IR::ValueOpcode::SetAttribute: EmitSetAttribute(inst); return;
 			case IR::ValueOpcode::ReadConst:
 				if (HasDescriptor(IR::DescriptorBindingKind::FlattenedSrt)) {
-					EmitAssignment(inst, "ab.flattened_srt[min(" + Expr(inst.Arg(1)) +
-					                        ", 255u)]");
+					// An immediate index is a flat slot assigned by the SRT plan and always lies inside the uploaded table (FC 27 glass
+					// reads slot 315: the old clamp to 255 read another constant, zero exposure and transmittance = black glass).
+					// A computed index keeps a bound against stray reads. KYTY_MSL_SRT_CLAMP255=1|ps|vs|<hash,...>: the old clamp for
+					// every shader, the pixel shaders, the other stages, or the listed shader hashes (A/B and bisection only).
+					static const std::string s_clamp255 = std::getenv("KYTY_MSL_SRT_CLAMP255") != nullptr ? std::getenv("KYTY_MSL_SRT_CLAMP255") : "";
+					const bool clamp255 = !s_clamp255.empty() &&
+					    (s_clamp255 == "1" || (s_clamp255 == "ps" && program.stage == ShaderType::Pixel) ||
+					     (s_clamp255 == "vs" && program.stage != ShaderType::Pixel) ||
+					     s_clamp255.find(fmt::format("{:016x}", program.shader_hash)) != std::string::npos);
+					if (clamp255) {
+						EmitAssignment(inst, "ab.flattened_srt[min(" + Expr(inst.Arg(1)) + ", 255u)]");
+					} else if (inst.Arg(1).IsImmediate()) {
+						EmitAssignment(inst, "ab.flattened_srt[" + Expr(inst.Arg(1)) + "]");
+					} else {
+						EmitAssignment(inst, "ab.flattened_srt[min(" + Expr(inst.Arg(1)) + ", 4095u)]");
+					}
 				} else {
 					Unsupported(inst, "SRT read without flattened SRT binding");
 					EmitAssignment(inst, "0u");
@@ -2147,11 +2200,15 @@ struct Emitter {
 				// Untyped formatted store with a 32-bit descriptor format (UInt/SInt/Float): no conversion, so
 				// it is a plain dword store (same as the SPIR-V path). Other formatted stores stay unsupported.
 				const auto store_op = inst.GetOpcode();
+				// A descriptor without a data format (data_format 0) converts nothing either: an untyped dword store goes to memory as it is. Kernel
+				// b8b4a7c7, skipped for this, ran 15 times a frame with no effect.
+				const bool no_data_format = mem.resource < program.info.buffers.size() && mem.data_format == 0 && mem.number_format == 0 &&
+				    static_cast<uint32_t>(program.info.buffers[mem.resource].descriptor_format) == 0u;
 				const bool raw_formatted_dword = mem.formatted && !mem.typed &&
 				    (store_op == IR::ValueOpcode::StoreBufferU32 || store_op == IR::ValueOpcode::StoreBufferU32x2 ||
 				     store_op == IR::ValueOpcode::StoreBufferU32x3 || store_op == IR::ValueOpcode::StoreBufferU32x4) &&
 				    mem.resource < program.info.buffers.size() &&
-				    IsRaw32BitFormat(program.info.buffers[mem.resource].descriptor_format);
+				    (IsRaw32BitFormat(program.info.buffers[mem.resource].descriptor_format) || no_data_format);
 				const bool half4_store = mem.formatted && !mem.typed && store_op == IR::ValueOpcode::StoreBufferU32x4 &&
 				    mem.resource < program.info.buffers.size() &&
 				    program.info.buffers[mem.resource].descriptor_format == Prospero::BufferFormat::k16_16_16_16Float;
@@ -2806,10 +2863,16 @@ inline float kyty_med3f(float a, float b, float c) {
 	return (isnan(a) || isnan(b) || isnan(c)) ? minimum : median;
 }
 )";
-	out << "inline float4 kyty_sample_cmp(float4 s, float ref) {\n";
-	out << "\treturn float4(ref <= s.x ? 1.0f : 0.0f);\n}\n\n";
-	out << "inline float4 kyty_gather_cmp(float4 g, float ref) {\n";
-	out << "\treturn float4(ref <= g.x ? 1.0f : 0.0f, ref <= g.y ? 1.0f : 0.0f, ref <= g.z ? 1.0f : 0.0f, ref <= g.w ? 1.0f : 0.0f);\n}\n\n";
+	// func: a DEPTH_COMPARE_FUNC applied as texel <func> reference (6 = GEQUAL, the default; with KYTY_MSL_CMP_FUNC the sampler's own,
+	// FC 27's shadow samplers are GREATER, S# 0x4092/0x4012; reference-first lit the red room grey and blew out frames, um190).
+	out << "inline float4 kyty_sample_cmp(float4 s, float ref, uint func) {\n";
+	out << "\tconst float d = s.x;\n";
+	out << "\tconst bool pass = func == 0u ? false : func == 1u ? d < ref : func == 2u ? d == ref : func == 3u ? d <= ref :\n";
+	out << "\t                  func == 4u ? d > ref : func == 5u ? d != ref : func == 6u ? d >= ref : true;\n";
+	out << "\treturn float4(pass ? 1.0f : 0.0f);\n}\n\n";
+	out << "inline float4 kyty_gather_cmp(float4 g, float ref, uint func) {\n";
+	out << "\treturn float4(kyty_sample_cmp(float4(g.x), ref, func).x, kyty_sample_cmp(float4(g.y), ref, func).x,\n";
+	out << "\t              kyty_sample_cmp(float4(g.z), ref, func).x, kyty_sample_cmp(float4(g.w), ref, func).x);\n}\n\n";
 	// D16 image data: two 16-bit components per dword. `mask` is the dmask (enabled texel components in order).
 	out << "inline uint4 kyty_d16_pack(uint4 t, uint mask, bool is_float) {\n";
 	out << "\tuint v[4] = {0u, 0u, 0u, 0u};\n\tuint n = 0u;\n";
@@ -3048,6 +3111,28 @@ inline float kyty_med3f(float a, float b, float c) {
 					body << "\t\t\tpc = " << BlockIndex(term.false_block) << "u;\n\t\t}\n\t\tbreak;\n";
 				}
 				break;
+			case CFG::TerminatorKind::IndirectBranch: {
+				// A jump table (s_setpc_b64 on a selector, e.g. the blend-mode switch of the mask layering kernel): choose the target the way the
+				// SPIR-V dispatcher does. A selector without an entry leaves the shader. Without this the block returned at once and every block
+				// behind the table was unreachable, so such kernels did nothing (the body hide masks never got their cutouts).
+				const auto& info    = program.block_info[index];
+				const bool  by_code = term.indirect_selector_code != UINT32_MAX;
+				const auto& values  = by_code ? term.indirect_selector_values : term.indirect_target_pcs;
+				const auto& targets = by_code ? term.indirect_selector_targets : term.indirect_targets;
+				const size_t count  = std::min(values.size(), targets.size());
+				if (info.indirect_target.IsEmpty() || count == 0) {
+					body << "\t\treturn" << (has_out ? " out" : "") << ";\n";
+					break;
+				}
+				body << "\t\t{\n\t\t\tconst uint kyty_sel = as_type<uint>(" << Expr(info.indirect_target) << ");\n";
+				for (size_t entry = 0; entry < count; ++entry) {
+					body << (entry == 0 ? "\t\t\tif (" : "\t\t\t} else if (") << "kyty_sel == " << values[entry] << "u) {\n";
+					EmitPhiCopies(block, targets[entry]);
+					body << "\t\t\t\tpc = " << BlockIndex(targets[entry]) << "u;\n";
+				}
+				body << "\t\t\t} else {\n\t\t\t\tpc = 0xffffffffu;\n\t\t\t}\n\t\t}\n\t\tbreak;\n";
+				break;
+			}
 			default: body << "\t\treturn" << (has_out ? " out" : "") << ";\n"; break;
 		}
 		body << "\t}\n";

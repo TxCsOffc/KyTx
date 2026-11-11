@@ -1574,8 +1574,9 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		std::lock_guard                     lock(mutex);
 		if (input_info.stage.program != nullptr &&
 		    seen.insert(input_info.stage.program->shader_hash).second) {
-			std::fprintf(stderr, "[cs] hash=0x%016llx lds_dwords=%u threads=%ux%ux%u wave=%u\n",
+			std::fprintf(stderr, "[cs] hash=0x%016llx guest=0x%016llx lds_dwords=%u threads=%ux%ux%u wave=%u\n",
 			             static_cast<unsigned long long>(input_info.stage.program->shader_hash),
+			             static_cast<unsigned long long>(input_info.stage.program->guest_hash),
 			             input_info.lds_size_dwords, input_info.threads_num[0],
 			             input_info.threads_num[1], input_info.threads_num[2], input_info.wave_size);
 		}

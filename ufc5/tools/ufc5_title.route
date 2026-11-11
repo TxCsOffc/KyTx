@@ -1,0 +1,4 @@
+wait 1.0
+tap cross
+wait 2.5
+shot

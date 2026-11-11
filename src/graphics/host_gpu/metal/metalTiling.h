@@ -47,7 +47,8 @@ bool DecodeTiledTextureLevel(std::span<const uint8_t> source, const TileSurfaceL
 // format of the element size (R8Uint, R16Uint, R32Uint, RG32Uint, RGBA32Uint) with the matching usage.
 // `tiled` + `tiled_offset` is the first byte of the surface. Each call encodes one compute pass into `cmd`.
 bool EncodeTileExport(id<MTLDevice> device, id<MTLCommandBuffer> cmd, id<MTLTexture> texture, id<MTLBuffer> tiled,
-                      NSUInteger tiled_offset, const TileTables& tables, uint32_t width, uint32_t height, uint32_t layer = 0);
+                      NSUInteger tiled_offset, const TileTables& tables, uint32_t width, uint32_t height, uint32_t layer = 0,
+                      uint32_t tile_x = 0, uint32_t tile_y = 0);
 bool EncodeTileImport(id<MTLDevice> device, id<MTLCommandBuffer> cmd, id<MTLBuffer> tiled, NSUInteger tiled_offset,
                       id<MTLTexture> texture, const TileTables& tables, uint32_t width, uint32_t height, uint32_t layer = 0);
 

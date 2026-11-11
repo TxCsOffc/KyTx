@@ -520,6 +520,18 @@ static const char* const kFlushReasonNames[kFlushReasonCount] = {
     "cp_wait_regmem",  "budget",       "idle",         "other"};
 static std::atomic<uint64_t> g_flush_by_reason[kFlushReasonCount] {};
 static std::atomic<uint64_t> g_flip_count {0};
+// How far the command processor lags the guest CPU (printed by PassTrace: graphics submissions and flip preparations the guest
+// queued, against those the processor has started). A lag of a frame or more lets the guest rewrite per-frame memory the
+// processor has not read yet.
+std::atomic<uint64_t> g_kyty_gfx_enqueued {0};
+std::atomic<uint64_t> g_kyty_gfx_started {0};
+std::atomic<uint64_t> g_kyty_flip_enqueued {0};
+uint64_t KytyCpLag(uint64_t* flips_enqueued, uint64_t* flips_done, uint64_t* gfx_started) {
+	*flips_enqueued = g_kyty_flip_enqueued.load(std::memory_order_relaxed);
+	*flips_done     = g_flip_count.load(std::memory_order_relaxed);
+	*gfx_started    = g_kyty_gfx_started.load(std::memory_order_relaxed);
+	return g_kyty_gfx_enqueued.load(std::memory_order_relaxed);
+}
 
 // KYTY_LABEL_MODE=cpu_on_complete (opt-in): EOP labels are written by the CPU when their tick
 // completes, with no GPU write and no submit per label. Default is gpu (GPU-written labels).
@@ -1075,6 +1087,8 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	if (submission.type == SubmissionType::Graphics) g_kyty_gfx_enqueued.fetch_add(1, std::memory_order_relaxed);
+	if (submission.type == SubmissionType::FlipPreparation) g_kyty_flip_enqueued.fetch_add(1, std::memory_order_relaxed);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -1285,6 +1299,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	if (first_slice) {
 		submission.started = true;
+		if (submission.type == SubmissionType::Graphics) g_kyty_gfx_started.fetch_add(1, std::memory_order_relaxed);
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
@@ -2284,14 +2299,22 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					// Experiment (KYTY_EOP_CLOCK_FREEZE=1): every GPU timestamp of one presented frame carries the same
 					// clock value, so a frame's measured GPU time is zero (probes whether dynamic resolution follows it).
 					static const bool s_freeze = std::getenv("KYTY_EOP_CLOCK_FREEZE") != nullptr;
-					if (s_freeze) {
+					// KYTY_EOP_CLOCK_SCALE=<n> (default 8, 1 = real time): time inside a presented frame runs n times slower, so the game measures its
+					// GPU time divided by n and keeps its full render size instead of dropping it and upscaling, and the clock still advances.
+					static const uint64_t s_scale = [] {
+						const char* v = std::getenv("KYTY_EOP_CLOCK_SCALE");
+						return v != nullptr ? std::strtoull(v, nullptr, 0) : 8ull;
+					}();
+					if (s_freeze || s_scale > 1) {
 						static std::atomic<uint64_t> s_frozen_flip {~0ull};
 						static std::atomic<uint64_t> s_frozen_value {0};
 						const uint64_t flip = Libs::Graphics::TraceWindow::g_flip.load(std::memory_order_relaxed);
+						const uint64_t now  = Sync::ReadReferenceClock();
 						if (s_frozen_flip.exchange(flip) != flip) {
-							s_frozen_value.store(Sync::ReadReferenceClock());
+							s_frozen_value.store(now);
 						}
-						value = s_frozen_value.load();
+						const uint64_t base = s_frozen_value.load();
+						value = s_freeze ? base : base + (now > base ? (now - base) / s_scale : 0);
 					} else {
 						value = Sync::ReadReferenceClock();
 					}

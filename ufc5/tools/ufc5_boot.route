@@ -1,0 +1,9 @@
+wait 1.0
+tap cross
+wait 5.0
+shot
+stick r down 3.0
+wait 0.4
+tap cross
+wait 4.0
+shot
