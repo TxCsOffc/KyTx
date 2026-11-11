@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "metalComputeCaseRunner.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -37298,6 +37299,116 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+int RunMetalCases() {
+  using namespace Libs::Graphics;
+  const auto tests = MakeCases();
+  std::printf("MetalCases: total=%zu\n", tests.size());
+  uint32_t passed = 0, failed = 0, skipped = 0;
+  for (const auto &test : tests) {
+    bool uses_image = std::any_of(test.opcodes.begin(), test.opcodes.end(), [](auto op) {
+      return op >= ShaderOpcode::IMAGE_GET_RESINFO && op <= ShaderOpcode::IMAGE_GATHER4H;
+    });
+    if (test.compile_only || uses_image) {
+      std::printf("[metal] %s skip %s\n", test.name,
+                  test.compile_only ? "compile_only" : "image_or_sampler");
+      ++skipped;
+      continue;
+    }
+    auto compiled = CompileCase(test, 32);
+    bool has_image_or_sampler = false;
+    bool has_flattened_srt = false;
+    for (const auto &binding : compiled.program.bindings.descriptors) {
+      if (binding.kind == ShaderRecompiler::IR::DescriptorBindingKind::Buffers ||
+          binding.kind == ShaderRecompiler::IR::DescriptorBindingKind::Gds ||
+          binding.kind == ShaderRecompiler::IR::DescriptorBindingKind::ShaderData ||
+          binding.kind == ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) {
+        if (binding.kind == ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) has_flattened_srt = true;
+      } else {
+        has_image_or_sampler = true;
+      }
+    }
+    if (has_image_or_sampler || has_flattened_srt) {
+      std::printf("[metal] %s skip %s\n", test.name,
+                  has_flattened_srt ? "flattened_srt" : "image_or_sampler");
+      ++skipped;
+      continue;
+    }
+    ShaderComputeInputInfo compute_info = test.compute_info;
+    compute_info.host_subgroup_size = 32;
+
+    ShaderRecompiler::IR::PushData push;
+    if (compiled.program.bindings.UsesPushData()) {
+      std::copy(compiled.packed_user_data.begin(), compiled.packed_user_data.end(),
+                push.dwords.begin() + compiled.program.bindings.push_data_start_dword);
+    }
+
+    size_t init_max = test.initial.size() > test.expected.size() ? test.initial.size() : test.expected.size();
+    size_t dwords = init_max > 1 ? init_max : 1;
+    std::vector<uint32_t> buffer(dwords, 0);
+    std::copy(test.initial.begin(), test.initial.end(), buffer.begin());
+    uint32_t buffer_bytes = static_cast<uint32_t>(dwords * 4u);
+    if (test.storage_buffer_range_dwords != 0) {
+      buffer_bytes = static_cast<uint32_t>(test.storage_buffer_range_dwords * 4u) +
+                     (test.storage_buffer_offsets.empty() ? 0 : test.storage_buffer_offsets[0]);
+    }
+
+    std::vector<uint32_t> gds_storage;
+    std::vector<uint32_t> *gds = nullptr;
+    const ShaderRecompiler::IR::DescriptorBinding *gds_binding = ShaderRecompiler::IR::FindBinding(compiled.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds);
+    if (gds_binding != nullptr) {
+      size_t gds_max = test.gds_initial.size() > test.expected_gds.size() ? test.gds_initial.size() : test.expected_gds.size();
+      gds_storage.resize(gds_max > 1 ? gds_max : 1);
+      std::copy(test.gds_initial.begin(), test.gds_initial.end(), gds_storage.begin());
+      std::fill(gds_storage.begin() + test.gds_initial.size(), gds_storage.end(), 0);
+      gds = &gds_storage;
+    }
+
+    std::string error;
+    bool ok = KytxMetalCases::Run(compiled.program, compute_info, push, buffer, buffer_bytes, gds,
+                                  test.dispatch_x, test.dispatch_y, test.dispatch_z, error);
+    if (!ok) {
+      std::printf("[metal] %s FAIL run:%s\n", test.name, error.c_str());
+      ++failed;
+      continue;
+    }
+
+    std::string reason;
+    std::vector<uint32_t> compare_expected = test.expected;
+    std::vector<uint32_t> compare_gds = test.expected_gds;
+    if (std::getenv("KYTX_METAL_CASES_CORRUPT")) {
+      if (!compare_expected.empty()) compare_expected[0] ^= 1u;
+      else if (!compare_gds.empty()) compare_gds[0] ^= 1u;
+    }
+    for (size_t i = 0; i < compare_expected.size(); ++i) {
+      if (buffer[i] != compare_expected[i]) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "buffer[%zu]: got %#x expected %#x", i, buffer[i], compare_expected[i]);
+        reason = buf;
+        break;
+      }
+    }
+    if (reason.empty() && gds != nullptr) {
+      for (size_t i = 0; i < compare_gds.size(); ++i) {
+        if (gds_storage[i] != compare_gds[i]) {
+          char buf[256];
+          std::snprintf(buf, sizeof(buf), "gds[%zu]: got %#x expected %#x", i, gds_storage[i], compare_gds[i]);
+          reason = buf;
+          break;
+        }
+      }
+    }
+    if (reason.empty()) {
+      std::printf("[metal] %s ok\n", test.name);
+      ++passed;
+    } else {
+      std::printf("[metal] %s FAIL %s\n", test.name, reason.c_str());
+      ++failed;
+    }
+  }
+  std::printf("MetalCases: passed=%u failed=%u skipped=%u\n", passed, failed, skipped);
+  return 0;
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -37306,6 +37417,7 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--metal-cases") == 0) return RunMetalCases();
   if (argc >= 2 && (std::strcmp(argv[1], "--detile-replay") == 0 ||
                     std::strcmp(argv[1], "--detile-replay-self-test") == 0 ||
                     std::strcmp(argv[1], "--detile-upload-pair") == 0)) {

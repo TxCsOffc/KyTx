@@ -619,6 +619,11 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+if (APPLE)
+	target_sources(shader_recompiler_compute_tests PRIVATE "${KYTY_TESTS_DIR}/metalComputeCaseRunner.mm")
+	set_source_files_properties("${KYTY_TESTS_DIR}/metalComputeCaseRunner.mm" PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+	target_link_libraries(shader_recompiler_compute_tests "-framework Metal" "-framework Foundation")
+endif()
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
