@@ -2594,7 +2594,9 @@ struct Emitter {
 			case IR::ValueOpcode::BufferAtomicUMin32:
 			case IR::ValueOpcode::BufferAtomicUMax32:
 			case IR::ValueOpcode::BufferAtomicSMin32:
-			case IR::ValueOpcode::BufferAtomicSMax32: {
+			case IR::ValueOpcode::BufferAtomicSMax32:
+			case IR::ValueOpcode::BufferAtomicFMin32:
+			case IR::ValueOpcode::BufferAtomicFMax32: {
 				// 32-bit device atomics on a storage buffer: the result is the old value. Lanes whose
 				// condition is false or whose index is past the buffer end contribute 0 and do not write.
 				// Operands follow the SPIR-V EmitAtomicOperation convention: value at NumArgs-2 (CmpSwap:
@@ -2621,6 +2623,26 @@ struct Emitter {
 					     << "\t\t\t\tatomic_compare_exchange_weak_explicit((device atomic_uint*)" << elem
 					     << ", &kyty_exp, " << desired << ", memory_order_relaxed, memory_order_relaxed);\n"
 					     << "\t\t\t\t" << Name(inst) << " = kyty_exp;\n\t\t\t}\n";
+				} else if (op == IR::ValueOpcode::BufferAtomicFMin32 ||
+					   op == IR::ValueOpcode::BufferAtomicFMax32) {
+					// 32-bit float buffer atomic min/max: RDNA semantics (see the SPIR-V path's
+					// EmitFloatAtomicReplacement) are not a plain MSL fmin/fmax - a NaN operand wins
+					// over the other, and the sign of an exact zero is preserved. MSL's
+					// atomic_compare_exchange_weak_explicit only compares whole uints, so retry the
+					// loop until the compare succeeds, combining old and value with the RDNA rule.
+					const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
+					const bool      max_value = op == IR::ValueOpcode::BufferAtomicFMax32;
+					body << "\t\t\t{\n";
+					body << "\t\t\t\tuint kyty_old = atomic_load_explicit((device atomic_uint*)" << elem
+					     << ", memory_order_relaxed);\n";
+					body << "\t\t\t\tfor (;;) {\n";
+					body << "\t\t\t\t\tuint kyty_new = kyty_float_atomic_combine(kyty_old, " << value
+					     << ", " << (max_value ? "true" : "false") << ");\n";
+					body << "\t\t\t\t\tif (atomic_compare_exchange_weak_explicit((device atomic_uint*)" << elem
+					     << ", &kyty_old, kyty_new, memory_order_relaxed, memory_order_relaxed)) break;\n";
+					body << "\t\t\t\t}\n";
+					body << "\t\t\t\t" << Name(inst) << " = kyty_old;\n";
+					body << "\t\t\t}\n";
 				} else {
 					const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
 					const char* fn = "atomic_fetch_add_explicit";
@@ -3459,6 +3481,26 @@ inline float kyty_fmax(float a, float b) {
 	if (isnan(b)) return a;
 	if (a == b) return as_type<float>(as_type<uint>(a) & as_type<uint>(b));
 	return a > b ? a : b;
+}
+// 32-bit buffer float atomic min/max: the RDNA rule from EmitFloatAtomicReplacement, expressed on
+// float bits so it matches the SPIR-V path exactly. A NaN operand (quiet or signalling) yields the
+// other operand; min(-0,+0) = -0, max(-0,+0) = +0 regardless of order. `max_value` selects min vs max.
+inline uint kyty_float_atomic_combine(uint old_bits, uint value_bits, bool max_value) {
+	// RDNA classify: nan requires exponent 0x7f800000 with a non-zero mantissa (so +/-inf are not
+	// nan), zero means exactly +/-0 (denorms are not zero). Mirrors EmitClassifyF32Bits.
+	const uint old_nan   = ((old_bits & 0x7f800000u) == 0x7f800000u) && ((old_bits & 0x007fffffu) != 0u) ? 1u : 0u;
+	const uint value_nan = ((value_bits & 0x7f800000u) == 0x7f800000u) && ((value_bits & 0x007fffffu) != 0u) ? 1u : 0u;
+	const uint old_zero  = (old_bits & 0x7fffffffu) == 0u ? 1u : 0u;
+	const uint value_zero = (value_bits & 0x7fffffffu) == 0u ? 1u : 0u;
+	// A NaN operand, or two exact signed zeros, leaves the buffer unchanged (the old value wins);
+	// this mirrors EmitFloatAtomicReplacement, where such cases select `old`.
+	if (old_nan | value_nan | (old_zero & value_zero)) return old_bits;
+	// Ordered key from EmitFloatAtomicReplacement: sign-flipped for negatives, sign-bit XORed for
+	// non-negatives, so the key increases with the float value.
+	const uint old_key   = (old_bits & 0x80000000u) != 0u ? ~old_bits : (old_bits ^ 0x80000000u);
+	const uint value_key = (value_bits & 0x80000000u) != 0u ? ~value_bits : (value_bits ^ 0x80000000u);
+	const bool take_value = max_value ? (value_key > old_key) : (value_key < old_key);
+	return take_value ? value_bits : old_bits;
 }
 )";
 	bool uses_trig = false;
