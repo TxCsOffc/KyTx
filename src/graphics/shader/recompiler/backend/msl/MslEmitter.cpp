@@ -126,6 +126,11 @@ struct Emitter {
 	// the results of half 1 named "<name>_h"; half_ is the half being emitted.
 	bool     pair_ = false;
 	bool     nan_trace_ = false; // KYTY_MSL_NAN_TRACE=<pixel shader hash>[,<hash>...]: remember the first float result that is NaN
+	// KYTY_MSL_LOOP_TRIP=<guest hash>:<limit> (diagnostic, GDS kernels only): every structured loop counts its iterations; past
+	// <limit> it adds 1 to GDS[16376 + id % 8], stores id + 1 into GDS[16368] and leaves the loop, so the watchdog report
+	// (KYTY_LOOP_TRIP_GDS=1) names a runaway loop instead of the GPU hanging. Never on by default: it changes results once it trips.
+	uint64_t loop_trip_limit_ = 0;
+	uint32_t loop_trip_next_  = 0;
 	bool     store_trace_ = false; // KYTY_MSL_STORE_TRACE=<guest hash,...>: active raw dword store ranges and float-bit NaN counts
 	std::set<uint32_t> value_trace_; // KYTY_MSL_VALUE_TRACE=<guest hash>,<id>,...: first guest lanes' scalar values
 	std::string value_at_ = "all(tgid == uint3(0u)) && liid == 0u"; // KYTY_MSL_VALUE_AT=<gx>,<gy>,<gz>,<lane>: the thread whose values are traced (default group 0, lane 0)
@@ -2080,7 +2085,16 @@ struct Emitter {
 				const auto merge = BlockIndex(term.merge_block);
 				if (merge >= program.blocks.size() || merge == index) return false;
 				loops.emplace_back(index, merge);
-				body << "\twhile (true) {\n";
+				if (loop_trip_limit_ != 0) {
+					const uint32_t id = loop_trip_next_++;
+					body << "\tuint kyty_trip_" << id << " = 0u;\n";
+					body << "\twhile (true) {\n";
+					body << "\t\tif (++kyty_trip_" << id << " > " << loop_trip_limit_ << "u) { atomic_fetch_add_explicit(&ab.gds[16376u + "
+					     << (id % 8u) << "u], 1u, memory_order_relaxed); atomic_store_explicit(&ab.gds[16368u], " << (id + 1u)
+					     << "u, memory_order_relaxed); break; }\n";
+				} else {
+					body << "\twhile (true) {\n";
+				}
 				if (!EmitStructuredRegion(index, UINT32_MAX, loops, seen, depth + 1, index)) return false;
 				body << "\t}\n";
 				loops.pop_back();
@@ -3187,6 +3201,16 @@ std::string Emitter::Emit() {
 			if (end == p) break;
 			nan_trace_ = nan_trace_ || hash == program.shader_hash;
 			p = *end == ',' ? end + 1 : end;
+		}
+	}
+	if (const char* trip = std::getenv("KYTY_MSL_LOOP_TRIP"); trip != nullptr) {
+		char* end = nullptr;
+		const uint64_t hash = std::strtoull(trip, &end, 16);
+		const bool gds = std::any_of(program.bindings.descriptors.begin(), program.bindings.descriptors.end(),
+		                             [](const auto& b) { return b.kind == IR::DescriptorBindingKind::Gds; });
+		if (end != trip && *end == ':' && hash == program.shader_hash && gds) {
+			loop_trip_limit_ = std::strtoull(end + 1, nullptr, 0);
+			std::fprintf(stderr, "[LoopTrip] guest=0x%016llx limit=%llu\n", (unsigned long long)hash, (unsigned long long)loop_trip_limit_);
 		}
 	}
 	if (const char* trace = std::getenv("KYTY_MSL_STORE_TRACE"); trace != nullptr && program.stage == ShaderType::Compute) {
