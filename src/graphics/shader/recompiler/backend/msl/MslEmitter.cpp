@@ -2995,6 +2995,9 @@ void Emitter::EmitAlu(const Inst& inst) {
 		case IR::ValueOpcode::FPAdd32: EmitAssignment(inst, Binary(inst, "+")); return;
 		case IR::ValueOpcode::FPSub32: EmitAssignment(inst, Binary(inst, "-")); return;
 		case IR::ValueOpcode::FPMul32: EmitAssignment(inst, Binary(inst, "*")); return;
+		case IR::ValueOpcode::FPLdexp:
+			EmitAssignment(inst, "ldexp(" + Expr(inst.Arg(0)) + ", clamp((int)" + Expr(inst.Arg(1)) + ", -512, 512))");
+			return;
 		case IR::ValueOpcode::FPFma32:
 			EmitAssignment(inst, "fma(" + Expr(inst.Arg(0)) + ", " + Expr(inst.Arg(1)) + ", " +
 			                        Expr(inst.Arg(2)) + ")");
