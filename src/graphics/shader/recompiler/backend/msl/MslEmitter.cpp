@@ -2956,6 +2956,18 @@ void Emitter::EmitAlu(const Inst& inst) {
 		case IR::ValueOpcode::ULessThanEqual32: EmitAssignment(inst, Binary(inst, "<=")); return;
 		case IR::ValueOpcode::UGreaterThan32: EmitAssignment(inst, Binary(inst, ">")); return;
 		case IR::ValueOpcode::UGreaterThanEqual32: EmitAssignment(inst, Binary(inst, ">=")); return;
+		case IR::ValueOpcode::IEqual64: EmitAssignment(inst, Binary(inst, "==")); return;
+		case IR::ValueOpcode::INotEqual64: EmitAssignment(inst, Binary(inst, "!=")); return;
+		case IR::ValueOpcode::ULessThan64: EmitAssignment(inst, Binary(inst, "<")); return;
+		case IR::ValueOpcode::ULessThanEqual64: EmitAssignment(inst, Binary(inst, "<=")); return;
+		case IR::ValueOpcode::UGreaterThan64: EmitAssignment(inst, Binary(inst, ">")); return;
+		case IR::ValueOpcode::UGreaterThanEqual64: EmitAssignment(inst, Binary(inst, ">=")); return;
+		case IR::ValueOpcode::SLessThan64:
+			EmitAssignment(inst, "((long)" + Expr(inst.Arg(0)) + " < (long)" + Expr(inst.Arg(1)) + ")");
+			return;
+		case IR::ValueOpcode::SLessThanEqual64:
+			EmitAssignment(inst, "((long)" + Expr(inst.Arg(0)) + " <= (long)" + Expr(inst.Arg(1)) + ")");
+			return;
 		case IR::ValueOpcode::SLessThan32:
 			EmitAssignment(inst, "((int)" + Expr(inst.Arg(0)) + " < (int)" + Expr(inst.Arg(1)) + ")");
 			return;
