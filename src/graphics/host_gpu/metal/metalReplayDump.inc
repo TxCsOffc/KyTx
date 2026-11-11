@@ -83,6 +83,10 @@ static bool ReplayDumpPhase(NSString* dir, NSString* phase,
 			@"backing" : @(key)
 		}];
 	}
+	// KYTY_REPLAY_SKIP_BUFFERS / KYTY_REPLAY_SKIP_IMAGES (diagnostic): leave that half of the capture out.
+	static const bool s_skip_buffers = KYTY_ENV("KYTY_REPLAY_SKIP_BUFFERS") != nullptr;
+	static const bool s_skip_images  = KYTY_ENV("KYTY_REPLAY_SKIP_IMAGES") != nullptr;
+	if (s_skip_buffers) ranges.clear();
 	for (const auto& [key, r]: ranges) {
 		const uint64_t bytes = r.last - r.first;
 		NSString*      name =
@@ -111,7 +115,7 @@ static bool ReplayDumpPhase(NSString* dir, NSString* phase,
 	}
 	for (size_t i = 0; i < images.size(); ++i) {
 		id<MTLTexture> t = images[i];
-		if (!t) continue;
+		if (!t || s_skip_images) continue;
 		const auto f     = t.pixelFormat;
 		uint32_t   block = 1, bpp = BytesPerPixel(f);
 		if (IsCompressedFormat(f)) {

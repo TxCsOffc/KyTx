@@ -10374,6 +10374,22 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 		// The capture holds the exact inputs; the kernel is not encoded.
 		if (gds_trip) GdsTripFinish(replay_dir, prog.guest_hash, cs_hash, gds_trip_value, before_ok);
 	}
+	// KYTY_GDS_TRIP_DRAIN=1 (diagnostic): the checked GDS kernel's pre-dispatch work (bindings, imports) completes on the GPU
+	// before the kernel itself is encoded, without capturing anything.
+	if (!replay_dir && compute_info.stage.program && GdsTrip().on && KYTY_ENV("KYTY_GDS_TRIP_DRAIN") != nullptr &&
+	    (GdsTrip().hash == trip_guest || GdsTrip().hash == cs_hash)) {
+		MetalContext::Instance().CommitCommandBuffer(true);
+		if (!MetalDrawExecutor::Instance().BeginComputePass()) return;
+		MetalDrawExecutor::Instance().SetComputePipeline(pstate);
+		MetalDrawExecutor::Instance().SetComputeBytes(&push_data, sizeof(push_data), 1);
+		MetalDrawExecutor::Instance().SetComputeBytes(sizes, sizeof(sizes), 25);
+		MetalDrawExecutor::Instance().SetComputeBytes(arg_ptrs, sizeof(arg_ptrs), 0);
+		for (id<MTLResource> r: cs_residency) MetalDrawExecutor::Instance().UseResource(r, ResidencyUsage(r));
+		if (replay_srt.buffer) MetalDrawExecutor::Instance().UseResource(replay_srt.buffer, MTLResourceUsageRead);
+		if (nan_dbg) MetalDrawExecutor::Instance().SetComputeBuffer(nan_dbg, 0, 28);
+		if (store_dbg) MetalDrawExecutor::Instance().SetComputeBuffer(store_dbg, 0, 27);
+		if (value_dbg) MetalDrawExecutor::Instance().SetComputeBuffer(value_dbg, 0, 29);
+	}
 	for (auto& writeback:canonical_writes) MetalContext::Instance().QueueEncoderWriteback(std::move(writeback));
 	if (indirect_args) {
 		MetalDrawExecutor::Instance().DispatchIndirect(indirect_args, 0, host_w, host_h, host_d);
