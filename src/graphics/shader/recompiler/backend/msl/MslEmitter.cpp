@@ -768,8 +768,8 @@ struct Emitter {
 	                                     const std::string& raw) {
 		const uint32_t bits = info.component_bits[component];
 		switch (info.type) {
-			case Format::ComponentType::Uint:
-			case Format::ComponentType::Sint: return raw;
+			case Format::ComponentType::Uint: return raw;
+			case Format::ComponentType::Sint: return SignExtendBits(raw, bits);
 			case Format::ComponentType::Uscaled:
 				return "as_type<uint>(float(" + raw + "))";
 			case Format::ComponentType::Sscaled:
@@ -786,6 +786,18 @@ struct Emitter {
 			case Format::ComponentType::Float:
 				if (bits == 16u) {
 					return "as_type<uint>(float(as_type<half>(ushort(" + raw + "))))";
+				} else if (bits == 11u || bits == 10u) {
+					const uint32_t M = bits - 5u;
+					const uint32_t mantissa_mask = (1u << M) - 1u;
+					const std::string mantissa_shift = std::to_string(23u - M);
+					const std::string exp = "(" + raw + " >> " + std::to_string(M) + "u)";
+					const std::string mant = "(" + raw + " & " + U32Literal(mantissa_mask) + ")";
+					// e == 0: denormal, exact constant 0x1p-(14+M)f
+					const std::string denormal_const = (M == 6u ? "0x1p-20f" : "0x1p-19f");
+					const std::string denormal = "(as_type<uint>(float(" + mant + ") * " + denormal_const + "))";
+					const std::string inf = "(0x7f800000u | (" + mant + " << " + mantissa_shift + "u))";
+					const std::string normal = "(((" + exp + " + 112u) << 23u) | (" + mant + " << " + mantissa_shift + "u))";
+					return "((" + exp + " == 0u) ? " + denormal + " : ((" + exp + " == 31u) ? " + inf + " : " + normal + "))";
 				}
 				return raw;
 			default: return raw;
