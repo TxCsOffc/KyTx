@@ -9070,7 +9070,25 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 	}
 	// KYTY_MSL_PROGRESS=<guest hash>: clear the kernel's progress slots and arrival masks (GDS[8192 .. 9600 + 2048)) before it is
 	// encoded, so after a hang a zero slot is a simdgroup that never stored anything in this dispatch (no packet is in flight here).
-	if (const char* prog = KYTY_ENV("KYTY_MSL_PROGRESS"); prog != nullptr && trip_guest != 0 && std::strtoull(prog, nullptr, 16) == trip_guest) {
+	// KYTY_GDS_STATE_LOG=<guest hash>: every non-zero GDS dword when that kernel is encoded (first 40 dispatches; no packet in flight).
+	if (const char* gl = KYTY_ENV("KYTY_GDS_STATE_LOG"); gl != nullptr && trip_guest != 0 && std::strtoull(gl, nullptr, 16) == trip_guest) {
+		static std::atomic<uint32_t> s_gl_n {0};
+		if (s_gl_n.fetch_add(1) < 40) {
+			const auto* g = static_cast<const uint32_t*>([GdsBuffer() contents]);
+			std::string text;
+			for (uint32_t i = 0; i < 16384; ++i) {
+				if (g[i] == 0) continue;
+				char item[32];
+				std::snprintf(item, sizeof(item), " %u:%x", i, g[i]);
+				text += item;
+			}
+			std::fprintf(stderr, "[GdsState] flip=%llu cs=%016llx%s\n", (unsigned long long)Libs::Graphics::TraceWindow::g_flip.load(),
+			             (unsigned long long)cs_hash, text.c_str());
+		}
+	}
+	// KYTY_MSL_PROGRESS_NOCLEAR=1 keeps the tags but skips this CPU clear (pg3/pg4 never hung with it: tell the clear from the kernel change).
+	if (const char* prog = KYTY_ENV("KYTY_MSL_PROGRESS"); prog != nullptr && KYTY_ENV("KYTY_MSL_PROGRESS_NOCLEAR") == nullptr && trip_guest != 0 &&
+	    std::strtoull(prog, nullptr, 16) == trip_guest) {
 		std::memset(static_cast<uint32_t*>([GdsBuffer() contents]) + 8192, 0, (9600 + 2048 - 8192) * sizeof(uint32_t));
 	}
 	uint32_t   gds_trip_value = 0;
