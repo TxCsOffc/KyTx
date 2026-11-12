@@ -1693,9 +1693,9 @@ struct Emitter {
 					const std::string target = "((lane & ~31u) | ((" + Expr(inst.Arg(1)) +
 					                           " >> 2) & 31u))";
 					// ds_bpermute_b32: returns 0 when the SOURCE lane (the target) is inactive.
-					EmitAssignment(inst, "simd_shuffle(uint(" + Expr(inst.Arg(2)) + "), (ushort)(" + target +
+					EmitAssignment(inst, "(simd_shuffle(uint(" + Expr(inst.Arg(2)) + "), (ushort)(" + target +
 					                   " & 31u)) != 0u ? simd_shuffle(" + Expr(inst.Arg(0)) +
-					                   ", (ushort)(" + target + " & 31u)) : 0u");
+					                   ", (ushort)(" + target + " & 31u)) : 0u)");
 					return;
 				}
 			case IR::ValueOpcode::SwizzleU32: {
@@ -2812,6 +2812,47 @@ struct Emitter {
 						     << " atomic_fetch_add_explicit(kyty_store_dbg + " << 257u + mem.resource << "u, _hn, memory_order_relaxed); }";
 					}
 					body << " }\n";
+				}
+				body << "\t\t}\n";
+				return;
+			}
+			case IR::ValueOpcode::SharedAtomicOr64:
+			case IR::ValueOpcode::SharedAtomicIAdd64: {
+				// 64-bit LDS atomic: the guest value spans two dwords. When the condition is set and both dwords
+				// (d and d+1) are inside the array, lower to two 32-bit atomics on the same slot. Or64 does an
+				// atomic_or on each dword independently. IAdd64 adds the low dword and propagates the carry into
+				// the high dword (unsigned wrap detection on the low add). Both are Void, so no result is stored.
+				const auto& mem   = Mem(inst);
+				const auto  op    = inst.GetOpcode();
+				const bool  compute = program.stage == ShaderType::Compute || program.stage == ShaderType::Mesh;
+				const bool  gds   = GdsMem(mem);
+				const std::string limit = std::to_string(gds ? kMslGdsDwords : LdsDwords()) + "u";
+				// ds_or_b64 / ds_add_u64: the 64-bit address wraps at 64 KiB and ignores its low three bits (DsAtomic64Bounds:
+				// 0x10007 + offset 2 -> 8).
+				const std::string d     = "(((" + LdsByte(inst, mem) + ") & 0xfff8u) >> 2)";
+				const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
+				const std::string cond  = Expr(inst.Arg(inst.NumArgs() - 1));
+				const std::string space = gds ? "device" : "threadgroup";
+				const std::string slot  = gds ? "ab.gds[" + d + "]" : "kyty_lds[" + d + "]";
+				// Both dwords must be inside the array: d < limit and d + 1 < limit.
+				body << "\t\tif (" << cond << " && " << d << " + 1u < " << limit << ") {\n";
+				if (!compute) {
+					Unsupported(inst, "graphics shared atomic requires shared execution");
+				} else if (op == IR::ValueOpcode::SharedAtomicOr64) {
+					body << "\t\t\t{\n\t\t\t\t" << space << " atomic_uint* kyty_p0 = (" << space << " atomic_uint*)&" << slot << ";\n"
+					     << "\t\t\t\tatomic_fetch_or_explicit(kyty_p0, uint(" << value << "), memory_order_relaxed);\n"
+					     << "\t\t\t\t" << space << " atomic_uint* kyty_p1 = (" << space << " atomic_uint*)&" << slot << " + 1u;\n"
+					     << "\t\t\t\tatomic_fetch_or_explicit(kyty_p1, uint(" << value << " >> 32u), memory_order_relaxed);\n"
+					     << "\t\t\t}\n";
+				} else {
+					// IAdd64: add the low dword, detect unsigned carry, add (high + carry) to the high dword.
+					body << "\t\t\t{\n\t\t\t\t" << space << " atomic_uint* kyty_p0 = (" << space << " atomic_uint*)&" << slot << ";\n"
+					     << "\t\t\t\t" << space << " atomic_uint* kyty_p1 = (" << space << " atomic_uint*)&" << slot << " + 1u;\n"
+					     << "\t\t\t\tuint kyty_lo = uint(" << value << ");\n"
+					     << "\t\t\t\tuint kyty_old_lo = atomic_fetch_add_explicit(kyty_p0, kyty_lo, memory_order_relaxed);\n"
+					     << "\t\t\t\tuint kyty_carry = (kyty_old_lo + kyty_lo < kyty_old_lo) ? 1u : 0u;\n"
+					     << "\t\t\t\tatomic_fetch_add_explicit(kyty_p1, uint(" << value << " >> 32u) + kyty_carry, memory_order_relaxed);\n"
+					     << "\t\t\t}\n";
 				}
 				body << "\t\t}\n";
 				return;
