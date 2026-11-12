@@ -768,6 +768,14 @@ struct Emitter {
 		return "(" + expr + ")";
 	}
 
+	// A buffer load with GLC/DLC bypasses the per-CU caches on RDNA (another workgroup's store is seen: a published flag or ticket
+	// polled in a loop). Plain MSL device loads may be served from a non-coherent cache or hoisted out of the loop: read such a word
+	// with a device-coherent atomic load instead (the SPIR-V path marks these accesses Volatile).
+	static std::string CoherentWord(const IR::MemoryInfo& mem, const std::string& ptr, const std::string& index) {
+		if (!mem.coherent) return ptr + "[" + index + "]";
+		return "atomic_load_explicit((device atomic_uint*)&" + ptr + "[" + index + "], memory_order_relaxed)";
+	}
+
 	std::string BufferDword(const Inst& inst, const IR::MemoryInfo& mem, uint32_t packed, uint32_t extra = 0) {
 		return "(" + BufferByte(inst, mem, packed, extra) + " >> 2)";
 	}
@@ -2600,7 +2608,7 @@ struct Emitter {
 							const std::string index = BufferSwizzled(packed) ? BufferDword(inst, mem, packed, i * 4u) : d + " + " + component;
 							const std::string bounds = BufferSwizzled(packed) ? index + " < " + n :
 							    d + " < " + n + " && " + component + " < " + n + " - " + d;
-							result += "(" + Expr(inst.Arg(inst.NumArgs() - 1)) + " && " + bounds + " ? " + *ptr + "[" + index + "] : 0u)";
+							result += "(" + Expr(inst.Arg(inst.NumArgs() - 1)) + " && " + bounds + " ? " + CoherentWord(mem, *ptr, index) + " : 0u)";
 						}
 						if (count > 1) result += ")";
 						EmitAssignment(inst, result);
@@ -2645,7 +2653,7 @@ struct Emitter {
 					const std::string index = BufferSwizzled(packed) ? BufferDword(inst, mem, packed, i * 4u) : d + " + " + component;
 					const std::string bounds = BufferSwizzled(packed) ? index + " < " + n :
 					    d + " < " + n + " && " + component + " < " + n + " - " + d;
-					result += "(" + Expr(inst.Arg(inst.NumArgs() - 1)) + " && " + bounds + " ? " + *ptr + "[" + index + "] : 0u)";
+					result += "(" + Expr(inst.Arg(inst.NumArgs() - 1)) + " && " + bounds + " ? " + CoherentWord(mem, *ptr, index) + " : 0u)";
 				}
 				if (count > 1) result += ")";
 				EmitAssignment(inst, result);
