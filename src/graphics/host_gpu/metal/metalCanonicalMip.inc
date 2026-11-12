@@ -2,6 +2,16 @@
 // to physical guest bytes at every producer boundary; no frame-age or sampled
 // hash can make a private copy authoritative. This intentionally trades copies
 // for correctness until a lazy range tracker replaces it.
+// Diagnostic scope: split each actual import, including imports reached during
+// resource preparation, rather than only the final image-binding loop.
+static thread_local bool s_split_canonical_imports=false;
+class CanonicalImportDiagnosticScope {
+public:
+	explicit CanonicalImportDiagnosticScope(bool enabled):previous_(s_split_canonical_imports){s_split_canonical_imports=enabled;}
+	~CanonicalImportDiagnosticScope(){s_split_canonical_imports=previous_;}
+private:
+	bool previous_;
+};
 static std::map<uint64_t,uint64_t> s_canonical_mip_ranges; // physical [begin,end)
 static uint64_t s_canonical_mapping_generation=UINT64_MAX;
 static std::vector<PhysicalMapping> s_canonical_mappings;
@@ -210,6 +220,17 @@ static CanonicalMipBinding CanonicalMipImage(const ShaderTextureResource& tex,ui
 	const bool reopen=MetalContext::Instance().GetActiveRenderEncoder()!=nil && s_last_pass_valid;
 	MetalDrawExecutor::Instance().EndRenderPass();
 	id<MTLCommandBuffer> command=MetalContext::Instance().GetCurrentCommandBuffer();
+	if(s_split_canonical_imports) {
+		std::fprintf(stderr,"[CanonicalImport] drain prior work addr=%llx tile=%u %ux%u\n",
+		    (unsigned long long)addr,unsigned(tex.TileMode()),w,h);
+		std::fflush(stderr);
+		MetalContext::Instance().CommitCommandBuffer(true);
+		command=MetalContext::Instance().GetCurrentCommandBuffer();
+		char label[192];std::snprintf(label,sizeof(label),"canonical import addr=0x%llx tile=%u %ux%u fmt=%u",
+		    (unsigned long long)addr,unsigned(tex.TileMode()),w,h,unsigned(tex.Format()));
+		KytyFaultOpSet(label);command.label=[NSString stringWithUTF8String:label];
+		std::fprintf(stderr,"[CanonicalImport] begin %s\n",label);std::fflush(stderr);
+	}
 	GuestWrites::Watch(addr,layout.total_size);
 	*entry.generation=GuestWrites::Begin();
 	if(!guest.Gather(command))RejectMetalState("canonical mip gather failed");
@@ -225,6 +246,11 @@ static CanonicalMipBinding CanonicalMipImage(const ShaderTextureResource& tex,ui
 			    failed.width,failed.height,failed.padded_width,failed.padded_height,(unsigned long long)failed.offset,(unsigned long long)layout.block_slice_size,table_ok,(unsigned long long)table.columns*table.rows*table.block.block_size);
 			RejectMetalState("canonical mip image import failed");
 		}
+	if(s_split_canonical_imports) {
+		MetalContext::Instance().CommitCommandBuffer(true);
+		std::fprintf(stderr,"[CanonicalImport] completed addr=%llx tile=%u %ux%u\n",
+		    (unsigned long long)addr,unsigned(tex.TileMode()),w,h);std::fflush(stderr);
+	}
 	if(reopen) {
 		MetalRenderPassDesc pass=s_last_pass_desc;
 		for(uint32_t i=0;i<pass.color_attachment_count;++i)pass.color_attachments[i].load_action=MTLLoadActionLoad;

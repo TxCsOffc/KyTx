@@ -8942,6 +8942,9 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 		else std::snprintf(fault_label, sizeof(fault_label), "cs hash=0x%016llx", (unsigned long long)cs_hash);
 		KytyFaultOpSet(fault_label);
 	}
+	const bool split_imports=KYTY_ENV("KYTY_GDS_TRIP_SPLIT_IMPORTS")!=nullptr && compute_info.stage.program &&
+	    GdsTrip().on && (GdsTrip().hash==compute_info.stage.program->guest_hash || GdsTrip().hash==cs_hash);
+	CanonicalImportDiagnosticScope import_diagnostic_scope(split_imports);
 	PrepareGpuDetiledSources(compute_info.stage);
 	EXIT_IF(!PrepareLayeredImages(compute_info.stage));
 	std::map<uint32_t,CanonicalMipBinding> canonical_images;
@@ -9094,11 +9097,8 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					}
 				}
 			}
-			for (size_t i = 0; i < 32 && i < snap.user_data.size(); ++i) {
-				if (push_data.dwords[i] == 0) {
-					push_data.dwords[i] = snap.user_data[i];
-				}
-			}
+			// No raw user_data[i] fill-in: GetUserData reads the packed slot push_data_start_dword + i (as the SPIR-V path), and a fill of
+			// "empty" slots overwrote packed registers whose value is 0 with another register.
 		}
 		MetalDrawExecutor::Instance().SetComputeBytes(&push_data, sizeof(push_data), 1);
 
@@ -9373,6 +9373,21 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					id<MTLTexture> texture = nil;
 					const char* via = "";
 					if (auto canonical=canonical_images.find(res);canonical!=canonical_images.end()) {texture=canonical->second.image;via="canonical";}
+					// KYTY_LOG_CANON_IMG=<guest hash>: how each image of that kernel is resolved, against the depth surface and render
+					// target registered at the same address (their sizes decide the tiled layout the bytes were written with).
+					if (const char* lc = KYTY_ENV("KYTY_LOG_CANON_IMG"); lc != nullptr && std::strtoull(lc, nullptr, 16) == cprog.guest_hash) {
+						static std::atomic<uint32_t> s_lc_n {0};
+						if (s_lc_n.fetch_add(1) < 60) {
+							const auto ds = s_depth_by_addr.find(addr);
+							std::fprintf(stderr, "[CanonImg] flip=%llu res=%u storage=%d via=%s addr=0x%llx T#=%ux%u fmt=%u tile=%u lv=%u..%u -> tex=%lux%lu fmt=%lu | depth_at_addr=%s%lux%lu fmt=%lu | T#=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+							             (unsigned long long)Libs::Graphics::TraceWindow::g_flip.load(), res, storage ? 1 : 0, via, (unsigned long long)addr, w, h,
+							             (unsigned)tex.Format(), (unsigned)tex.TileMode(), (unsigned)tex.BaseLevel(), (unsigned)tex.LastLevel(),
+							             texture ? (unsigned long)texture.width : 0ul, texture ? (unsigned long)texture.height : 0ul, texture ? (unsigned long)texture.pixelFormat : 0ul,
+							             ds != s_depth_by_addr.end() ? "yes " : "no ", ds != s_depth_by_addr.end() ? (unsigned long)ds->second.w : 0ul,
+							             ds != s_depth_by_addr.end() ? (unsigned long)ds->second.h : 0ul, ds != s_depth_by_addr.end() ? (unsigned long)ds->second.fmt : 0ul,
+							             tex.fields[0], tex.fields[1], tex.fields[2], tex.fields[3], tex.fields[4], tex.fields[5], tex.fields[6], tex.fields[7]);
+						}
+					}
 					if (texture == nil && !storage && res < cprog.info.images.size()) {
 						texture = DepthWriterForLayeredRead(cprog.info.images[res], tex, addr, w, h);
 						if (texture != nil) via = "depth-layer";
@@ -10396,6 +10411,11 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 	                      (GdsTrip().hash == trip_guest || GdsTrip().hash == cs_hash);
 	if (!split_wb)
 		for (auto& writeback:canonical_writes) MetalContext::Instance().QueueEncoderWriteback(std::move(writeback));
+	if(split_imports) {
+		char label[192];std::snprintf(label,sizeof(label),"cs hash=0x%016llx after separate canonical imports",(unsigned long long)cs_hash);
+		KytyFaultOpSet(label);
+		std::fprintf(stderr,"[CanonicalImport] consumer ready cs=%016llx imports complete\n",(unsigned long long)cs_hash);std::fflush(stderr);
+	}
 	if (indirect_args) {
 		MetalDrawExecutor::Instance().DispatchIndirect(indirect_args, 0, host_w, host_h, host_d);
 	} else {
