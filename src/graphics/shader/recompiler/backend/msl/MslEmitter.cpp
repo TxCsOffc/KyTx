@@ -849,7 +849,8 @@ struct Emitter {
 		    : inst.GetOpcode() == ValueOpcode::LoadBufferU32x2 ? 2u
 		    : inst.GetOpcode() == ValueOpcode::LoadBufferU32x3 ? 3u
 			                                                  : 4u;
-		const uint32_t last_component = count > 0 ? count - 1 : 0u;
+		// A load of more dwords than the format has components transfers only the format's components.
+		const uint32_t last_component = std::min(count, std::max(info.component_count, 1u)) - 1u;
 		const uint32_t transferred_size =
 		    info.packed_bitfield ? 4u : (Format::GetFormatComponentByteOffset(info, last_component) +
 		                                 info.component_bits[last_component] / 8u);
