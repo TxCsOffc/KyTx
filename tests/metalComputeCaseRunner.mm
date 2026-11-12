@@ -39,7 +39,8 @@ bool WaitOrKill(id<MTLCommandBuffer> command) {
 namespace KytxMetalCases {
 
 bool Run(const IR::Program& program, const ShaderComputeInputInfo& compute_info,
-         const IR::PushData& push, std::vector<uint32_t>& buffer, uint32_t buffer_bytes,
+         const IR::PushData& push, std::vector<uint32_t>& buffer, const std::vector<uint32_t>& slot_offsets,
+         const std::vector<uint32_t>& slot_sizes,
          std::vector<uint32_t>* gds, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
          std::string& error) {
 	id<MTLDevice> device = GetDevice();
@@ -87,7 +88,7 @@ bool Run(const IR::Program& program, const ShaderComputeInputInfo& compute_info,
 	// One data buffer behind every buffer slot (as the Vulkan harness binds one storage buffer), one GDS buffer.
 	id<MTLBuffer> data = nil, gds_buffer = nil;
 	if (buffers_binding != nullptr) {
-		data = [device newBufferWithLength:std::max<size_t>(buffer_bytes, buffer.size() * 4u) options:MTLResourceStorageModeShared];
+		data = [device newBufferWithLength:buffer.size() * 4u options:MTLResourceStorageModeShared];
 		std::memset(data.contents, 0, data.length);
 		std::memcpy(data.contents, buffer.data(), buffer.size() * 4u);
 	}
@@ -103,7 +104,7 @@ bool Run(const IR::Program& program, const ShaderComputeInputInfo& compute_info,
 	id<MTLBuffer> argbuf = [device newBufferWithLength:std::max<NSUInteger>(arguments.encodedLength, 16) options:MTLResourceStorageModeShared];
 	[arguments setArgumentBuffer:argbuf offset:0];
 	for (uint32_t i = 0; buffers_binding != nullptr && i < buffers_binding->resources.size(); ++i)
-		[arguments setBuffer:data offset:0 atIndex:static_cast<NSUInteger>(i)];
+		[arguments setBuffer:data offset:(i < slot_offsets.size() ? slot_offsets[i] : 0u) atIndex:static_cast<NSUInteger>(i)];
 	if (gds_buffer != nil) [arguments setBuffer:gds_buffer offset:0 atIndex:161];
 
 	id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -115,7 +116,7 @@ bool Run(const IR::Program& program, const ShaderComputeInputInfo& compute_info,
 	[encoder setBytes:push.dwords.data() length:sizeof(push.dwords) atIndex:1];
 	std::array<uint32_t, 64> sizes {};
 	if (buffers_binding != nullptr) {
-		for (uint32_t i = 0; i < buffers_binding->resources.size(); ++i) sizes[i] = buffer_bytes;
+		for (uint32_t i = 0; i < buffers_binding->resources.size(); ++i) sizes[i] = i < slot_sizes.size() ? slot_sizes[i] : 0u;
 	}
 	[encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:25];
 

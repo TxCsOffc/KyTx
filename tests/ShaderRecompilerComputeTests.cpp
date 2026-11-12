@@ -37346,10 +37346,16 @@ int RunMetalCases() {
     size_t dwords = init_max > 1 ? init_max : 1;
     std::vector<uint32_t> buffer(dwords, 0);
     std::copy(test.initial.begin(), test.initial.end(), buffer.begin());
-    uint32_t buffer_bytes = static_cast<uint32_t>(dwords * 4u);
-    if (test.storage_buffer_range_dwords != 0) {
-      buffer_bytes = static_cast<uint32_t>(test.storage_buffer_range_dwords * 4u) +
-                     (test.storage_buffer_offsets.empty() ? 0 : test.storage_buffer_offsets[0]);
+    // Metal binds each buffer slot at its exact byte offset (the renderer binds V# bases, no push-data adjust):
+    // slot i starts at storage_buffer_offsets[resource]; it sees storage_buffer_range_dwords dwords, or the rest of the buffer.
+    std::vector<uint32_t> slot_offsets, slot_sizes;
+    if (const auto *binding = ShaderRecompiler::IR::FindBinding(compiled.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers)) {
+      for (const auto resource : binding->resources) {
+        const uint32_t offset = resource < test.storage_buffer_offsets.size() ? test.storage_buffer_offsets[resource] : 0u;
+        slot_offsets.push_back(offset);
+        slot_sizes.push_back(test.storage_buffer_range_dwords != 0 ? static_cast<uint32_t>(test.storage_buffer_range_dwords * 4u)
+                                                                   : static_cast<uint32_t>(dwords * 4u) - offset);
+      }
     }
 
     std::vector<uint32_t> gds_storage;
@@ -37364,7 +37370,7 @@ int RunMetalCases() {
     }
 
     std::string error;
-    bool ok = KytxMetalCases::Run(compiled.program, compute_info, push, buffer, buffer_bytes, gds,
+    bool ok = KytxMetalCases::Run(compiled.program, compute_info, push, buffer, slot_offsets, slot_sizes, gds,
                                   test.dispatch_x, test.dispatch_y, test.dispatch_z, error);
     if (!ok) {
       std::printf("[metal] %s FAIL run:%s\n", test.name, error.c_str());
