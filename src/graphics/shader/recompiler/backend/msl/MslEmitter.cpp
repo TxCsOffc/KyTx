@@ -2584,6 +2584,33 @@ struct Emitter {
 				EmitAssignment(inst, result);
 				return;
 			}
+			case IR::ValueOpcode::BufferAtomicAnd64: {
+				// 64-bit buffer atomic-and (a qword): the result is the old qword. Split the qword
+				// into its two dwords and apply atomic_fetch_and_explicit to each, then recombine the
+				// old dwords into the returned ulong. Lanes whose condition is false contribute 0ul.
+				const auto& mem = Mem(inst);
+				const auto  ptr = BufferPtr(mem.resource);
+				if (!ptr || mem.kind != IR::ResourceKind::Buffer || !BufferAddressable(mem.resource) ||
+				    mem.formatted) {
+					Unsupported(inst, "buffer atomic");
+					return;
+				}
+				const std::string d = BufferDword(inst, mem, program.info.buffers[mem.resource].packed_stride);
+				const std::string cond = Expr(inst.Arg(inst.NumArgs() - 1));
+				const std::string n = "(sizes[" + std::to_string(mem.resource) + "] >> 2)";
+				const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
+				const std::string elem = "&" + *ptr + "[" + d + "]";
+				const std::string elem_hi = "&" + *ptr + "[" + d + " + 1u]";
+				body << "\t\t" << Name(inst) << " = 0ul;\n";
+				body << "\t\tif (" << cond << " && " << d << " < " << n << ") {\n";
+				body << "\t\t\tulong kyty_old_lo = atomic_fetch_and_explicit((device atomic_uint*)" << elem
+				     << ", uint(" << value << "), memory_order_relaxed);\n";
+				body << "\t\t\tulong kyty_old_hi = atomic_fetch_and_explicit((device atomic_uint*)" << elem_hi
+				     << ", uint(" << value << " >> 32u), memory_order_relaxed);\n";
+				body << "\t\t\t" << Name(inst) << " = kyty_old_lo | (kyty_old_hi << 32u);\n";
+				body << "\t\t}\n";
+				return;
+			}
 			case IR::ValueOpcode::BufferAtomicSwap32:
 			case IR::ValueOpcode::BufferAtomicCmpSwap32:
 			case IR::ValueOpcode::BufferAtomicIAdd32:
