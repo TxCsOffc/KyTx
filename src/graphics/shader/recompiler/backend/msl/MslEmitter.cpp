@@ -2270,11 +2270,26 @@ struct Emitter {
 			case IR::ValueOpcode::Identity:
 				EmitAssignment(inst, Expr(inst.Arg(0)));
 				return;
-			case IR::ValueOpcode::GetUserData:
-				// Push data is bound at buffer(1); user SGPRs model that block.
-				EmitAssignment(inst, "pc_data.dwords[" +
-				                        std::to_string(IR::RegIndex(inst.Arg(0).ScalarRegister())) + "u]");
+			case IR::ValueOpcode::GetUserData: {
+				// The push block holds the used user registers PACKED: user_data_registers[i]
+				// lives at dword push_data_start_dword + i. Emit 0u when the register is not
+				// part of that block, or when no push data is bound.
+				uint32_t dword = 0u;
+				bool found = false;
+				if (program.bindings.UsesPushData()) {
+					const auto register_index = IR::RegIndex(inst.Arg(0).ScalarRegister());
+					const auto& registers = program.bindings.user_data_registers;
+					const auto iter = std::lower_bound(registers.begin(), registers.end(), register_index);
+					found = (iter != registers.end()) && (*iter == register_index);
+					if (found) {
+						dword = static_cast<uint32_t>(iter - registers.begin());
+					}
+				}
+				std::string expr = found ? ("pc_data.dwords[" + std::to_string(
+					program.bindings.push_data_start_dword + dword) + "u]") : "0u";
+				EmitAssignment(inst, expr);
 				return;
+			}
 			case IR::ValueOpcode::GetBuiltin: EmitBuiltin(inst); return;
 			case IR::ValueOpcode::GetAttribute: EmitGetAttribute(inst); return;
 			case IR::ValueOpcode::SetAttribute: EmitSetAttribute(inst); return;
