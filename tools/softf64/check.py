@@ -2,13 +2,14 @@
 """Judge for tools/softf64/kyty_f64.h: compile it as C++ (uint/ulong typedefs, MSL-compatible subset) and compare every
 function bit-exactly with the host's IEEE double (round to nearest even, denormals kept) on edge values and random inputs."""
 import subprocess, sys, tempfile, re, argparse
-ap=argparse.ArgumentParser(); ap.add_argument("--only", default="add,mul,fma,from_f32,to_f32,from_i32,from_u32,cmp"); ONLY=set(ap.parse_args().only.split(","))
+ap=argparse.ArgumentParser(); ap.add_argument("--only", default="add,mul,fma,rcp,from_f32,to_f32,from_i32,from_u32,cmp"); ONLY=set(ap.parse_args().only.split(","))
 from pathlib import Path
 here = Path(__file__).resolve().parent
-hdr = here / "kyty_f64.h"
-if not hdr.exists():
-    print("kyty_f64.h missing"); print("FAIL"); sys.exit(1)
-text = hdr.read_text()
+inc = here.parent.parent / "src/graphics/shader/recompiler/backend/msl/MslSoftF64.inc"
+if not inc.exists():
+    print("MslSoftF64.inc missing"); print("FAIL"); sys.exit(1)
+raw = inc.read_text()
+text = raw.split('R"KYTYF64(',1)[1].rsplit(')KYTYF64"',1)[0]
 # MSL compatibility: no std::, no includes, no double/float math helpers from libc, no recursion-y C++ features.
 bad = [w for w in ("#include", "std::", "double", "long double", "__int128", "memcpy", "union", "goto") if w in text]
 if bad:
@@ -29,6 +30,7 @@ static inline float as_float(uint u){float f;std::memcpy(&f,&u,4);return f;}
 static inline uint as_uint(float f){uint u;std::memcpy(&u,&f,4);return u;}
 template<class T, class F> static inline T as_type(F v){T t;static_assert(sizeof(T)==sizeof(F));std::memcpy(&t,&v,sizeof(T));return t;}
 #include "kyty_f64.h"
+
 static double D(ulong u){double d;std::memcpy(&d,&u,8);return d;}
 static ulong U(double d){ulong u;std::memcpy(&u,&d,8);return u;}
 static bool same(ulong a, ulong b){ // NaN: any NaN accepted for a NaN result
@@ -58,6 +60,9 @@ int main(){
 #endif
 #if KYTY_TEST_FMA
     r=kyty_f64_fma(a,b,c); if(!same(r,U(std::fma(D(a),D(b),D(c))))) REPORT("fma","%016llx %016llx %016llx -> %016llx want %016llx\n",(unsigned long long)a,(unsigned long long)b,(unsigned long long)c,(unsigned long long)r,(unsigned long long)U(std::fma(D(a),D(b),D(c))));
+#endif
+#if KYTY_TEST_RCP
+    r=kyty_f64_rcp(a); if(!same(r,U(1.0/D(a)))) REPORT("rcp","%016llx -> %016llx want %016llx\n",(unsigned long long)a,(unsigned long long)r,(unsigned long long)U(1.0/D(a)));
 #endif
     uint f=uint(rng()); if(i%7==0) f=uint(edge[rng()%edge.size()]>>32);
 #if KYTY_TEST_FROM_F32
@@ -97,9 +102,10 @@ int main(){
 '''
 with tempfile.TemporaryDirectory() as t:
     defs="".join(f"#define KYTY_TEST_{n.upper()} 1\n" for n in ONLY)
+    (Path(t)/"kyty_f64.h").write_text(text)
     (Path(t)/"h.cpp").write_text(defs+harness)
     exe = Path(t)/"h"
-    c = subprocess.run(["xcrun","clang++","-std=c++20","-O2","-ffp-contract=off","-I",str(here),str(Path(t)/"h.cpp"),"-o",str(exe)],capture_output=True,text=True)
+    c = subprocess.run(["xcrun","clang++","-std=c++20","-O2","-ffp-contract=off","-I",str(t),str(Path(t)/"h.cpp"),"-o",str(exe)],capture_output=True,text=True)
     if c.returncode:
         print("COMPILE ERROR\n"+"\n".join(c.stderr.splitlines()[:30])); print("FAIL"); sys.exit(1)
     r = subprocess.run([str(exe)],capture_output=True,text=True,timeout=600)

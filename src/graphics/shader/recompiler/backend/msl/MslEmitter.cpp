@@ -46,6 +46,9 @@ static bool MslGdsEnabled() { return true; }
 static constexpr uint32_t kMslGdsDwords = 16384u;
 // A GDS access is checked against the bound GDS length (sizes[GdsDwordsWord], at most the 64 KiB GDS), as the SPIR-V path checks it
 // against the bound buffer: a wide access that crosses the end keeps its in-range dwords and drops/zeroes the rest.
+static const char kMslSoftF64[] =
+#include "MslSoftF64.inc"
+    ;
 static std::string GdsLimitExpr() {
 	return "min(sizes[" + std::to_string(Libs::Graphics::ShaderRecompiler::Msl::GdsDwordsWord) + "u], " + std::to_string(kMslGdsDwords) + "u)";
 }
@@ -78,7 +81,7 @@ const char* MslType(IR::Type type) {
 		case IR::Type::F16: return "half";
 		case IR::Type::F32: return "float";
 		case IR::Type::U64: return "ulong";
-		case IR::Type::F64: return "double";
+		case IR::Type::F64: return "ulong";  // raw binary64 bits: Apple GPUs have no 64-bit float (MslSoftF64.inc)
 		case IR::Type::U32x2: return "uint2";
 		case IR::Type::U32x3: return "uint3";
 		case IR::Type::U32x4: return "uint4";
@@ -995,6 +998,15 @@ struct Emitter {
 		return program.stage != ShaderType::Mesh && HasOutInterface() ? " out" : "";
 	}
 
+	[[nodiscard]] bool UsesF64() const {
+		for (const auto* block: program.blocks)
+			for (const auto& inst: *block) {
+				if (inst.GetType() == IR::Type::F64) return true;
+				for (size_t i = 0; i < inst.NumArgs(); ++i)
+					if (inst.Arg(i).GetType() == IR::Type::F64) return true;
+			}
+		return false;
+	}
 	[[nodiscard]] bool UsesLds() const {
 		for (const auto& info: program.memory_info) {
 			if (info.kind == IR::ResourceKind::Lds) {
@@ -3223,6 +3235,20 @@ void Emitter::EmitAlu(const Inst& inst) {
 		case IR::ValueOpcode::ShiftLeftLogical64:
 			EmitAssignment(inst, "(" + Expr(inst.Arg(0)) + " << (" + Expr(inst.Arg(1)) + " & 63u))"); return;
 		case IR::ValueOpcode::IAdd64: EmitAssignment(inst, Binary(inst, "+")); return;
+		// binary64 in software (MslSoftF64.inc, bit-exact with IEEE round-to-nearest-even; judge tools/softf64/check.py).
+		case IR::ValueOpcode::BitCastU64F64:
+		case IR::ValueOpcode::BitCastF64U64: EmitAssignment(inst, Expr(inst.Arg(0))); return;
+		case IR::ValueOpcode::ConvertF64S32: EmitAssignment(inst, "kyty_f64_from_i32(" + Expr(inst.Arg(0)) + ")"); return;
+		case IR::ValueOpcode::ConvertF64U32: EmitAssignment(inst, "kyty_f64_from_u32(" + Expr(inst.Arg(0)) + ")"); return;
+		case IR::ValueOpcode::ConvertF64F32: EmitAssignment(inst, "kyty_f64_from_f32_rdna(as_type<uint>(" + Expr(inst.Arg(0)) + "))"); return;
+		case IR::ValueOpcode::ConvertF32F64: EmitAssignment(inst, "as_type<float>(kyty_f64_to_f32_rdna(" + Expr(inst.Arg(0)) + "))"); return;
+		case IR::ValueOpcode::FPOrdEqual64: EmitAssignment(inst, Call("kyty_f64_eq", inst, 2)); return;
+		case IR::ValueOpcode::FPOrdLessThanEqual64: EmitAssignment(inst, Call("kyty_f64_le", inst, 2)); return;
+		case IR::ValueOpcode::FPOrdGreaterThanEqual64: EmitAssignment(inst, Call("kyty_f64_ge", inst, 2)); return;
+		case IR::ValueOpcode::FPAdd64: EmitAssignment(inst, Call("kyty_f64_add", inst, 2)); return;
+		case IR::ValueOpcode::FPMul64: EmitAssignment(inst, Call("kyty_f64_mul", inst, 2)); return;
+		case IR::ValueOpcode::FPFma64: EmitAssignment(inst, Call("kyty_f64_fma", inst, 3)); return;
+		case IR::ValueOpcode::FPRecip64: EmitAssignment(inst, Call("kyty_f64_rcp", inst, 1)); return;
 		case IR::ValueOpcode::GetShaderBase: EmitAssignment(inst, "0ul"); return;
 		case IR::ValueOpcode::ShiftRightLogical64:
 			EmitAssignment(inst, "(" + Expr(inst.Arg(0)) + " >> (" + Expr(inst.Arg(1)) + " & 63u))"); return;
@@ -3745,6 +3771,16 @@ inline uint kyty_f16_rte(float f) {
 }
 
 )";
+	if (UsesF64()) {
+		out << kMslSoftF64 << "\n";
+		// RDNA conversions on top of IEEE (SPIR-V EmitConvertF32F64/EmitConvertF64F32): a finite f64 of 2^128 or more gives +-FLT_MAX,
+		// f32 denormals are flushed to signed zero on both sides (MODE 0xc0 flushes f32 denormals).
+		out << "inline uint kyty_f64_to_f32_rdna(ulong a) {\n"
+		       "\tconst uint hi = uint(a >> 32), e = hi & 0x7ff00000u;\n"
+		       "\tconst uint r = (e > 0x47e00000u && e < 0x7ff00000u) ? ((hi & 0x80000000u) | 0x7f7fffffu) : kyty_f64_to_f32(a);\n"
+		       "\treturn (r & 0x7f800000u) == 0u ? (r & 0x80000000u) : r;\n}\n"
+		       "inline ulong kyty_f64_from_f32_rdna(uint f) { return kyty_f64_from_f32((f & 0x7f800000u) == 0u ? (f & 0x80000000u) : f); }\n";
+	}
 	out << R"(// RDNA semantics the generic MSL builtins do not give (mirrors the SPIR-V path: EmitFlushF32DenormToSignedZero, EmitF32ToU32, EmitFPMedTri32).
 inline float kyty_ftz(float v) {
 	uint b = as_type<uint>(v);
