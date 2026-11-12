@@ -842,9 +842,20 @@ struct Emitter {
 			      U32Literal(mask) + ")";
 		}
 		const auto limit = "sizes[" + std::to_string(mem.resource) + "]";
-		const auto bytes = std::to_string(info.packed_bitfield ? 4u : bits / 8u) + "u";
-		return "(" + Expr(inst.Arg(inst.NumArgs() - 1)) + " && " + byte + " <= " + limit + " && " + bytes +
-		    " <= " + limit + " - " + byte + " ? " + NormalizeFormatComponent(info, component, raw) + " : 0u)";
+		const std::string record_byte = BufferByte(inst, mem, packed);
+		// RDNA bounds-checks the record from its start to the last transferred component. A
+		// partial record (fewer than all components) reads 0, matching the hardware.
+		const uint32_t count = inst.GetOpcode() == ValueOpcode::LoadBufferU32     ? 1u
+		    : inst.GetOpcode() == ValueOpcode::LoadBufferU32x2 ? 2u
+		    : inst.GetOpcode() == ValueOpcode::LoadBufferU32x3 ? 3u
+			                                                  : 4u;
+		const uint32_t last_component = count > 0 ? count - 1 : 0u;
+		const uint32_t transferred_size =
+		    info.packed_bitfield ? 4u : (Format::GetFormatComponentByteOffset(info, last_component) +
+		                                 info.component_bits[last_component] / 8u);
+		return "(" + Expr(inst.Arg(inst.NumArgs() - 1)) + " && " + record_byte + " <= " + limit + " && " +
+		    std::to_string(transferred_size) + "u <= " + limit + " - " + record_byte + " ? " +
+		    NormalizeFormatComponent(info, component, raw) + " : 0u)";
 	}
 
 	bool EmitFormattedStore(const Inst& inst, const IR::MemoryInfo& mem, const std::string& ptr,
