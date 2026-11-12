@@ -104,7 +104,8 @@ bool Run(const IR::Program& program, const ShaderComputeInputInfo& compute_info,
 	id<MTLBuffer> argbuf = [device newBufferWithLength:std::max<NSUInteger>(arguments.encodedLength, 16) options:MTLResourceStorageModeShared];
 	[arguments setArgumentBuffer:argbuf offset:0];
 	for (uint32_t i = 0; buffers_binding != nullptr && i < buffers_binding->resources.size(); ++i)
-		[arguments setBuffer:data offset:(i < slot_offsets.size() ? slot_offsets[i] : 0u) atIndex:static_cast<NSUInteger>(i)];
+		// The MSL reads ab.buffers[<resource>] and sizes[<resource>] (as the renderer binds arg_ptrs[b]): index by resource, not position.
+		[arguments setBuffer:data offset:(i < slot_offsets.size() ? slot_offsets[i] : 0u) atIndex:static_cast<NSUInteger>(buffers_binding->resources[i])];
 	if (gds_buffer != nil) [arguments setBuffer:gds_buffer offset:0 atIndex:161];
 
 	id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -117,7 +118,7 @@ bool Run(const IR::Program& program, const ShaderComputeInputInfo& compute_info,
 	std::array<uint32_t, ShaderRecompiler::Msl::SizeConstantWordCount> sizes {};
 	if (gds != nullptr) sizes[ShaderRecompiler::Msl::GdsDwordsWord] = static_cast<uint32_t>(gds->size());
 	if (buffers_binding != nullptr) {
-		for (uint32_t i = 0; i < buffers_binding->resources.size(); ++i) sizes[i] = i < slot_sizes.size() ? slot_sizes[i] : 0u;
+		for (uint32_t i = 0; i < buffers_binding->resources.size(); ++i) sizes[buffers_binding->resources[i]] = i < slot_sizes.size() ? slot_sizes[i] : 0u;
 	}
 	[encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:25];
 
