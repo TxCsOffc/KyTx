@@ -15,7 +15,9 @@ namespace Libs::Graphics::ShaderRecompiler::Msl {
 inline constexpr uint32_t ComparisonPointSamplerBase = 192;
 inline constexpr uint32_t SamplerDescriptorWordBase = 96;
 inline constexpr uint32_t ImageMetadataWordBase = SamplerDescriptorWordBase + 32 * 4;
-inline constexpr uint32_t SizeConstantWordCount = ImageMetadataWordBase + 64;
+// Buffer-25 word with the bound GDS length in dwords (the SPIR-V path checks GDS accesses against the bound buffer's length).
+inline constexpr uint32_t GdsDwordsWord = ImageMetadataWordBase + 64;
+inline constexpr uint32_t SizeConstantWordCount = GdsDwordsWord + 1;
 
 // Direct RDNA (IR) -> Metal Shading Language translation. Bypasses SPIR-V and
 // SPIRV-Cross: the IR already carries typed memory, image and export semantics.

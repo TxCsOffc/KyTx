@@ -44,6 +44,11 @@ static bool MslGdsEnabled() { return true; }
 
 // Dwords of the Metal GDS buffer (GdsBuffer() in metalRenderer.mm is 64 KiB).
 static constexpr uint32_t kMslGdsDwords = 16384u;
+// A GDS access is checked against the bound GDS length (sizes[GdsDwordsWord], at most the 64 KiB GDS), as the SPIR-V path checks it
+// against the bound buffer: a wide access that crosses the end keeps its in-range dwords and drops/zeroes the rest.
+static std::string GdsLimitExpr() {
+	return "min(sizes[" + std::to_string(Libs::Graphics::ShaderRecompiler::Msl::GdsDwordsWord) + "u], " + std::to_string(kMslGdsDwords) + "u)";
+}
 
 namespace Libs::Graphics::ShaderRecompiler::Msl {
 namespace {
@@ -2859,7 +2864,7 @@ struct Emitter {
 				const auto  op    = inst.GetOpcode();
 				const bool  compute = program.stage == ShaderType::Compute || program.stage == ShaderType::Mesh;
 				const bool  gds   = GdsMem(mem);
-				const std::string limit = std::to_string(gds ? kMslGdsDwords : LdsDwords()) + "u";
+				const std::string limit = (gds ? GdsLimitExpr() : std::to_string(LdsDwords()) + "u");
 				// ds_or_b64 / ds_add_u64: the 64-bit address wraps at 64 KiB and ignores its low three bits (DsAtomic64Bounds:
 				// 0x10007 + offset 2 -> 8).
 				const std::string d     = "(((" + LdsByte(inst, mem) + ") & 0xfff8u) >> 2)";
@@ -2910,7 +2915,7 @@ struct Emitter {
 				const auto  op    = inst.GetOpcode();
 				const bool  compute = program.stage == ShaderType::Compute || program.stage == ShaderType::Mesh;
 				const bool  gds   = GdsMem(mem);
-				const std::string limit = std::to_string(gds ? kMslGdsDwords : LdsDwords()) + "u";
+				const std::string limit = (gds ? GdsLimitExpr() : std::to_string(LdsDwords()) + "u");
 				const std::string d     = "(" + LdsByte(inst, mem) + " >> 2)";
 				const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
 				const std::string cond  = Expr(inst.Arg(inst.NumArgs() - 1));
@@ -3037,7 +3042,7 @@ struct Emitter {
 				const auto  d    = "(" + byte + " >> 2)";
 				const auto count = IR::SharedComponentCount(inst.GetOpcode());
 				const bool gds   = GdsMem(mem);
-				const auto n = std::to_string(gds ? kMslGdsDwords : LdsDwords()) + "u";
+				const auto n = (gds ? GdsLimitExpr() : std::to_string(LdsDwords()) + "u");
 				std::string result = count == 1 ? "" : "uint" + std::to_string(count) + "(";
 				for (uint32_t i=0;i<count;++i) {
 					if (i) result += ", ";
@@ -3068,7 +3073,7 @@ struct Emitter {
 				if (GdsMem(mem)) {
 					// Sub-dword GDS writes clear and then set their bits (two atomics; GDS bytes are not written concurrently).
 					const auto op = inst.GetOpcode();
-					body << "\t\tif (" << Expr(inst.Arg(inst.NumArgs()-1)) << " && " << d << " < " << kMslGdsDwords << "u) {\n";
+					body << "\t\tif (" << Expr(inst.Arg(inst.NumArgs()-1)) << " && " << d << " < " << GdsLimitExpr() << ") {\n";
 					if (op == IR::ValueOpcode::WriteSharedU8 || op == IR::ValueOpcode::WriteSharedU16) {
 						const char* mask = op == IR::ValueOpcode::WriteSharedU8 ? "0xffu" : "0xffffu";
 						body << "\t\t\tconst uint kyty_shift = (" << byte << " & " << (op == IR::ValueOpcode::WriteSharedU8 ? "3u" : "2u")
@@ -3078,7 +3083,7 @@ struct Emitter {
 						     << ") << kyty_shift, memory_order_relaxed);\n";
 					} else {
 						for (uint32_t i = 0; i < count; ++i) {
-							body << "\t\t\tif (" << i << "u < " << kMslGdsDwords << "u - " << d << ") atomic_store_explicit(&ab.gds[" << d
+							body << "\t\t\tif (" << i << "u < " << GdsLimitExpr() << " - " << d << ") atomic_store_explicit(&ab.gds[" << d
 							     << " + " << i << "u], " << Expr(inst.Arg(1 + i)) << ", memory_order_relaxed);\n";
 						}
 					}

@@ -9169,6 +9169,7 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 				}
 			}
 		}
+		sizes[ShaderRecompiler::Msl::GdsDwordsWord] = 16384u; // the whole 64 KiB GDS buffer is bound
 		// The static extent misses dynamically indexed accesses (e.g. a table index in a register). The V#
 		// record count is the buffer's real size, as the pixel stage already uses it; take the larger.
 		if (compute_info.stage.program && compute_info.stage.resources) {

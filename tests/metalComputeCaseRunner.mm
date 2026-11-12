@@ -114,7 +114,8 @@ bool Run(const IR::Program& program, const ShaderComputeInputInfo& compute_info,
 
 	[encoder setBuffer:argbuf offset:0 atIndex:0];
 	[encoder setBytes:push.dwords.data() length:sizeof(push.dwords) atIndex:1];
-	std::array<uint32_t, 64> sizes {};
+	std::array<uint32_t, ShaderRecompiler::Msl::SizeConstantWordCount> sizes {};
+	if (gds != nullptr) sizes[ShaderRecompiler::Msl::GdsDwordsWord] = static_cast<uint32_t>(gds->size());
 	if (buffers_binding != nullptr) {
 		for (uint32_t i = 0; i < buffers_binding->resources.size(); ++i) sizes[i] = i < slot_sizes.size() ? slot_sizes[i] : 0u;
 	}
