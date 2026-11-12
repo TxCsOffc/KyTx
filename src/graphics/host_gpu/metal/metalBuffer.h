@@ -143,6 +143,12 @@ private:
 		uint64_t                     generation = 0;              // guest mapping generation the entry was last checked against
 	};
 	std::unordered_map<uint64_t, PageCacheEntry> m_page_cache;
+	struct MappingWrapper {
+		std::shared_ptr<MetalBuffer> buffer;
+		uint64_t                     size = 0;
+		uint64_t                     generation = 0;
+	};
+	std::unordered_map<uint64_t, MappingWrapper> m_mapping_wrappers;  // KYTY_GUEST_BUFFER_MAPPING: one wrapper per guest mapping
 	std::mutex                                                   m_chunk_mutex;
 	std::unordered_map<uint64_t, std::shared_ptr<MetalBuffer>> m_backing_chunks;
 	int64_t                                      m_page_cache_swept_ms = 0;

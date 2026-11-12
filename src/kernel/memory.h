@@ -120,6 +120,8 @@ bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   GetGuestBackingAlias(uint64_t* base, uint64_t* size);
 bool                   TryGetGuestBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_offset);
+// The committed guest range that holds all of [vaddr, vaddr + size) (one VirtualRanges entry). False otherwise.
+bool                   TryGetGuestMappedRange(uint64_t vaddr, uint64_t size, uint64_t* range_start, uint64_t* range_size);
 struct GuestBackingMapping {
 	uint64_t address;
 	uint64_t size;

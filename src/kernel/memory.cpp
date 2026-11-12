@@ -1017,6 +1017,16 @@ bool TryGetGuestBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* backing_o
 	       g_guest_address_space->TryGetContiguousBackingOffset(vaddr, size, backing_offset);
 }
 
+bool TryGetGuestMappedRange(uint64_t vaddr, uint64_t size, uint64_t* range_start, uint64_t* range_size) {
+	if (g_virtual_ranges == nullptr || range_start == nullptr || range_size == nullptr || size == 0) return false;
+	VirtualRanges::Range range {};
+	if (!g_virtual_ranges->Query(vaddr, 0, &range) || !IsCommittedRangeType(range.type)) return false;
+	if (vaddr + size > range.start + range.size) return false;
+	*range_start = range.start;
+	*range_size  = range.size;
+	return true;
+}
+
 uint64_t GetGuestBackingGeneration() {
 	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingGeneration() : 0;
 }

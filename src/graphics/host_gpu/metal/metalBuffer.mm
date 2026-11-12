@@ -289,6 +289,39 @@ MetalBufferAllocation MetalBufferManager::GetBufferForGuestRange(uint64_t vaddr,
 	// cloth started from those stale bytes in their first frame and turned to NaN (shirts, shorts and tracksuits missing until the solver
 	// settled). A range inside one physical 64 MiB chunk now always goes through that chunk's buffer. KYTY_GUEST_BUFFER_PER_PAGE=1
 	// restores the per-page wrappers.
+	// KYTY_GUEST_BUFFER_MAPPING=1 (experiment): every guest range is bound through ONE wrapper over the whole committed guest mapping
+	// that holds it (a VirtualRanges entry), made on first use and kept: no chunk buffers and no per-start-page wrappers, so a guest
+	// byte has one GPU address. c29's node pool (non-contiguous backing -> page wrapper) was written by other kernels through the 64 MiB
+	// chunk buffers of the same physical pages: two GPU mappings of one page, not coherent, cyclic lists and an endless walk.
+	static const bool s_mapping = std::getenv("KYTY_GUEST_BUFFER_MAPPING") != nullptr;
+	if (s_mapping) {
+		uint64_t m_start = 0, m_size = 0;
+		if (LibKernel::Memory::TryGetGuestMappedRange(vaddr, size, &m_start, &m_size)) {
+			std::lock_guard lock(m_cache_mutex);
+			const uint64_t generation = LibKernel::Memory::GetGuestBackingGeneration();
+			auto& entry = m_mapping_wrappers[m_start];
+			if (entry.buffer == nullptr || entry.size != m_size || entry.generation != generation) {
+				auto buf = std::make_shared<MetalBuffer>();
+				if (buf->WrapHostMemory(reinterpret_cast<void*>(m_start), m_size, "GuestMapping")) {
+					static std::atomic<uint32_t> s_log {0};
+					if (s_log.fetch_add(1) < 400) {
+						std::fprintf(stderr, "[GuestMapping] wrap start=0x%llx size=%llu (%s)\n", (unsigned long long)m_start,
+						             (unsigned long long)m_size, entry.buffer == nullptr ? "new" : "remapped");
+					}
+					entry = {buf, m_size, generation};
+				}
+			}
+			if (entry.buffer != nullptr) {
+				MetalBufferAllocation alloc {};
+				alloc.buffer = entry.buffer->GetHandle();
+				alloc.offset = entry.buffer->GetOffset() + (vaddr - m_start);
+				alloc.size = size;
+				alloc.cpu_addr = reinterpret_cast<void*>(vaddr);
+				alloc.gpu_addr = entry.buffer->GetGpuAddress() ? (entry.buffer->GetGpuAddress() + (vaddr - m_start)) : 0;
+				return alloc;
+			}
+		}
+	}
 	static const bool s_per_page = std::getenv("KYTY_GUEST_BUFFER_PER_PAGE") != nullptr;
 	if (!s_per_page) {
 		uint64_t backing = 0;
