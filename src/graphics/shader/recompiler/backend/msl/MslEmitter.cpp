@@ -3215,7 +3215,7 @@ void Emitter::EmitAlu(const Inst& inst) {
 		case IR::ValueOpcode::FPFloor32: EmitAssignment(inst, "floor(" + Expr(inst.Arg(0)) + ")"); return;
 		case IR::ValueOpcode::FPCeil32: EmitAssignment(inst, "ceil(" + Expr(inst.Arg(0)) + ")"); return;
 		case IR::ValueOpcode::FPTrunc32: EmitAssignment(inst, "trunc(" + Expr(inst.Arg(0)) + ")"); return;
-		case IR::ValueOpcode::FPFract32: EmitAssignment(inst, "fract(" + Expr(inst.Arg(0)) + ")"); return;
+		case IR::ValueOpcode::FPFract32: EmitAssignment(inst, "kyty_fract(" + Ftz(Expr(inst.Arg(0))) + ")"); return;
 		case IR::ValueOpcode::FPRoundEven32:
 			EmitAssignment(inst, "rint(" + Expr(inst.Arg(0)) + ")");
 			return;
@@ -3533,6 +3533,12 @@ inline uint kyty_f16_rte(float f) {
 inline float kyty_ftz(float v) {
 	uint b = as_type<uint>(v);
 	return (b & 0x7f800000u) == 0u ? as_type<float>(b & 0x80000000u) : v;
+}
+// RDNA v_fract_f32 (and v_fract_f16 through it): NaN and +/-inf give the canonical quiet NaN (VectorFractF16CapturedAndEdges:
+// 0x7c00, 0xfc00, 0x7e55, 0x7d01 -> 0x7e00); MSL fract() returns 0 for them.
+inline float kyty_fract(float x) {
+	if (isnan(x) || isinf(x)) return as_type<float>(0x7fc00000u);
+	return fract(x); // finite: x - floor(x), kept below 1.0 (a tiny negative x must not round up to 1.0)
 }
 inline uint kyty_f2u(float v) {
 	if (isnan(v) || v <= 0.0f) return 0u;
