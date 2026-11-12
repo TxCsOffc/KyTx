@@ -2602,7 +2602,8 @@ struct Emitter {
 				const std::string elem = "&" + *ptr + "[" + d + "]";
 				const std::string elem_hi = "&" + *ptr + "[" + d + " + 1u]";
 				body << "\t\t" << Name(inst) << " = 0ul;\n";
-				body << "\t\tif (" << cond << " && " << d << " < " << n << ") {\n";
+				// Both dwords of the qword must be inside the buffer, or the whole operation is dropped.
+				body << "\t\tif (" << cond << " && " << d << " + 1u < " << n << ") {\n";
 				body << "\t\t\tulong kyty_old_lo = atomic_fetch_and_explicit((device atomic_uint*)" << elem
 				     << ", uint(" << value << "), memory_order_relaxed);\n";
 				body << "\t\t\tulong kyty_old_hi = atomic_fetch_and_explicit((device atomic_uint*)" << elem_hi
