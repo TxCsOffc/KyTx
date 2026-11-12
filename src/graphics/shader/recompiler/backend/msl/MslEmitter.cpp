@@ -884,7 +884,7 @@ struct Emitter {
 				component = "as_type<uint>(int(rint(clamp(" + f + ", -1.0f, 1.0f) * " +
 				            std::to_string((1u << (bits - 1u)) - 1u) + ".0f)))";
 			} else if (info.type == Format::ComponentType::Float && bits == 16) {
-				component = "uint(as_type<ushort>(half(" + f + ")))";
+				component = "uint(kyty_f16_rte(" + f + "))";
 			} else if (info.type == Format::ComponentType::Uscaled) {
 				component = "uint(clamp(" + f + ", 0.0f, " + std::to_string(mask) + ".0f))";
 			} else if (info.type == Format::ComponentType::Sscaled) {
@@ -3472,6 +3472,38 @@ inline uint kyty_f16_rtz(float f) {
     if (exponent > 112u) return sign | ((exponent - 112u) << 10) | (mantissa >> 13);
     if (exponent < 103u) return sign;
     return sign | ((mantissa | 0x00800000u) >> (126u - exponent));
+}
+
+// v_cvt_pkrtf_f16_f32 rounds to nearest-even. Unlike half()/kyty_f16_rtz it must match RDNA's f32->f16 bit conversion:
+// NaN stays a quiet NaN, inf/overflow become signed inf, and exact ties round to the even mantissa. The low 13 bits of the
+// f32 mantissa are the round/sticky bits; bit 12 is the round bit, the rest the sticky. We round up only when the round bit
+// is set and (any sticky bit is set, or the kept LSB is already 1 for evenness).
+inline uint kyty_f16_rte(float f) {
+    uint bits = as_type<uint>(f);
+    uint sign = (bits >> 16) & 0x8000u;
+    uint exponent = (bits >> 23) & 0xffu;
+    uint mantissa = bits & 0x007fffffu;
+    if (exponent == 255u) return sign | 0x7c00u | (mantissa != 0u ? 0x0200u | (mantissa >> 13) : 0u);
+    if (exponent > 173u) return sign | 0x7c00u;
+    if (exponent >= 143u) {
+        uint rounded = 0x7bffu + ((mantissa & 0x2000u) != 0u ? 1u : 0u);
+        return sign | (rounded & 0x7bffu);
+    }
+    if (exponent > 112u) {
+        uint low = mantissa & 0x1fffu;
+        uint lsb = (mantissa >> 13) & 1u;
+        uint round = (low > 0x1000u) || (low == 0x1000u && lsb == 1u);
+        return sign | ((exponent - 112u) << 10) | (mantissa >> 13) + (round ? 1u : 0u);
+    }
+    if (exponent >= 103u) {
+        uint low = mantissa & 0x07fffu;
+        uint round = (low > 0x0400u) || (low == 0x0400u && ((mantissa >> 13) & 1u) == 1u);
+        return sign | ((mantissa | 0x00800000u) >> (126u - exponent)) + (round ? 1u : 0u);
+    }
+    // Denormal f16 result: exponent underflows. Round the scaled mantissa to the nearest even 10-bit value.
+    uint low = mantissa & 0x03fffu;
+    uint round = (low > 0x0200u) || (low == 0x0200u && ((mantissa >> 13) & 1u) == 1u);
+    return sign | (((mantissa | 0x00800000u) >> (126u - exponent)) + (round ? 1u : 0u));
 }
 
 )";
