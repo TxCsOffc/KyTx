@@ -2800,7 +2800,9 @@ struct Emitter {
 			case IR::ValueOpcode::SharedAtomicSMin32:
 			case IR::ValueOpcode::SharedAtomicSMax32:
 			case IR::ValueOpcode::SharedAtomicInc32:
-			case IR::ValueOpcode::SharedAtomicDec32: {
+			case IR::ValueOpcode::SharedAtomicDec32:
+			case IR::ValueOpcode::SharedAtomicFMin32:
+			case IR::ValueOpcode::SharedAtomicFMax32: {
 				// LDS atomic: the result is the old dword. Lanes with a false condition or an index past the LDS
 				// array contribute 0 and do not write (same guard as the SPIR-V EmitAtomicAccess path).
 				const auto& mem   = Mem(inst);
@@ -2813,10 +2815,21 @@ struct Emitter {
 				const std::string cond  = Expr(inst.Arg(inst.NumArgs() - 1));
 				const std::string space = gds ? "device" : "threadgroup";
 				const std::string slot  = gds ? "ab.gds[" + d + "]" : "kyty_lds[" + d + "]";
-				body << "\t\t" << Name(inst) << " = 0u;\n";
+				const bool float_minmax = op == IR::ValueOpcode::SharedAtomicFMin32 || op == IR::ValueOpcode::SharedAtomicFMax32;
+				if (!float_minmax) body << "\t\t" << Name(inst) << " = 0u;\n"; // ds_min/max_f32 are Void
 				body << "\t\tif (" << cond << " && " << d << " < " << limit << ") {\n";
 				if (!compute) {
 					Unsupported(inst, "graphics shared atomic requires shared execution");
+				} else if (float_minmax) {
+					// ds_min_f32 / ds_max_f32 (SPIR-V EmitSharedFloatAtomic): data = Arg(1), compare = Arg(2). FMin writes
+					// (cmp < old) ? data : old, FMax (old > cmp) ? data : old; ordered compares, so a NaN keeps old.
+					const std::string take = op == IR::ValueOpcode::SharedAtomicFMax32
+					                             ? "as_type<float>(kyty_old) > as_type<float>(" + Expr(inst.Arg(2)) + ")"
+					                             : "as_type<float>(" + Expr(inst.Arg(2)) + ") < as_type<float>(kyty_old)";
+					body << "\t\t\t{\n\t\t\t\t" << space << " atomic_uint* kyty_p = (" << space << " atomic_uint*)&" << slot << ";\n"
+					     << "\t\t\t\tuint kyty_old = atomic_load_explicit(kyty_p, memory_order_relaxed);\n"
+					     << "\t\t\t\twhile (!atomic_compare_exchange_weak_explicit(kyty_p, &kyty_old, (" << take << ") ? "
+					     << Expr(inst.Arg(1)) << " : kyty_old, memory_order_relaxed, memory_order_relaxed)) {}\n\t\t\t}\n";
 				} else if (op == IR::ValueOpcode::SharedAtomicInc32 || op == IR::ValueOpcode::SharedAtomicDec32) {
 					// No native MSL atomic for the wrapping inc/dec: CAS loop on the threadgroup dword.
 					body << "\t\t\t{\n\t\t\t\t" << space << " atomic_uint* kyty_p = (" << space << " atomic_uint*)&" << slot << ";\n"
@@ -3474,36 +3487,30 @@ inline uint kyty_f16_rtz(float f) {
     return sign | ((mantissa | 0x00800000u) >> (126u - exponent));
 }
 
-// v_cvt_pkrtf_f16_f32 rounds to nearest-even. Unlike half()/kyty_f16_rtz it must match RDNA's f32->f16 bit conversion:
-// NaN stays a quiet NaN, inf/overflow become signed inf, and exact ties round to the even mantissa. The low 13 bits of the
-// f32 mantissa are the round/sticky bits; bit 12 is the round bit, the rest the sticky. We round up only when the round bit
-// is set and (any sticky bit is set, or the kept LSB is already 1 for evenness).
+// f32 -> f16 bits, round to nearest even (buffer_store_format f16 components): NaN stays a quiet NaN with its top payload bits,
+// |x| >= 65520 becomes inf (the rounding carry reaches the exponent), f16 denormals round on the bits shifted out, values at or
+// below 2^-25 become signed zero (an exact 2^-25 tie goes to the even zero).
 inline uint kyty_f16_rte(float f) {
     uint bits = as_type<uint>(f);
     uint sign = (bits >> 16) & 0x8000u;
     uint exponent = (bits >> 23) & 0xffu;
     uint mantissa = bits & 0x007fffffu;
     if (exponent == 255u) return sign | 0x7c00u | (mantissa != 0u ? 0x0200u | (mantissa >> 13) : 0u);
-    if (exponent > 173u) return sign | 0x7c00u;
-    if (exponent >= 143u) {
-        uint rounded = 0x7bffu + ((mantissa & 0x2000u) != 0u ? 1u : 0u);
-        return sign | (rounded & 0x7bffu);
+    if (exponent >= 143u) return sign | 0x7c00u;
+    if (exponent >= 113u) {
+        uint h = ((exponent - 112u) << 10) | (mantissa >> 13);
+        uint rest = mantissa & 0x1fffu;
+        h += (rest > 0x1000u || (rest == 0x1000u && (h & 1u) != 0u)) ? 1u : 0u;
+        return sign | h;
     }
-    if (exponent > 112u) {
-        uint low = mantissa & 0x1fffu;
-        uint lsb = (mantissa >> 13) & 1u;
-        uint round = (low > 0x1000u) || (low == 0x1000u && lsb == 1u);
-        return sign | ((exponent - 112u) << 10) | (mantissa >> 13) + (round ? 1u : 0u);
-    }
-    if (exponent >= 103u) {
-        uint low = mantissa & 0x07fffu;
-        uint round = (low > 0x0400u) || (low == 0x0400u && ((mantissa >> 13) & 1u) == 1u);
-        return sign | ((mantissa | 0x00800000u) >> (126u - exponent)) + (round ? 1u : 0u);
-    }
-    // Denormal f16 result: exponent underflows. Round the scaled mantissa to the nearest even 10-bit value.
-    uint low = mantissa & 0x03fffu;
-    uint round = (low > 0x0200u) || (low == 0x0200u && ((mantissa >> 13) & 1u) == 1u);
-    return sign | (((mantissa | 0x00800000u) >> (126u - exponent)) + (round ? 1u : 0u));
+    if (exponent < 102u) return sign;
+    uint full = mantissa | 0x00800000u;
+    uint shift = 126u - exponent;
+    uint h = full >> shift;
+    uint rest = full & ((1u << shift) - 1u);
+    uint half_ulp = 1u << (shift - 1u);
+    h += (rest > half_ulp || (rest == half_ulp && (h & 1u) != 0u)) ? 1u : 0u;
+    return sign | h;
 }
 
 )";
