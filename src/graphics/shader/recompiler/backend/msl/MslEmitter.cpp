@@ -1534,8 +1534,10 @@ struct Emitter {
 				// BOUND_CTRL = 0 suppresses the write for an invalid source: outside the row, or (FI = 0) a lane whose EXEC
 				// bit is zero.
 				const auto src    = DppSourceLane(flags, g);
-				const bool check  = !flags.bound_control && !flags.fetch_inactive;
-				if (!flags.bound_control) write += " && " + src.valid;
+				// DPP8 has no BOUND_CTRL: an inactive source reads 0 (the move gives it) and the lane is written, as the SPIR-V
+				// write condition does (it never tests the source's EXEC). VectorDpp8CapturedMaskedExec.
+				const bool check  = !flags.bound_control && !flags.fetch_inactive && !flags.dpp8;
+				if (!flags.bound_control && !flags.dpp8) write += " && " + src.valid;
 				if (check) {
 					body << "\t\t{\n\t\t\tconst uint kyty_ut = " << src.target << " & 63u;\n"
 					     << "\t\t\tconst uint4 kyty_ub = kyty_ballot2(" << arg(2, 0) << ", " << arg(2, 1) << ");\n"
@@ -1657,7 +1659,7 @@ struct Emitter {
 				const std::string valid = "(" + src.valid + " && " + live + ")";
 				std::string       write = "(" + exec + " && ((" + std::to_string(flags.bank_mask) +
 				                    "u >> ((lane >> 2u) & 3u)) & 1u) != 0u && ((" + std::to_string(flags.row_mask) +
-				                    "u >> ((lane >> 4u) & 3u)) & 1u) != 0u && " + (flags.bound_control ? "true" : valid);
+				                    "u >> ((lane >> 4u) & 3u)) & 1u) != 0u && " + (flags.bound_control || flags.dpp8 ? "true" : valid);
 				if (whole) write += " && !(" + src.valid + " && !kyty_up" + (block != 0u ? " && kyty_uk == 0u" : "") + ")";
 				write += ")";
 				body << "\t\t\t" << Name(inst) << " = " << write << " ? " << Expr(inst.Arg(0)) << " : " << Expr(inst.Arg(1))
