@@ -776,6 +776,30 @@ struct Emitter {
 		return "(((ulong(" + Expr(inst.Arg(2)) + ") << 32) | ulong(" + Expr(inst.Arg(1)) + ")) + ulong(long(" +
 		       std::to_string(static_cast<int32_t>(mem.offset)) + ")))";
 	}
+	// Flat access to the private or shared aperture (ResourceKind::FlatLocal, SPIR-V ForEachLocalFlatAccess): the high dword of the
+	// 64-bit address selects scratch (PrivateApertureHigh) or LDS (SharedApertureHigh); dword-aligned, in bounds of that memory.
+	std::string FlatLocalLoad(const Inst& inst, const IR::MemoryInfo& mem) {
+		const std::string a = ScratchByte(inst, mem), lo = "uint(" + a + ")", hi = "uint(" + a + " >> 32)", idx = "(" + lo + " >> 2)";
+		const std::string aligned = "((" + lo + " & 3u) == 0u)";
+		std::string result = "0u";
+		if (program.scratch_dwords != 0u)
+			result = "(" + aligned + " && " + hi + " == " + std::to_string(Decoder::PrivateApertureHigh) + "u && " + idx + " < " +
+			         std::to_string(program.scratch_dwords) + "u ? " + ScratchArray() + "[" + idx + "] : " + result + ")";
+		if (UsesLds())
+			result = "(" + aligned + " && " + hi + " == " + std::to_string(Decoder::SharedApertureHigh) + "u && " + idx + " < " +
+			         std::to_string(LdsDwords()) + "u ? kyty_lds[" + idx + "] : " + result + ")";
+		return result;
+	}
+	void FlatLocalStore(const Inst& inst, const IR::MemoryInfo& mem) {
+		const std::string a = ScratchByte(inst, mem), lo = "uint(" + a + ")", hi = "uint(" + a + " >> 32)", idx = "(" + lo + " >> 2)";
+		const std::string cond = "(" + Expr(inst.Arg(4)) + ") && ((" + lo + " & 3u) == 0u)";
+		if (program.scratch_dwords != 0u)
+			body << "\t\tif (" << cond << " && " << hi << " == " << Decoder::PrivateApertureHigh << "u && " << idx << " < "
+			     << program.scratch_dwords << "u) " << ScratchArray() << "[" << idx << "] = " << Expr(inst.Arg(3)) << ";\n";
+		if (UsesLds())
+			body << "\t\tif (" << cond << " && " << hi << " == " << Decoder::SharedApertureHigh << "u && " << idx << " < "
+			     << LdsDwords() << "u) kyty_lds[" << idx << "] = " << Expr(inst.Arg(3)) << ";\n";
+	}
 	std::string ScratchValid(const std::string& byte) const {
 		return "((" + byte + " >> 32) == 0ul && (" + byte + " >> 2) < " + std::to_string(program.scratch_dwords) + "ul)";
 	}
@@ -2553,6 +2577,10 @@ struct Emitter {
 				// replaces their shader consumers with materialized argument slots.
 				if (Mem(inst).planning_only) return;
 				const auto& mem = Mem(inst);
+				if (mem.kind == IR::ResourceKind::FlatLocal && inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
+					EmitAssignment(inst, "((" + Expr(inst.Arg(3)) + ") ? " + FlatLocalLoad(inst, mem) + " : 0u)");
+					return;
+				}
 				if (mem.kind == IR::ResourceKind::Scratch && program.scratch_dwords != 0u) {
 					const uint32_t bytes = inst.GetOpcode() == ValueOpcode::LoadAddressU8 ? 1u
 					                       : inst.GetOpcode() == ValueOpcode::LoadAddressU16 ? 2u : 4u;
@@ -2794,6 +2822,10 @@ struct Emitter {
 			case IR::ValueOpcode::StoreAddressU16:
 			case IR::ValueOpcode::StoreAddressU32: {
 				const auto& mem = Mem(inst);
+				if (mem.kind == IR::ResourceKind::FlatLocal && inst.GetOpcode() == ValueOpcode::StoreAddressU32) {
+					FlatLocalStore(inst, mem);
+					return;
+				}
 				if (mem.kind != IR::ResourceKind::Scratch || program.scratch_dwords == 0u) {
 					Unsupported(inst, "side effect not lowered");
 					return;
