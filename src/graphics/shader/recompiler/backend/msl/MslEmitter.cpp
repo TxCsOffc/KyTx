@@ -2578,9 +2578,25 @@ struct Emitter {
 					    mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
 					              : program.info.buffers[mem.resource].descriptor_format;
 					const auto format_info = Format::GetFormatInfo(format);
+					// An unrecognized format is treated as a raw dword load, matching the
+					// SPIR-V backend's FormattedLoad fallback.
 					if (format_info.type == Format::ComponentType::Unknown) {
-						Unsupported(inst, "unknown buffer format");
-						EmitAssignment(inst, "0");
+						const std::string d = BufferDword(inst, mem, packed);
+						const std::string n = "(sizes[" + std::to_string(mem.resource) + "] >> 2)";
+						const uint32_t count = inst.GetOpcode() == ValueOpcode::LoadBufferU32 ? 1u
+						    : inst.GetOpcode() == ValueOpcode::LoadBufferU32x2 ? 2u
+						    : inst.GetOpcode() == ValueOpcode::LoadBufferU32x3 ? 3u : 4u;
+						std::string result = count == 1 ? "" : "uint" + std::to_string(count) + "(";
+						for (uint32_t i = 0; i < count; ++i) {
+							if (i != 0) result += ", ";
+							const auto component = std::to_string(i) + "u";
+							const std::string index = BufferSwizzled(packed) ? BufferDword(inst, mem, packed, i * 4u) : d + " + " + component;
+							const std::string bounds = BufferSwizzled(packed) ? index + " < " + n :
+							    d + " < " + n + " && " + component + " < " + n + " - " + d;
+							result += "(" + Expr(inst.Arg(inst.NumArgs() - 1)) + " && " + bounds + " ? " + *ptr + "[" + index + "] : 0u)";
+						}
+						if (count > 1) result += ")";
+						EmitAssignment(inst, result);
 						return;
 					}
 					const uint32_t count =
