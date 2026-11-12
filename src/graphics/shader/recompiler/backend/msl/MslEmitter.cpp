@@ -1689,14 +1689,15 @@ struct Emitter {
 				body << "\t\t}\n";
 				return;
 			}
-			case IR::ValueOpcode::BpermuteU32: {
-				const std::string target = "((lane & ~31u) | ((" + Expr(inst.Arg(1)) +
-				                           " >> 2) & 31u))";
-				EmitAssignment(inst, "(" + Expr(inst.Arg(2)) + " ? simd_shuffle(" +
-				                        Expr(inst.Arg(0)) + ", (ushort)(" + target +
-				                        " & 31u)) : 0u)");
-				return;
-			}
+				case IR::ValueOpcode::BpermuteU32: {
+					const std::string target = "((lane & ~31u) | ((" + Expr(inst.Arg(1)) +
+					                           " >> 2) & 31u))";
+					// ds_bpermute_b32: returns 0 when the SOURCE lane (the target) is inactive.
+					EmitAssignment(inst, "simd_shuffle(uint(" + Expr(inst.Arg(2)) + "), (ushort)(" + target +
+					                   " & 31u)) != 0u ? simd_shuffle(" + Expr(inst.Arg(0)) +
+					                   ", (ushort)(" + target + " & 31u)) : 0u");
+					return;
+				}
 			case IR::ValueOpcode::SwizzleU32: {
 				// ds_swizzle_b32: reads a lane of the same 32-lane group; a source lane that is not live gives zero.
 				const auto control = ImmU32(inst.Arg(1));
