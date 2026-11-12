@@ -2809,8 +2809,14 @@ struct Emitter {
 				const bool half4_store = mem.formatted && !mem.typed && store_op == IR::ValueOpcode::StoreBufferU32x4 &&
 				    mem.resource < program.info.buffers.size() &&
 				    program.info.buffers[mem.resource].descriptor_format == Prospero::BufferFormat::k16_16_16_16Float;
+				// A format the format table does not know (e.g. tbuffer 14/7 = k11_11_10SNorm) is stored as raw dwords, as the SPIR-V
+				// FormattedStore/StoreWideBuffer do for ComponentType::Unknown (TBufferStoreVariants expects the input dwords).
+				const bool unknown_format_raw = mem.formatted && mem.resource < program.info.buffers.size() &&
+				    Format::GetFormatInfo(mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
+				                                    : program.info.buffers[mem.resource].descriptor_format).type ==
+				        Format::ComponentType::Unknown;
 				if (!ptr || mem.kind != IR::ResourceKind::Buffer ||
-				    !BufferAddressable(mem.resource) || (mem.formatted && !raw_formatted_dword && !half4_store)) {
+				    !BufferAddressable(mem.resource) || (mem.formatted && !raw_formatted_dword && !half4_store && !unknown_format_raw)) {
 					const std::string reason = "formatted buffer store (data_format=" + std::to_string(mem.data_format) +
 					                           " number_format=" + std::to_string(mem.number_format) + " typed=" + std::to_string(mem.typed) +
 					                           " desc_format=" + std::to_string(mem.resource < program.info.buffers.size() ?
