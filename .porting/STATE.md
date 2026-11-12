@@ -1,3 +1,109 @@
+## Paused — 2026-11-12 13:00 +05 (Claude)
+The user plays FC27 PC (Denuvo removed) through CrossOver; KyTx work for FC27 is paused. State: --metal-cases 336/336 executed; c29
+hang open (endless list walk; page-wrapper/chunk aliasing suspected; KYTY_GUEST_BUFFER_MAPPING experiment did not fix it, gm1
+status-2 hang, ~400 wrapper re-creations); white/pink menu open.
+
+## --metal-cases: 336 of 336 executed RDNA cases pass — 2026-11-12 12:20 +05 (Claude)
+- Soft binary64 (5ffc549b): MslSoftF64.inc + RDNA conversion rules; judge tools/softf64/check.py (14 functions bit-exact vs host).
+- Today 266 -> 336; 83 cases are skipped by the runner (images, samplers, compile-only, flattened SRT) - next coverage step.
+- Next: c29 node-pool page-wrapper aliasing (one wrapper per guest mapping, no re-wrapping); patch from the first try in .porting/work.
+
+## MSL leftovers done by hand after Ornith gave up — 2026-11-12 11:40 +05 (Claude)
+- --metal-cases 317 -> 328 of 419; only the 8 f64 cases fail. Ornith queue 7 (3 tries each) landed only c7c0a1db (unknown format
+  loads = raw dwords); the rest by hand: 4924240f GDS bounds from the bound GDS length (sizes[GdsDwordsWord]); 4ceada08 unknown
+  formats store raw dwords; ad7c244a runner binds buffers by resource index (TBufferCapturedZeroStrideOob was a runner artefact);
+  9fdb7ed6 DPP8 writes when its source is inactive (reads 0, no BOUND_CTRL); 25405d72 GLC/DLC buffer loads are atomic (device-
+  coherent) loads - game-relevant for cross-workgroup polling; 670b6a12 scratch as per-lane private arrays; this commit FlatLocal.
+- Harness: local_worker accepts "command" as the run_cmd argument name (3 tries were lost to it).
+- Next: soft f64 (judge tools/softf64/check.py), then c29 page-wrapper aliasing (patch in .porting/work).
+
+## c29 list walk: buffer 11 is a page wrapper; aliasing-fix attempts — 2026-11-12 09:40 +05 (Claude)
+- c29 reads AND writes its slots 10/11 itself: per-workgroup linked lists (heads in LDS via atomic_exchange, next pointers stored to
+  buffers[11] at base cb[0x20] + tgid.x * cb[0x22] + mbcnt offset; mbcnt pair-path translation checked correct). fb1 ([CsBuf]):
+  slot 11 = 36 MiB at a moving address (0x8249a10000, 0x824a080000 ...) with no physical backing -> a "page" wrapper keyed by its
+  start page: a new MTLBuffer over the same pages almost every dispatch (aliases, known incoherent on this GPU).
+- Patch .porting/work/page-cache-disjoint-wrappers.patch (NOT applied): page cache as disjoint intervals (reuse a containing wrapper,
+  else wrap the union and drop overlapped ones) + widen to the committed VirtualRanges entry (TryGetGuestMappedRange). Results:
+  nw1 hang status 2 (packet never scheduled, before c29 ran); nw2 c29 hang right after a [PageUnion] merge re-wrapped 0x824a070000
+  (supports the alias theory: every merge is a new alias); nw3 merges still happen, hang status 2 in a draw packet. Status-2 hangs
+  appeared only with the patch -> reverted, tree = HEAD f5a422ea + Codex MSL policy (uncommitted).
+- Next idea: no re-wrapping at all for these ranges, e.g. one MTLBuffer per guest reservation made at map time (mmap/direct-memory
+  map), so every later binding is an offset into it; check the status-2 cause first (log residency / wrapper creation timing).
+
+## c29 hang = endless linked-list walk in c29 — 2026-11-12 09:00 +05 (Claude)
+- pg5 (KYTY_MSL_PROGRESS + NOCLEAR) hung in 71 s; 48 of 144 groups had simdgroups spinning in progress loop id 12 = MSL loop at
+  d6a4c426 line 12779 (inside 12584): `while any lane (v1867 && v1868 != 0xffffffff)`, node = v1868 >> 12, next =
+  buffers[11][...] (bounds-checked; out of range reads 0, a valid node). 1-4 million iterations in 2 s -> the list in buffer 11
+  is cyclic/garbage in game. Simdgroups that left the loop wait at the next barrier (16630).
+- gs1 (KYTY_GDS_STATE_LOG): at c29 only GDS[0],[1],[16],[17] are non-zero; GDS[8192..] is never used, so the pg3/pg4 per-dispatch
+  clear did not change data (no-hang runs are 3 of 8: mx1, pg3, pg4).
+- Next: who writes buffer 11 (c29 slot 11 address/size, its writer kernel in the hair chain) and why its links can be stale or
+  cyclic in game but not in a replay: wrappers over the same pages (GetBufferForGuestRange "page" path when a range crosses a 64 MiB
+  chunk) aliasing the writer's buffer, OOB node indices reading 0, or a missed reset of the list heads/next array.
+
+## c29 hang chase: offline LDS poison + in-game progress tags — 2026-11-12 08:30 +05 (Claude)
+- Offline: c29 replay (f386 1.5 ms, sn1 GDS[0]=4337 18 ms) is unchanged with LDS pre-filled 0 / 0xffffffff / 0x7f7fffff / 1:
+  not an uninitialized-LDS read.
+- KYTY_MSL_PROGRESS=c29caf0c1cb0ad94 (commit above). pg1/pg2 hung: the work queue was drained up to 2-3 groups (GDS[1]-GDS[0] =
+  141/142 of 144); all tags at/after the barrier right after the ds_inc take; no lane missing at a barrier (pg2 masks empty). The
+  unfinished groups' slots held stale tags -> pg3 clears the slots per dispatch: 25 min, no hang (heisenbug or luck).
+- Fences: every OrderBegin encodes into the current command buffer; CS overlap off; no cross-buffer fence deadlock found.
+- Compute buffers are bound with size = sizes[b] (V# size), so the shader bound check never reads past the bound allocation.
+- White menu persists with the SGPR fix (pg3 last frames mean 229).
+Next: repeat pg runs to catch a hang with cleared slots (zero slot = group never stored -> not launched/stuck before entry).
+
+## Game run mx2 (SGPR packing fix, build 6f6f2bfd, HEAD 0e41aed2 + Codex MSL-version policy) — 2026-11-12 07:31 +05 (Claude)
+- c29 hang again: the FIRST c29 dispatch (new native b4ced3d90748bb53) right after its compile, ~5.5 min in, packet did not finish in 2 s
+  (status 3), before the menu. mx1 (same policy, before the SGPR fix) had no hang in 11 min: still intermittent, the SGPR fix neither
+  causes nor cures it. Marker archived after a host check (gds-trip/mx2-HOST_GPU_TESTS_BLOCKED.archived). No menu frames to compare.
+
+## MSL emitter queues 4-6 + soft f64 attempt — 2026-11-12 08:00 +05 (Claude)
+- --metal-cases 308 -> 317 of 419 (commits 99df9d4f..0e41aed2). Game-relevant: GetUserData read pc_data.dwords[<register>] while push data
+  holds the used registers packed (user_data_registers order from push_data_start_dword) -> fixed (99df9d4f, also fixed
+  ScalarZeroShift/ScalarB32MaskDataflow x2); the compute push "fill zero dwords with user_data[i]" hack removed (ad564481). Not yet
+  checked in game. Also: fract NaN/inf, partial-record formatted loads, bpermute source exec, getpc, 64-bit LDS atomics (address
+  wraps at 64 KiB and aligns to 8), runner binds buffer slots at their storage offsets (fe449a04).
+- TBufferStoreVariants: format (14,7) decodes to Prospero k11_11_10SNorm but the test expects raw dwords -> check how the SPIR-V
+  path stores it before any job (my first spec assumed 11_11_10 float and misled Ornith twice).
+- Soft f64 (8 cases, no double in Metal): judge tools/softf64/check.py (compiles kyty_f64.h as C++ and compares 13 functions with
+  the host double, --only <set>). Ornith cannot write it (64-bit results typed uint, wrong field masks; 24 steps without progress);
+  needs a hand-written library. kyty_f64.h in the tree is Ornith's broken stage-1 draft (uncommitted).
+
+## Game run mx1 with the 13 MSL fixes (+ Codex's uncommitted MSL-version policy) — 2026-11-12 06:10 +05 (Claude)
+- Build sha 83c182e0…; lean run, auto j:8; run1.sh time-limit watcher stopped at 5 min on the user's request (in-process HostBudget
+  40 GiB guard kept), closed by the user after ~11 min. 368 CS compiled (MSL source changed, so all recompiled), FPS 0..2 while compiling.
+- Reached the main menu (FC NEWS / The Grounds / Ultimate Team ...). No c29 hang / GPU timeout in this run (one run: not proof).
+- Last ~20 frames of the menu are washed out white-pink (mean brightness 225-253). Unknown whether this is the old transient white menu
+  or a regression from today's emitter changes / the MSL 4.0 policy: needs an A/B (7149c478^ build vs HEAD) before any claim.
+  Frames: work/gds-trip/frames-mx1, log lean/mx1-055007.log.
+
+## MSL translator judged by the RDNA TestCases on Metal; Ornith writes the fixes — 2026-11-12 05:50 +05 (Claude)
+- `shader_recompiler_compute_tests --metal-cases` (7149c478) runs the 419 RDNA TestCases through TranslateProgram -> CompileProgram ->
+  Msl::EmitProgram -> Metal (images/samplers/flattened SRT skipped). `tools/check_metal_cases.py` builds+runs it, proves the comparison
+  with a corrupted-expectation run, and has `--require <cases> --baseline .porting/work/metal-cases-baseline.txt` for emitter jobs.
+- 266 -> 299 passing. Commits dfd78221 f6cf876a 2fcc5c16 530f8612 c3af660e ba1c93ec f73ba51e 458b1917 b0cbe784 4f821c65 cd209791 c9c0459b:
+  int64 compares, SINT sign extension + float11/10 unpack (game-relevant), ldexp, FindUMsb64, RDNA min/max (-0/+0, NaN), byte/short
+  stores, float buffer atomics, buffer and_x2, exact f16 RTE stores, ds_min/max_f32 (compare DATA1, write DATA0).
+- Workflow: /Users/tx/Developer/local-worker/emitter_queue.py <jobs.json> runs Ornith jobs sequentially; the script re-runs the check
+  itself, commits on PASS, restores the file on FAIL (diff + check saved in work/jobs). Review every PASS diff: tests passed with wrong
+  edges twice (f16 RTE overflow/carry, and_x2 bounds).
+- Left (37): SharedAtomicOr64/IAdd64 (6, need 64-bit LDS atomics design), f64 ops (8, no double in Metal: soft-float), StoreAddressU32
+  scratch/flat (3), unknown buffer formats (3), ~16 value mismatches to triage (runner ABI vs emitter: push extent, storage offsets,
+  zero-stride tbuffer, dpp8, bpermute, wide GDS bounds, fract f16 NaN).
+
+## Claude took over from Codex 1992 — 2026-11-12 03:50 +05 (Claude)
+- Codex 1992 stopped at 03:29 with kernel_jobs.py prepared (job vop3lerp: Ornith hand-writes MSL for an AnyPS5 sample, GPU compare). That checks Ornith, not KyTx: the MSL it writes never enters the emulator.
+- Better oracle, not started yet: every AnyPS5 execution sample holds real RDNA words + user data + inputs + a CPU Check, and tests/ShaderRecompilerComputeTests.cpp already has 359 RDNA TestCases (code/initial/expected/user_data/GDS). Both currently run only through the Vulkan/SPIR-V path. A Metal-native runner (TranslateProgram -> MaterializeResources -> CompileProgram -> Msl::EmitProgram -> dispatch: argument buffer(0), PushData(1) = packed_user_data at push_data_start_dword, sizes(25), GDS id 161) would make them conformance tests of the MSL translator. Ornith ports samples to TestCase form, failures are fixed in MslEmitter under the test.
+- c29 barrier structure checked by hand: 7 barriers, 5 inside the item loop, whose trip count is workgroup-uniform (mask from buffer[item], exit from popcount of 8 LDS words read after a barrier). No barrier divergence.
+- local_worker: stops after 8 consecutive refused commands and warns after 3 (q2 run looped 80 pipe variants).
+- Marker HOST_GPU_TESTS_BLOCKED (ci1) still present. Uncommitted: Codex's metalCompilePolicy.h MSL-version fix (CPU-tested only), split-import diagnostic, CanonImg log.
+
+## In progress: Codex continuation + per-kernel Ornith workflow — 2026-11-12
+Read named Claude session945ca8da-23db-4449-9627-8cffec6d7bd4 through final limit at02:37+05. User clarified current aim: delegate actual kernels/samples to Ornith, Codex reviews/verifies, rather than logs only. Building isolated sequential kernel-job workflow in /Users/tx/Developer/local-worker; first real reference sample AnyPS5 Vop3Lerp.cpp. No worker/emulator is running now.
+Fresh CI1 fault marker MUST remain: ci1-030603.log PID93287 exited after2s at c29 native94f477b77168bdf5, status3 Scheduled, second dispatch TraceFlip383. Actual canonical imports for res1/res2 both completed separately; prior c29+2 writebacks completed. res0 was cached (no new import logged). No GPU probes after fault. Existing local_worker correctly refuses to start while marker exists, so preparing CPU-only workflow/compilers now.
+Completed: local Ornith barrier map7 sites (bounded follow-up), independently checked; mini-replay with80 real tile24/9 imports+c29,74,045,440 written bytes +5,785,600 depth-input bytes exact under API+GPU validation. This used OLD implicit language setting in replay. New opt-in KYTY_GDS_TRIP_SPLIT_IMPORTS diagnostic in renderer/canonicalMip. Miniprogram artifacts work/claude-continuation-2026-11-12.
+FOUND actual compiler-policy bug: #if defined(MTLLanguageVersion4_0/3_2) checks enum names, so native shaders/presenter always selected3.0; replay default uses latest, per Apple docs. Replaced with shared metalCompilePolicy.h (SDK+runtime gates; native max4.0), corrected Metal4 capability query.16 CPU SDK/OS cases+runtime selection PASS, old-selector negative FAIL, product build PASS. Offline c29 source compilation metal4.0 PASS (CPU compiler, no device). NO GPU/game verification of policy fix; do not claim c29 fixed. Current shader/presenter/context edits remain uncommitted; initial renderer15-line CanonImg diagnostic preserved. Verified launch hash still belongs to CI1, not latest build; block retained.
+
 ## c29 hang: it is the packet with c29 and its canonical IMPORTS — 2026-11-11 23:05 +05 (Claude)
 - KYTY_GDS_TRIP_SPLIT_WB=1 (diagnostic): c29 is committed in its own packet, then each canonical writeback of its storage images in its own packet, with a log line per image/writeback. sw2: the hang came before "writeback 0 committing", i.e. in the packet holding c29's pre-dispatch imports + c29 (an empty "[HostBudget] packet:" label only means no op was labelled without KYTY_MTL_SPLIT_OPS; sw1's reading "the writeback hung" was wrong).
 - That packet re-imports two canonical images every frame (GuestWrites says the GPU wrote them): res 0 = scene depth read as R32F, tile mode 24, 1784x1008 (its guest bytes are not depth values: see the capture analysis above) and res 2 = R32F output, both via Gather + EncodeTileTextureImport. The offline replay skips these imports (textures come from the capture), which fits "same inputs, 17 ms offline, hang in game". Next: time/split the tile-24 depth import and the res 2 import from c29 (commit+wait after imports was dd1 and still hung, so check whether that drained packet or c29's was the one), and decide what c29 must see for a depth target (Metal depth texture vs guest bytes).
