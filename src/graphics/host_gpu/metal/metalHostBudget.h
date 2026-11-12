@@ -16,6 +16,8 @@
 #include <thread>
 #include <unistd.h>
 
+extern "C" __attribute__((weak)) const char* KytyHostBudgetTimeoutReport();
+
 namespace Libs::Graphics::Metal::HostBudget {
 
 [[noreturn]] inline void Stop(const char* reason) {
@@ -149,6 +151,8 @@ inline void Commit(id<MTLCommandBuffer> command) {
 			std::fprintf(stderr, "[HostBudget] packet did not finish in 2s, Metal status=%ld; stopping submissions (this cannot preempt a hung GPU kernel)\n",
 			             static_cast<long>(command.status));
 			if (command.label) std::fprintf(stderr, "[HostBudget] packet: %.6000s\n", command.label.UTF8String);
+			// The renderer, when linked, describes GPU-visible state the hung packet left (GDS work-queue indices, progress tags).
+			if (KytyHostBudgetTimeoutReport != nullptr) std::fprintf(stderr, "[HostBudget] state: %s\n", KytyHostBudgetTimeoutReport());
 			std::fflush(stderr);
 			Stop("GPU packet timeout; inspect host before another launch");
 		}

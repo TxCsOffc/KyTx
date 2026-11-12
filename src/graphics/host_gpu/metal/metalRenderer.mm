@@ -1928,6 +1928,13 @@ static id<MTLBuffer> GdsBuffer() {
 	return s_gds;
 }
 
+std::string KytyDescribeGds();
+// metalHostBudget.h calls this (weak) when a packet times out.
+extern "C" const char* KytyHostBudgetTimeoutReport() {
+	static std::string s_text;
+	s_text = KytyDescribeGds();
+	return s_text.c_str();
+}
 // The first GDS dwords as the GPU left them (the watchdog report: a GDS work queue's count and index when its kernel hangs).
 std::string KytyDescribeGds() {
 	const auto* d = static_cast<const uint32_t*>([GdsBuffer() contents]);
@@ -1936,6 +1943,27 @@ std::string KytyDescribeGds() {
 		char item[24];
 		std::snprintf(item, sizeof(item), "%s[%u]=%u", i == 0 ? "" : " ", i, d[i]);
 		text += item;
+	}
+	// KYTY_MSL_PROGRESS: where lane 0 of each simdgroup of the instrumented kernel was (MslEmitter ProgressStore): tag/count per slot.
+	if (std::getenv("KYTY_MSL_PROGRESS") != nullptr) {
+		std::map<uint32_t, uint32_t> tags;
+		text += " progress:";
+		for (uint32_t slot = 0; slot < 2048; ++slot) {
+			const uint32_t tag = d[8192 + slot * 2], count = d[8193 + slot * 2];
+			if (tag == 0) continue;
+			++tags[tag];
+			char item[64];
+			// Lanes still marked as arrived at a barrier (KYTY_MSL_PROGRESS arrival masks at GDS[9600 + slot]).
+			if (d[9600 + slot] != 0) std::snprintf(item, sizeof(item), " %u:%x/%u@%08x", slot, tag, count, d[9600 + slot]);
+			else std::snprintf(item, sizeof(item), " %u:%x/%u", slot, tag, count);
+			text += item;
+		}
+		text += " | tag histogram:";
+		for (const auto& [tag, n]: tags) {
+			char item[32];
+			std::snprintf(item, sizeof(item), " %x*%u", tag, n);
+			text += item;
+		}
 	}
 	// KYTY_LOOP_TRIP_GDS: runaway-loop guard trips per loop id (MslEmitter kMslLoopTripGdsBase, the last 8 dwords).
 	if (std::getenv("KYTY_LOOP_TRIP_GDS") != nullptr) {
@@ -9039,6 +9067,11 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 	const uint64_t trip_guest = compute_info.stage.program ? compute_info.stage.program->guest_hash : 0;
 	if (GdsTripWatched(trip_guest, cs_hash)) {
 		GdsTripBeginWatch(trip_guest, cs_hash, thread_group_x, thread_group_y, thread_group_z, indirect_args_addr);
+	}
+	// KYTY_MSL_PROGRESS=<guest hash>: clear the kernel's progress slots and arrival masks (GDS[8192 .. 9600 + 2048)) before it is
+	// encoded, so after a hang a zero slot is a simdgroup that never stored anything in this dispatch (no packet is in flight here).
+	if (const char* prog = KYTY_ENV("KYTY_MSL_PROGRESS"); prog != nullptr && trip_guest != 0 && std::strtoull(prog, nullptr, 16) == trip_guest) {
+		std::memset(static_cast<uint32_t*>([GdsBuffer() contents]) + 8192, 0, (9600 + 2048 - 8192) * sizeof(uint32_t));
 	}
 	uint32_t   gds_trip_value = 0;
 	const bool gds_trip       = compute_info.stage.program && GdsTripCheck(trip_guest, cs_hash, gds_trip_value);

@@ -130,6 +130,17 @@ struct Emitter {
 	// <limit> it adds 1 to GDS[16376 + id % 8], stores id + 1 into GDS[16368] and leaves the loop, so the watchdog report
 	// (KYTY_LOOP_TRIP_GDS=1) names a runaway loop instead of the GPU hanging. Never on by default: it changes results once it trips.
 	uint64_t loop_trip_limit_ = 0;
+	// KYTY_MSL_PROGRESS=<guest hash> (diagnostic, GDS kernels only): lane 0 of every simdgroup records where it is in GDS
+	// [8192 + 2 * (tgid.x * 4 + simdgroup)] = site tag (loop id + 1, 0x80000000 | barrier id, 0x40000000 | CAS id) and the next dword
+	// = iterations of the current loop. Plain relaxed stores, no other change to the kernel; read after a GPU hang (KytyDescribeGds).
+	bool     progress_      = false;
+	uint32_t progress_next_ = 0;
+	std::string ProgressStore(const std::string& tag, const std::string& count = "") const {
+		const std::string slot = "(8192u + ((tgid.x * 4u + (liid >> 5u)) & 2047u) * 2u)";
+		std::string out = "\t\tif ((lane & 31u) == 0u) { atomic_store_explicit(&ab.gds[" + slot + "], " + tag + ", memory_order_relaxed);";
+		if (!count.empty()) out += " atomic_store_explicit(&ab.gds[" + slot + " + 1u], " + count + ", memory_order_relaxed);";
+		return out + " }\n";
+	}
 	uint32_t loop_trip_next_  = 0;
 	bool     store_trace_ = false; // KYTY_MSL_STORE_TRACE=<guest hash,...>: active raw dword store ranges and float-bit NaN counts
 	std::set<uint32_t> value_trace_; // KYTY_MSL_VALUE_TRACE=<guest hash>,<id>,...: first guest lanes' scalar values
@@ -2139,6 +2150,11 @@ struct Emitter {
 					body << "\t\tif (++kyty_trip_" << id << " > " << loop_trip_limit_ << "u) { atomic_fetch_add_explicit(&ab.gds[16376u + "
 					     << (id % 8u) << "u], 1u, memory_order_relaxed); atomic_store_explicit(&ab.gds[16368u], " << (id + 1u)
 					     << "u, memory_order_relaxed); break; }\n";
+				} else if (progress_) {
+					const uint32_t id = progress_next_++;
+					body << "\tuint kyty_prog_" << id << " = 0u;\n";
+					body << "\twhile (true) {\n";
+					body << ProgressStore(std::to_string(id + 1u) + "u", "++kyty_prog_" + std::to_string(id));
 				} else {
 					body << "\twhile (true) {\n";
 				}
@@ -2901,11 +2917,23 @@ struct Emitter {
 					     << Expr(inst.Arg(1)) << " : kyty_old, memory_order_relaxed, memory_order_relaxed)) {}\n\t\t\t}\n";
 				} else if (op == IR::ValueOpcode::SharedAtomicInc32 || op == IR::ValueOpcode::SharedAtomicDec32) {
 					// No native MSL atomic for the wrapping inc/dec: CAS loop on the threadgroup dword.
+					const uint32_t cas_id = progress_ ? progress_next_++ : 0u;
+					if (progress_) body << ProgressStore(std::to_string(0x40000000u | cas_id) + "u", "0u");
 					body << "\t\t\t{\n\t\t\t\t" << space << " atomic_uint* kyty_p = (" << space << " atomic_uint*)&" << slot << ";\n"
-					     << "\t\t\t\tuint kyty_old = atomic_load_explicit(kyty_p, memory_order_relaxed);\n"
-					     << "\t\t\t\twhile (!atomic_compare_exchange_weak_explicit(kyty_p, &kyty_old, "
-					     << SharedAtomicNew(op, "kyty_old", value) << ", memory_order_relaxed, memory_order_relaxed)) {}\n"
-					     << "\t\t\t\t" << Name(inst) << " = kyty_old;\n\t\t\t}\n";
+					     << "\t\t\t\tuint kyty_old = atomic_load_explicit(kyty_p, memory_order_relaxed);\n";
+					if (progress_) {
+						// Same CAS loop, counting its retries (stored every 1024) so a spinning compare-exchange shows up after a hang.
+						body << "\t\t\t\tuint kyty_cas = 0u;\n"
+						     << "\t\t\t\twhile (!atomic_compare_exchange_weak_explicit(kyty_p, &kyty_old, "
+						     << SharedAtomicNew(op, "kyty_old", value) << ", memory_order_relaxed, memory_order_relaxed)) {\n"
+						     << "\t\t\t\t\tif ((++kyty_cas & 1023u) == 0u) " << ProgressStore(std::to_string(0x40000000u | cas_id) + "u", "kyty_cas")
+						     << "\t\t\t\t}\n";
+					} else {
+						body << "\t\t\t\twhile (!atomic_compare_exchange_weak_explicit(kyty_p, &kyty_old, "
+						     << SharedAtomicNew(op, "kyty_old", value) << ", memory_order_relaxed, memory_order_relaxed)) {}\n";
+					}
+					body << "\t\t\t\t" << Name(inst) << " = kyty_old;\n\t\t\t}\n";
+					if (progress_) body << ProgressStore(std::to_string(0x20000000u | cas_id) + "u");
 				} else {
 					std::string call;
 					const char* fn = "atomic_fetch_add_explicit";
@@ -3239,8 +3267,20 @@ void Emitter::EmitAlu(const Inst& inst) {
 			return;
 		case IR::ValueOpcode::Barrier:
 			if (program.stage == ShaderType::Compute || program.stage == ShaderType::Mesh) {
+				const uint32_t barrier_id = progress_ ? progress_next_++ : 0u;
+				const std::string arrived = "ab.gds[9600u + ((tgid.x * 4u + (liid >> 5u)) & 2047u)]";
+				if (progress_) {
+					// Every lane sets its bit in its simdgroup's arrival mask before the barrier and clears it after: a hung barrier
+					// leaves the lanes that arrived set and shows which lanes never came.
+					body << ProgressStore(std::to_string(0x80000000u | barrier_id) + "u");
+					body << "\t\tatomic_fetch_or_explicit(&" << arrived << ", 1u << (lane & 31u), memory_order_relaxed);\n";
+				}
 				body << "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup | "
 				        "mem_flags::mem_device);\n";
+				if (progress_) {
+					body << "\t\tatomic_fetch_and_explicit(&" << arrived << ", ~(1u << (lane & 31u)), memory_order_relaxed);\n";
+					body << ProgressStore(std::to_string(0xC0000000u | barrier_id) + "u");
+				}
 			} else {
 				Unsupported(inst, "barrier outside compute");
 			}
@@ -3426,6 +3466,13 @@ std::string Emitter::Emit() {
 			loop_trip_limit_ = std::strtoull(end + 1, nullptr, 0);
 			std::fprintf(stderr, "[LoopTrip] guest=0x%016llx limit=%llu\n", (unsigned long long)hash, (unsigned long long)loop_trip_limit_);
 		}
+	}
+	if (const char* prog = std::getenv("KYTY_MSL_PROGRESS"); prog != nullptr && program.stage == ShaderType::Compute &&
+	    std::strtoull(prog, nullptr, 16) == program.shader_hash &&
+	    std::any_of(program.bindings.descriptors.begin(), program.bindings.descriptors.end(),
+	                [](const auto& b) { return b.kind == IR::DescriptorBindingKind::Gds; })) {
+		progress_ = true;
+		std::fprintf(stderr, "[MslProgress] guest=0x%016llx instrumented\n", (unsigned long long)program.shader_hash);
 	}
 	if (const char* trace = std::getenv("KYTY_MSL_STORE_TRACE"); trace != nullptr && program.stage == ShaderType::Compute) {
 		for (const char* p = trace; *p != '\0';) {
@@ -3839,6 +3886,7 @@ inline uint kyty_float_atomic_combine(uint old_bits, uint value_bits, bool max_v
 	}
 
 	if (nan_trace_ && program.stage != ShaderType::Compute) out << "\tuint kyty_first_nan = 0u;\n";
+	if (progress_) out << ProgressStore("0xA0000000u", "0u"); // entered: the slot was cleared by the renderer before this dispatch
 	if (pair_) {
 		// Host thread (simdgroup s, lane l) of a one-dimensional group stands for the guest threads 64*s + l and 64*s + 32 + l.
 		out << "\tconst uint kyty_gl0 = ((liid >> 5u) << 6u) | (lane & 31u);\n";
