@@ -3039,6 +3039,8 @@ void Emitter::EmitAlu(const Inst& inst) {
 		case IR::ValueOpcode::ShiftLeftLogical32: EmitAssignment(inst, Binary(inst, "<<")); return;
 		case IR::ValueOpcode::ShiftLeftLogical64:
 			EmitAssignment(inst, "(" + Expr(inst.Arg(0)) + " << (" + Expr(inst.Arg(1)) + " & 63u))"); return;
+		case IR::ValueOpcode::IAdd64: EmitAssignment(inst, Binary(inst, "+")); return;
+		case IR::ValueOpcode::GetShaderBase: EmitAssignment(inst, "0ul"); return;
 		case IR::ValueOpcode::ShiftRightLogical64:
 			EmitAssignment(inst, "(" + Expr(inst.Arg(0)) + " >> (" + Expr(inst.Arg(1)) + " & 63u))"); return;
 		case IR::ValueOpcode::ShiftRightArithmetic64:
