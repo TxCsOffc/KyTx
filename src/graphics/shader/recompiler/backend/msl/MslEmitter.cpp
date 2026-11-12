@@ -768,6 +768,18 @@ struct Emitter {
 		return "(" + expr + ")";
 	}
 
+	// Scratch (private per-invocation) memory, as the SPIR-V path: the 64-bit address low/high plus the signed immediate; only an address
+	// whose high dword is 0 and whose dword index is below program.scratch_dwords reaches the per-lane array (loads read 0 otherwise,
+	// stores are dropped). Each guest lane has its own array (kyty_scratch, and kyty_scratch_h for the second lane of a wave64 pair).
+	std::string ScratchArray() const { return half_ != 0u ? "kyty_scratch_h" : "kyty_scratch"; }
+	std::string ScratchByte(const Inst& inst, const IR::MemoryInfo& mem) {
+		return "(((ulong(" + Expr(inst.Arg(2)) + ") << 32) | ulong(" + Expr(inst.Arg(1)) + ")) + ulong(long(" +
+		       std::to_string(static_cast<int32_t>(mem.offset)) + ")))";
+	}
+	std::string ScratchValid(const std::string& byte) const {
+		return "((" + byte + " >> 32) == 0ul && (" + byte + " >> 2) < " + std::to_string(program.scratch_dwords) + "ul)";
+	}
+
 	// A buffer load with GLC/DLC bypasses the per-CU caches on RDNA (another workgroup's store is seen: a published flag or ticket
 	// polled in a loop). Plain MSL device loads may be served from a non-coherent cache or hoisted out of the loop: read such a word
 	// with a device-coherent atomic load instead (the SPIR-V path marks these accesses Volatile).
@@ -2541,6 +2553,15 @@ struct Emitter {
 				// replaces their shader consumers with materialized argument slots.
 				if (Mem(inst).planning_only) return;
 				const auto& mem = Mem(inst);
+				if (mem.kind == IR::ResourceKind::Scratch && program.scratch_dwords != 0u) {
+					const uint32_t bytes = inst.GetOpcode() == ValueOpcode::LoadAddressU8 ? 1u
+					                       : inst.GetOpcode() == ValueOpcode::LoadAddressU16 ? 2u : 4u;
+					const std::string b = ScratchByte(inst, mem);
+					std::string word = ScratchArray() + "[uint(" + b + " >> 2)]";
+					if (bytes != 4u) word = "((" + word + " >> (uint(" + b + " & 3ul) * 8u)) & " + (bytes == 1u ? "0xffu" : "0xffffu") + ")";
+					EmitAssignment(inst, "((" + Expr(inst.Arg(3)) + ") && " + ScratchValid(b) + " ? " + word + " : 0u)");
+					return;
+				}
 				if (!HasDescriptor(IR::DescriptorBindingKind::BdaPagetable) ||
 				    (mem.kind != IR::ResourceKind::ScalarAddress && mem.kind != IR::ResourceKind::Flat &&
 				     mem.kind != IR::ResourceKind::Global)) {
@@ -2765,6 +2786,29 @@ struct Emitter {
 					const std::string arg = signed_op ? "(int)" + value : value;
 					body << "\t\t\t" << Name(inst) << " = " << (signed_op ? "as_type<uint>(" : "(") << fn << "((" << ptr_type
 					     << ")" << elem << ", " << arg << ", memory_order_relaxed));\n";
+				}
+				body << "\t\t}\n";
+				return;
+			}
+			case IR::ValueOpcode::StoreAddressU8:
+			case IR::ValueOpcode::StoreAddressU16:
+			case IR::ValueOpcode::StoreAddressU32: {
+				const auto& mem = Mem(inst);
+				if (mem.kind != IR::ResourceKind::Scratch || program.scratch_dwords == 0u) {
+					Unsupported(inst, "side effect not lowered");
+					return;
+				}
+				const uint32_t bytes = inst.GetOpcode() == ValueOpcode::StoreAddressU8 ? 1u
+				                       : inst.GetOpcode() == ValueOpcode::StoreAddressU16 ? 2u : 4u;
+				const std::string b = ScratchByte(inst, mem), arr = ScratchArray() + "[uint(" + b + " >> 2)]";
+				body << "\t\tif ((" << Expr(inst.Arg(4)) << ") && " << ScratchValid(b) << ") {\n";
+				if (bytes == 4u) {
+					body << "\t\t\t" << arr << " = " << Expr(inst.Arg(3)) << ";\n";
+				} else {
+					const std::string mask = bytes == 1u ? "0xffu" : "0xffffu";
+					body << "\t\t\tconst uint kyty_ss = uint(" << b << " & 3ul) * 8u;\n"
+					     << "\t\t\t" << arr << " = (" << arr << " & ~(" << mask << " << kyty_ss)) | ((uint(" << Expr(inst.Arg(3)) << ") & "
+					     << mask << ") << kyty_ss);\n";
 				}
 				body << "\t\t}\n";
 				return;
@@ -3923,6 +3967,10 @@ inline uint kyty_float_atomic_combine(uint old_bits, uint value_bits, bool max_v
 	}
 
 	if (nan_trace_ && program.stage != ShaderType::Compute) out << "\tuint kyty_first_nan = 0u;\n";
+	if (program.scratch_dwords != 0u && program.stage == ShaderType::Compute) {
+		out << "\tuint kyty_scratch[" << program.scratch_dwords << "] = {};\n";
+		if (pair_) out << "\tuint kyty_scratch_h[" << program.scratch_dwords << "] = {};\n";
+	}
 	if (progress_) out << ProgressStore("0xA0000000u", "0u"); // entered: the slot was cleared by the renderer before this dispatch
 	if (pair_) {
 		// Host thread (simdgroup s, lane l) of a one-dimensional group stands for the guest threads 64*s + l and 64*s + 32 + l.
