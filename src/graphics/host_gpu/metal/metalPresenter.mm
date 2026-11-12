@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/metal/metalCompilePolicy.h"
 #include "graphics/host_gpu/metal/metalPresenter.h"
 #include "graphics/host_gpu/metal/metalBuffer.h"
 #include "graphics/host_gpu/metal/metalContext.h"
@@ -163,13 +164,7 @@ struct MetalPresenter::Impl {
 			"}\n";
 
 		MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-#if defined(MTLLanguageVersion4_0)
-		opts.languageVersion    = MTLLanguageVersion4_0;
-#elif defined(MTLLanguageVersion3_2)
-		opts.languageVersion    = MTLLanguageVersion3_2;
-#else
-		opts.languageVersion    = MTLLanguageVersion3_0;
-#endif
+		opts.languageVersion = NativeMslLanguageVersion();
 
 
 		id<MTLLibrary> lib = [device newLibraryWithSource:shader_src options:opts error:&error];

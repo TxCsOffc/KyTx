@@ -121,8 +121,8 @@ void MetalContext::QueryCapabilities() {
 		m_capabilities.supports_metal3 = false;
 	}
 
-#if defined(MTLLanguageVersion4_0)
-	m_capabilities.supports_metal4 = true;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+	if (@available(macOS 26.0, *)) m_capabilities.supports_metal4 = [m_device supportsFamily:MTLGPUFamilyMetal4];
 #endif
 
 	if (@available(macOS 11.0, *)) {

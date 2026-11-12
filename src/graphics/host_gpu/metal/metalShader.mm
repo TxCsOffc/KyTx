@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/metal/metalCompilePolicy.h"
 #include "graphics/host_gpu/metal/metalEnv.h"
 #include "graphics/host_gpu/metal/metalShader.h"
 #include "graphics/host_gpu/metal/metalShaderAbi.h"
@@ -276,13 +277,7 @@ id<MTLFunction> MetalShaderManager::GetFunction(uint64_t hash) {
 				device = MetalContext::Instance().GetDevice();
 			}
 			MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
-#if defined(MTLLanguageVersion4_0)
-			opts.languageVersion = MTLLanguageVersion4_0;
-#elif defined(MTLLanguageVersion3_2)
-			opts.languageVersion = MTLLanguageVersion3_2;
-#else
-			opts.languageVersion = MTLLanguageVersion3_0;
-#endif
+			opts.languageVersion = NativeMslLanguageVersion();
 			ApplyMslMathMode(opts);
 			NSError* err = nil;
 			id<MTLLibrary> lib = [device newLibraryWithSource:source_str options:opts error:&err];
@@ -435,13 +430,7 @@ MetalShaderCompileResult MetalShaderManager::CompileSpirvToFunction(
 		}
 
 		MTLCompileOptions* compile_options = [[MTLCompileOptions alloc] init];
-#if defined(MTLLanguageVersion4_0)
-		compile_options.languageVersion    = MTLLanguageVersion4_0;
-#elif defined(MTLLanguageVersion3_2)
-		compile_options.languageVersion    = MTLLanguageVersion3_2;
-#else
-		compile_options.languageVersion    = MTLLanguageVersion3_0;
-#endif
+		compile_options.languageVersion = NativeMslLanguageVersion();
 		ApplyMslMathMode(compile_options);
 
 		NSError*  error      = nil;
@@ -533,13 +522,7 @@ MetalShaderCompileResult MetalShaderManager::CompileMslToFunction(
 		}
 
 		MTLCompileOptions* compile_options = [[MTLCompileOptions alloc] init];
-#if defined(MTLLanguageVersion4_0)
-		compile_options.languageVersion = MTLLanguageVersion4_0;
-#elif defined(MTLLanguageVersion3_2)
-		compile_options.languageVersion = MTLLanguageVersion3_2;
-#else
-		compile_options.languageVersion = MTLLanguageVersion3_0;
-#endif
+		compile_options.languageVersion = NativeMslLanguageVersion();
 		ApplyMslMathMode(compile_options);
 
 		NSError*  error      = nil;
