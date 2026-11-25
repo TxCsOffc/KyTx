@@ -96,7 +96,7 @@ const char* MslType(IR::Type type) {
 		case IR::Type::F16: return "half";
 		case IR::Type::F32: return "float";
 		case IR::Type::U64: return "ulong";
-		case IR::Type::F64: return "double";
+		case IR::Type::F64: return "ulong"; // Metal has no native double type.
 		case IR::Type::U32x2: return "uint2";
 		case IR::Type::U32x3: return "uint3";
 		case IR::Type::U32x4: return "uint4";
@@ -283,7 +283,11 @@ struct Emitter {
 						}
 						break;
 					case IR::StageInputKind::Layer:
-					case IR::StageInputKind::SampleId: unsupported.push_back("pixel input builtin"); break;
+						in_fields.push_back({"layer", "uint", "[[render_target_array_index]]"});
+						break;
+					case IR::StageInputKind::SampleId:
+						in_fields.push_back({"sample_id", "uint", "[[sample_id]]"});
+						break;
 					default: break;
 				}
 			}
@@ -312,6 +316,10 @@ struct Emitter {
 						break;
 					default: break;
 				}
+			}
+			if (input_info.pixel && input_info.pixel->alpha_blend_source_remap && !mrt_field.contains(1)) {
+				mrt_field[1] = "color1";
+				out_fields.push_back({"color1", "float4", "[[color(0), index(1)]]"});
 			}
 			pixel_location_count = static_cast<uint32_t>(in_fields.size());
 		}
@@ -662,13 +670,18 @@ struct Emitter {
 		return bits;
 	}
 
-	std::string TexelValue(const IR::ImageResource& image, const std::string& bits_in,
-	                       const IR::MemoryInfo* mem = nullptr) {
-		std::string bits = bits_in;
-		if (mem != nullptr && mem->data_bits == 16u) {
-			bits = "kyty_d16_unpack(" + bits_in + ", " + std::to_string(mem->dmask != 0u ? mem->dmask : 1u) + "u, " +
-			       (ImageIsFloatClass(image) ? "true" : "false") + ")";
+	std::string TexelValue(const IR::ImageResource& image, const std::string& logical,
+	                       uint32_t mask) {
+		// Metal writes the physical RGBA components. Reverse the descriptor's
+		// channel selection so a later sampled view sees the original logical values.
+		std::string bits = "uint4(";
+		for (uint32_t physical = 0; physical < 4u; ++physical) {
+			if (physical != 0) bits += ", ";
+			const uint32_t source = IR::ImageStoreSourceChannel(image.shader_swizzle, physical);
+			bits += source < 4u && ((mask >> source) & 1u) != 0 ?
+			    logical + "." + std::string(1, "xyzw"[source]) : "0u";
 		}
+		bits += ")";
 		switch (image.numeric_class) {
 			case Prospero::TextureNumericClass::Uint: return bits;
 			case Prospero::TextureNumericClass::Sint: return "as_type<int4>(" + bits + ")";
@@ -875,12 +888,21 @@ struct Emitter {
 	[[nodiscard]] uint32_t LdsDwords() const {
 		if (program.stage != ShaderType::Compute) return 2048u;
 		const uint32_t declared = input_info.compute ? input_info.compute->lds_size_dwords : 0u;
-		return declared != 0 ? std::min(declared, 8192u) : 8192u;
+		// Preserve the guest bounds. Metal validates the complete pipeline's
+		// threadgroup allocation against the selected device.
+		return declared != 0 ? declared : 8192u;
+	}
+
+	[[nodiscard]] bool UsesDeviceLds() const {
+		const auto* cs = input_info.compute;
+		return program.stage == ShaderType::Compute && cs != nullptr &&
+		       cs->metal_threadgroup_limit_dwords != 0 &&
+		       LdsDwords() > cs->metal_threadgroup_limit_dwords && UsesLds();
 	}
 
 	[[nodiscard]] bool UsesLds() const {
 		for (const auto& info: program.memory_info) {
-			if (info.kind == IR::ResourceKind::Lds) {
+			if (info.kind == IR::ResourceKind::Lds || (info.kind == IR::ResourceKind::Gds && !GdsMem(info))) {
 				return true;
 			}
 		}
@@ -961,6 +983,8 @@ struct Emitter {
 					unsupported.push_back("barycentric builtin without interface");
 				}
 				return;
+			case IR::StageInputKind::Layer: EmitAssignment(inst, "in.layer"); return;
+			case IR::StageInputKind::SampleId: EmitAssignment(inst, "in.sample_id"); return;
 			case IR::StageInputKind::WorkgroupId:
 				EmitAssignment(inst, std::string("tgid.") + ComponentName(comp));
 				return;
@@ -1006,6 +1030,39 @@ struct Emitter {
 		}
 		const auto attr = *attr_value;
 		const auto chan = *chan_value;
+		if (program.stage == ShaderType::Vertex && input_info.vertex != nullptr &&
+		    attr < 27u && attr < static_cast<uint32_t>(input_info.vertex->resources_num) &&
+		    program.info.buffers.size() <= 32u) {
+			const auto& vertex = *input_info.vertex;
+			const auto& resource = vertex.resources[attr];
+			const auto format = Format::GetFormatInfo(resource.Format());
+			const auto binding = vertex.resources_dst[attr].buffer_index;
+			if (!resource.SwizzleEnabled() && binding >= 0 && binding < vertex.buffers_num &&
+			    chan < format.component_count && format.component_bits[chan] > 0 &&
+			    format.component_bits[chan] <= 32 && format.type != Format::ComponentType::Unknown) {
+				const auto slot = std::to_string(32u + attr);
+				const auto bits = format.component_bits[chan];
+				const auto offset = format.packed_bitfield ? 0u : Format::GetFormatComponentByteOffset(format, chan);
+				const auto bytes = format.packed_bitfield ? 4u : (bits + 7u) / 8u;
+				const auto id = vertex.buffers[binding].fetch_index != 0 ? "iid" : "vid";
+				const auto stride = std::to_string(vertex.buffers[binding].stride);
+				const auto pos = "(ulong(" + std::string(id) + ") * " + stride + "u + " + std::to_string(offset) + "u)";
+				const auto ptr = "((device uchar*)ab.buffers[" + slot + "])";
+				std::string raw = "(";
+				for (uint32_t b = 0; b < bytes; ++b) {
+					if (b != 0) raw += " | ";
+					raw += "(uint(" + ptr + "[" + pos + " + " + std::to_string(b) + "u]) << " + std::to_string(b * 8) + "u)";
+				}
+				raw += ")";
+				if (format.packed_bitfield && bits < 32) {
+					raw = "((" + raw + " >> " + std::to_string(format.component_bit_offset[chan]) +
+					      "u) & " + U32Literal((1u << bits) - 1u) + ")";
+				}
+				EmitAssignment(inst, "(" + pos + " + " + std::to_string(bytes) + "u <= sizes[" + slot +
+				                        "] ? " + NormalizeFormatComponent(format, chan, raw) + " : 0u)");
+				return;
+			}
+		}
 		if (program.stage != ShaderType::Pixel) {
 			Unsupported(inst, "vertex-stage attribute fetch");
 			EmitAssignment(inst, "0u");
@@ -1021,8 +1078,21 @@ struct Emitter {
 		                        ComponentName(chan) + ")");
 	}
 
+	// Match the SPIR-V backend: a VM export updates whether this pixel survives.
+	bool TracksPixelValidMask() const {
+		return program.stage == ShaderType::Pixel &&
+		       std::ranges::any_of(program.export_info, [](const auto& exp) { return exp.vm; });
+	}
+
+	void EmitPixelDiscard() {
+		if (TracksPixelValidMask()) body << "\t\tif (!kyty_pixel_valid) discard_fragment();\n";
+	}
+
 	void EmitSetAttribute(const Inst& inst) {
 		const auto& exp = program.export_info.at(inst.Flags<IR::ExportFlags>().index);
+		if (program.stage == ShaderType::Pixel && exp.vm) {
+			body << "\t\tkyty_pixel_valid = " << Expr(inst.Arg(1)) << ";\n";
+		}
 		if (exp.kind == IR::ExportTargetKind::Null || exp.en == 0u) {
 			return;
 		}
@@ -1092,6 +1162,10 @@ struct Emitter {
 			}
 		}
 
+		const bool pixel_color = program.stage == ShaderType::Pixel &&
+		                         exp.kind == IR::ExportTargetKind::Mrt && input_info.pixel != nullptr;
+		const bool alpha_remap = pixel_color && input_info.pixel->alpha_blend_source_remap;
+		if (alpha_remap && exp.index != 0) return;
 		body << "\t\tif (" << exec << ") {\n";
 		for (uint32_t component = 0; component < 4; ++component) {
 			const bool component_written =
@@ -1137,6 +1211,17 @@ struct Emitter {
 				body << "as_type<float>(" << bits << ")";
 			}
 			body << ";\n";
+		}
+		if (alpha_remap && integer == 0) {
+			body << "\t\t\tout.color1 = float4(out." << field << ".w);\n";
+		}
+		if (pixel_color && exp.index < input_info.pixel->target_export_mapping.size()) {
+			const auto mapping = input_info.pixel->target_export_mapping[exp.index];
+			if (!mapping.IsIdentity()) {
+				body << "\t\t\tout." << field << " = out." << field << ".";
+				for (uint32_t i = 0; i < 4; ++i) body << ComponentName(mapping.Map(i));
+				body << ";\n";
+			}
 		}
 		body << "\t\t}\n";
 	}
@@ -1352,11 +1437,50 @@ struct Emitter {
 	}
 
 	void EmitImage(const Inst& inst) {
+		const auto& image = program.info.images.at(Mem(inst).resource);
+		if (image.indirect_root != Mem(inst).resource) {
+			EmitImageForResource(inst, Mem(inst).resource);
+			return;
+		}
+
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (inst.GetOpcode() != ValueOpcode::ImageSampleRaw || handle == nullptr ||
+		    handle->NumArgs() == 0u || image.indirect_resources.empty() ||
+		    !HasDescriptor(IR::DescriptorBindingKind::FlattenedSrt)) {
+			Unsupported(inst, "indirect image without a sampled descriptor map");
+			return;
+		}
+
+		// The resource planner writes sorted key-to-descriptor pairs into SRT.
+		// A miss uses candidate zero, the same default as the SPIR-V backend.
+		body << "\t\t{\n"
+		     << "\t\t\tconst device uint* mapping = ab.flattened_srt + "
+		     << image.indirect_mapping_offset << "u;\n"
+		     << "\t\t\tconst uint key = " << Expr(handle->Arg(0)) << ";\n"
+		     << "\t\t\tuint lo = 0u, hi = mapping[0], selected = 0u;\n"
+		     << "\t\t\tfor (uint step = 0u; lo < hi && step < "
+		     << image.indirect_search_iterations << "u; ++step) {\n"
+		     << "\t\t\t\tconst uint mid = lo + (hi - lo) / 2u;\n"
+		     << "\t\t\t\tconst uint entry = 1u + mid * 2u;\n"
+		     << "\t\t\t\tconst uint mapped_key = mapping[entry];\n"
+		     << "\t\t\t\tif (mapped_key == key) { selected = mapping[entry + 1u]; break; }\n"
+		     << "\t\t\t\tif (mapped_key < key) lo = mid + 1u; else hi = mid;\n"
+		     << "\t\t\t}\n\t\t\tswitch (selected) {\n";
+		for (size_t index = 0; index < image.indirect_resources.size(); ++index) {
+			if (index == 0) body << "\t\t\tdefault: {\n";
+			else body << "\t\t\tcase " << index << "u: {\n";
+			EmitImageForResource(inst, image.indirect_resources[index]);
+			body << "\t\t\tbreak; }\n";
+		}
+		body << "\t\t\t}\n\t\t}\n";
+	}
+
+	void EmitImageForResource(const Inst& inst, uint32_t resource) {
 		const auto op     = inst.GetOpcode();
 		const auto info   = IR::ImageOpcodeInfoOf(op);
 		const auto& mem   = Mem(inst);
-		const auto& image = program.info.images.at(mem.resource);
-		const auto slot   = ImageSlotOf(mem.resource);
+		const auto& image = program.info.images.at(resource);
+		const auto slot   = ImageSlotOf(resource);
 		const auto fail   = [&](const char* reason) {
 			Unsupported(inst, reason);
 			if (inst.GetType() != IR::Type::Void) {
@@ -1367,21 +1491,19 @@ struct Emitter {
 			fail("image resource is not bound");
 			return;
 		}
-		// NoIndirectImage (UINT32_MAX) is the common direct case; only an image whose
-		// indirect_root points at itself needs the runtime SRT mapping.
-		if (!ImageSupported(image) || image.indirect_root == mem.resource) {
+		if (!ImageSupported(image) || resource >= kMslSamplerBase - kMslImageBase) {
 			char reason[128];
 			std::snprintf(reason, sizeof(reason),
 			              "image: r128=%d format=%u convert=%u depth=%d atomic=%d indirect=%u/%u",
 			              image.r128 ? 1 : 0, static_cast<uint32_t>(image.numeric_class),
 			              static_cast<uint32_t>(image.conversion_format),
 			              image.depth_compare ? 1 : 0, image.atomic ? 1 : 0,
-			              image.indirect_root, mem.resource);
+			              image.indirect_root, resource);
 			fail(reason);
 			return;
 		}
-		const bool storage = static_cast<uint32_t>(slot->kind) >= IR::FirstStorageImageBinding;
-		const std::string tex = "ab.image_" + std::to_string(mem.resource);
+		const bool storage = image.resource_class == IR::ImageResourceClass::Storage;
+		const std::string tex = "ab.image_" + std::to_string(resource);
 		const auto dim = DimensionInfo(image.dimension);
 		const Inst* address = inst.Arg(info.needs_sampler ? 2 : 1).TryInstruction();
 		if (address == nullptr) {
@@ -1393,13 +1515,6 @@ struct Emitter {
 			case IR::ValueOpcode::ImageSampleRaw: {
 				const auto layout = LayoutOf(mem);
 				if (image.cube) {
-					// Experimental (KYTY_MSL_CUBE=1): the kernels that sample cubes (reflection filtering) run for seconds per frame
-					// with the state-machine codegen and the cube faces are not uploaded yet, so they stay skipped by default.
-					// Graphics stages sample cubes by default (a skipped pixel shader drops its draw); compute kernels stay off.
-					if (program.stage == ShaderType::Compute && std::getenv("KYTY_MSL_CUBE") == nullptr) {
-						fail("cube sample in compute (enable with KYTY_MSL_CUBE=1)");
-						return;
-					}
 					if (dim.components < 2u || dim.components > 3u || dim.spatial != 2u || (mem.image_sample_flags & Decoder::ImageSampleFlagDerivative) != 0u ||
 					    layout.dref >= 0) {
 						char why[160];
@@ -1558,29 +1673,46 @@ struct Emitter {
 				const std::string lod =
 				    image.mip_mode == IR::ImageMipMode::Dynamic
 				        ? AddressU32(*address, mem, static_cast<uint32_t>(dim.components)) : "0u";
-				const std::string value = TexelValue(image, Expr(inst.Arg(2)), &mem);
-				body << "\t\tif (" << Expr(inst.Arg(3)) << ") {\n\t\t\t" << tex << ".write(" << value
+				const uint32_t mask = mem.dmask != 0u ? mem.dmask : 1u;
+				const auto bits = Expr(inst.Arg(2));
+				body << "\t\tif (" << Expr(inst.Arg(3)) << ") {\n";
+				if (mem.data_bits == 16u) {
+					body << "\t\t\tconst uint4 kyty_store = kyty_d16_unpack(" << bits << ", " << mask << "u, "
+					     << (ImageIsFloatClass(image) ? "true" : "false") << ");\n";
+				} else {
+					std::array<std::string, 4> channels {"0u", "0u", "0u", "0u"};
+					uint32_t packed = 0;
+					for (uint32_t logical = 0; logical < 4u; ++logical) {
+						if ((mask & (1u << logical)) != 0) {
+							channels[logical] = "(" + bits + ")." + std::string(1, "xyzw"[packed++]);
+						}
+					}
+					body << "\t\t\tconst uint4 kyty_store = uint4(" << channels[0] << ", " << channels[1]
+					     << ", " << channels[2] << ", " << channels[3] << ");\n";
+				}
+				body << "\t\t\t" << tex << ".write(" << TexelValue(image, "kyty_store", mask)
 				     << ", " << coord << array_arg << ", " << lod << ");\n\t\t}\n";
 				return;
 			}
 			case IR::ValueOpcode::ImageQueryDimensions: {
-				// image_get_resinfo: (width, height, depth/layers, mip count) at the requested level.
-				if (dim.msaa || image.cube) {
-					fail("resinfo of a multisampled or cube image");
-					return;
-				}
-				const std::string lod = "min(" + AddressU32(*address, mem, 0) + ", (uint)" + tex + ".get_num_mip_levels() - 1u)";
-				std::string h = "1u", d = "1u";
-				if (dim.spatial >= 2u) h = "(uint)" + tex + ".get_height(" + lod + ")";
+				// Multisample views have no mip argument or mip count. Cube views on
+				// Metal have one array slice per face. Follow the guest resource's
+				// coordinate count for the components exposed to the shader.
+				const std::string mip_levels = dim.msaa ? "0u" : "(uint)" + tex + ".get_num_mip_levels()";
+				const std::string lod = dim.msaa ? "" :
+				    "min(" + AddressU32(*address, mem, 0) + ", " + mip_levels + " - 1u)";
+				const std::string width = "(uint)" + tex + ".get_width(" + lod + ")";
+				const std::string height = dim.spatial >= 2u ? "(uint)" + tex + ".get_height(" + lod + ")" : "0u";
+				std::string depth_or_layers = "0u";
 				if (image.dimension == Decoder::ImageDimension::Dim3D) {
-					d = "(uint)" + tex + ".get_depth(" + lod + ")";
+					depth_or_layers = "(uint)" + tex + ".get_depth(" + lod + ")";
 				} else if (dim.components > dim.spatial) {
-					d = "(uint)" + tex + ".get_array_size()";
+					depth_or_layers = "(uint)" + tex + ".get_array_size()";
 				}
-				EmitAssignment(inst, "uint4((uint)" + tex + ".get_width(" + lod + "), " + h + ", " + d + ", (uint)" +
-				                         tex + ".get_num_mip_levels())");
+				EmitAssignment(inst, "uint4(" + width + ", " + height + ", " + depth_or_layers + ", " + mip_levels + ")");
 				return;
 			}
+
 			default: fail("image operation"); return;
 		}
 	}
@@ -1683,6 +1815,7 @@ struct Emitter {
 				if (inst.GetOpcode() != ValueOpcode::Phi && !IsResourceType(inst.GetType())) EmitWaveInstruction(inst);
 			}
 			if (term.kind == CFG::TerminatorKind::Return) {
+				EmitPixelDiscard();
 				body << "\t\treturn" << (HasOutInterface() ? " out" : "") << ";\n";
 				return true;
 			}
@@ -2086,7 +2219,9 @@ struct Emitter {
 			case IR::ValueOpcode::BufferAtomicUMin32:
 			case IR::ValueOpcode::BufferAtomicUMax32:
 			case IR::ValueOpcode::BufferAtomicSMin32:
-			case IR::ValueOpcode::BufferAtomicSMax32: {
+			case IR::ValueOpcode::BufferAtomicSMax32:
+			case IR::ValueOpcode::BufferAtomicFMin32:
+			case IR::ValueOpcode::BufferAtomicFMax32: {
 				// 32-bit device atomics on a storage buffer: the result is the old value. Lanes whose
 				// condition is false or whose index is past the buffer end contribute 0 and do not write.
 				// Operands follow the SPIR-V EmitAtomicOperation convention: value at NumArgs-2 (CmpSwap:
@@ -2113,6 +2248,22 @@ struct Emitter {
 					     << "\t\t\t\tatomic_compare_exchange_weak_explicit((device atomic_uint*)" << elem
 					     << ", &kyty_exp, " << desired << ", memory_order_relaxed, memory_order_relaxed);\n"
 					     << "\t\t\t\t" << Name(inst) << " = kyty_exp;\n\t\t\t}\n";
+				} else if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {
+					// Compare float encodings as integers to preserve NaNs and signed zero
+					// with Metal fast math enabled. Like the SPIR-V path, unordered or
+					// equal operands keep the existing value.
+					const char comparison = op == IR::ValueOpcode::BufferAtomicFMax32 ? '>' : '<';
+					body << "\t\t\tdevice atomic_uint* atomic_word = (device atomic_uint*)" << elem << ";\n"
+					     << "\t\t\tconst uint operand = " << Expr(inst.Arg(inst.NumArgs() - 2)) << ";\n"
+					     << "\t\t\tconst uint operand_key = operand ^ ((operand >> 31u) != 0u ? 0xffffffffu : 0x80000000u);\n"
+					     << "\t\t\tuint old = atomic_load_explicit(atomic_word, memory_order_relaxed);\n"
+					     << "\t\t\tdo {\n"
+					     << "\t\t\t\tconst uint old_key = old ^ ((old >> 31u) != 0u ? 0xffffffffu : 0x80000000u);\n"
+					     << "\t\t\t\tconst bool ordered = (operand & 0x7fffffffu) <= 0x7f800000u && (old & 0x7fffffffu) <= 0x7f800000u;\n"
+					     << "\t\t\t\tconst bool both_zero = ((operand | old) & 0x7fffffffu) == 0u;\n"
+					     << "\t\t\t\tif (!ordered || both_zero || !(operand_key " << comparison << " old_key)) break;\n"
+					     << "\t\t\t} while (!atomic_compare_exchange_weak_explicit(atomic_word, &old, operand, memory_order_relaxed, memory_order_relaxed));\n"
+					     << "\t\t\t" << Name(inst) << " = old;\n";
 				} else {
 					const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
 					const char* fn = "atomic_fetch_add_explicit";
@@ -2204,7 +2355,7 @@ struct Emitter {
 				const std::string d     = "(" + LdsByte(inst, mem) + " >> 2)";
 				const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
 				const std::string cond  = Expr(inst.Arg(inst.NumArgs() - 1));
-				const std::string space = gds ? "device" : "threadgroup";
+				const std::string space = gds || UsesDeviceLds() ? "device" : "threadgroup";
 				const std::string slot  = gds ? "ab.gds[" + d + "]" : "kyty_lds[" + d + "]";
 				body << "\t\t" << Name(inst) << " = 0u;\n";
 				body << "\t\tif (" << cond << " && " << d << " < " << limit << ") {\n";
@@ -2288,7 +2439,9 @@ struct Emitter {
 				     << "\t\t\tuint kyty_old = 0u;\n"
 				     << "\t\t\tif ((lane & 31u) == (kyty_first & 31u) && kyty_cnt != 0u && kyty_ok) {\n"
 				     << "\t\t\t\tkyty_old = atomic_fetch_" << (append ? "add" : "sub") << "_explicit("
-				     << (gds ? "&ab.gds[kyty_idx]" : "(threadgroup atomic_uint*)&kyty_lds[kyty_idx]")
+				     << (gds ? "&ab.gds[kyty_idx]" : UsesDeviceLds() ?
+			                                      "(device atomic_uint*)&kyty_lds[kyty_idx]" :
+			                                      "(threadgroup atomic_uint*)&kyty_lds[kyty_idx]")
 				     << ", kyty_cnt, memory_order_relaxed);\n"
 				     << "\t\t\t}\n"
 				     << "\t\t\t" << Name(inst) << " = simd_shuffle(kyty_old, kyty_first & 31u);\n";
@@ -2321,7 +2474,8 @@ struct Emitter {
 				if (count>1) result+=")";
 				// KYTY_LDS_SYNC=1 (experiment): a wave64 workgroup is two 32-wide host simdgroups that do not run in lockstep, so LDS
 				// handed from one half to the other needs a barrier the RDNA code (one wave, no s_barrier) never had.
-				if (LdsSyncEnabled() && program.stage == ShaderType::Compute) body << "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n";
+				if (LdsSyncEnabled() && program.stage == ShaderType::Compute) body << (UsesDeviceLds() ? "\t\tthreadgroup_barrier(mem_flags::mem_device);\n" :
+			                          "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n");
 				EmitAssignment(inst,result);
 				return;
 			}
@@ -2373,7 +2527,8 @@ struct Emitter {
 					}
 				}
 				body << "\t\t}\n";
-				if (LdsSyncEnabled() && program.stage == ShaderType::Compute) body << "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n";
+				if (LdsSyncEnabled() && program.stage == ShaderType::Compute) body << (UsesDeviceLds() ? "\t\tthreadgroup_barrier(mem_flags::mem_device);\n" :
+			                          "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n");
 				return;
 			}
 			default: EmitAlu(inst); return;
@@ -2580,6 +2735,27 @@ void Emitter::EmitAlu(const Inst& inst) {
 			// (EmitF32ToU32). A plain C cast is undefined in MSL for exactly those inputs.
 			EmitAssignment(inst, (RdnaFloatMask() & 2u) != 0 ? "kyty_f2u(" + Expr(inst.Arg(0)) + ")" : "(uint)(" + Expr(inst.Arg(0)) + ")");
 			return;
+		case IR::ValueOpcode::BitCastU64F64:
+		case IR::ValueOpcode::BitCastF64U64:
+			EmitAssignment(inst, Expr(inst.Arg(0)));
+			return;
+		case IR::ValueOpcode::ConvertF64F32:
+			EmitAssignment(inst, "kyty_widen_float(as_type<uint>(" + Expr(inst.Arg(0)) + "))");
+			return;
+		case IR::ValueOpcode::ConvertF32F64:
+			EmitAssignment(inst, "as_type<float>(kyty_narrow_double(" + Expr(inst.Arg(0)) + "))");
+			return;
+		case IR::ValueOpcode::FPMin64:
+		case IR::ValueOpcode::FPMax64:
+			EmitAssignment(inst, "kyty_double_minmax(" + Expr(inst.Arg(0)) + ", " + Expr(inst.Arg(1)) +
+			                         (inst.GetOpcode() == IR::ValueOpcode::FPMax64 ? ", true)" : ", false)"));
+			return;
+		case IR::ValueOpcode::FPAdd64:
+			EmitAssignment(inst, "kyty_double_add(" + Expr(inst.Arg(0)) + ", " + Expr(inst.Arg(1)) + ")");
+			return;
+		case IR::ValueOpcode::FPMul64:
+			EmitAssignment(inst, "kyty_double_multiply(" + Expr(inst.Arg(0)) + ", " + Expr(inst.Arg(1)) + ")");
+			return;
 		case IR::ValueOpcode::BitCastU32F32:
 			EmitAssignment(inst, "as_type<uint>(" + Expr(inst.Arg(0)) + ")");
 			return;
@@ -2701,6 +2877,162 @@ std::string Emitter::Emit() {
 	out << "#include <metal_stdlib>\n";
 	out << "#include <simd/simd.h>\n";
 	out << "using namespace metal;\n\n";
+	if (std::ranges::any_of(program.blocks, [](const IR::Block* block) {
+		    return std::ranges::any_of(*block, [](const Inst& inst) {
+			    switch (inst.GetOpcode()) {
+				    case IR::ValueOpcode::ConvertF64F32:
+				    case IR::ValueOpcode::ConvertF32F64:
+				    case IR::ValueOpcode::FPMin64:
+				    case IR::ValueOpcode::FPMax64:
+				    case IR::ValueOpcode::FPAdd64:
+				    case IR::ValueOpcode::FPMul64: return true;
+				    default: return false;
+			    }
+		    });
+	    })) {
+		out << R"(
+inline ulong kyty_widen_float(uint bits) {
+	const ulong sign = ulong(bits & 0x80000000u) << 32u;
+	const uint exponent = (bits >> 23u) & 0xffu;
+	const uint fraction = bits & 0x007fffffu;
+	if (exponent == 0xffu) {
+		const ulong quiet = fraction != 0u ? (1ul << 51u) : 0ul;
+		return sign | 0x7ff0000000000000ul | quiet | (ulong(fraction) << 29u);
+	}
+	// The guest conversion flushes single-precision denormals to signed zero.
+	if (exponent == 0u) return sign;
+	return sign | (ulong(exponent + 896u) << 52u) | (ulong(fraction) << 29u);
+}
+constant ulong kyty_f64_sign = 0x8000000000000000ul;
+constant ulong kyty_f64_inf = 0x7ff0000000000000ul;
+constant ulong kyty_f64_fraction = 0x000ffffffffffffful;
+constant ulong kyty_f64_quiet = 0x0008000000000000ul;
+
+inline ulong kyty_shift_right_sticky(ulong value, uint shift) {
+	if (shift == 0u) return value;
+	if (shift >= 64u) return ulong(value != 0ul);
+	return (value >> shift) | ulong((value << (64u - shift)) != 0ul);
+}
+
+inline uint kyty_narrow_double(ulong bits) {
+	const uint sign = uint(bits >> 32u) & 0x80000000u;
+	const uint exponent = uint((bits >> 52u) & 0x7fful);
+	const ulong fraction = bits & kyty_f64_fraction;
+	if (exponent == 0x7ffu) {
+		return sign | 0x7f800000u |
+		       (fraction != 0ul ? 0x00400000u | uint(fraction >> 29u) : 0u);
+	}
+	// Mirror the SPIR-V conversion: clamp overflows and flush float denormals.
+	if (exponent > 1150u) return sign | 0x7f7fffffu;
+	if (exponent < 896u) return sign;
+	const uint shift = exponent == 896u ? 30u : 29u;
+	const ulong significand = (1ul << 52u) | fraction;
+	const uint integral = uint(significand >> shift);
+	const ulong halfway = 1ul << (shift - 1u);
+	const ulong dropped = significand & ((halfway << 1u) - 1ul);
+	const uint rounded = integral + uint(dropped > halfway || (dropped == halfway && (integral & 1u)));
+	if (exponent == 896u) return sign | (rounded & 0x00800000u);
+	return sign | (((exponent - 897u) << 23u) + rounded);
+}
+
+inline ulong kyty_double_minmax(ulong a, ulong b, bool maximum) {
+	if ((a & ~kyty_f64_sign) > kyty_f64_inf) return b;
+	if ((b & ~kyty_f64_sign) > kyty_f64_inf) return a;
+	const ulong a_key = a ^ ((a & kyty_f64_sign) ? ~0ul : kyty_f64_sign);
+	const ulong b_key = b ^ ((b & kyty_f64_sign) ? ~0ul : kyty_f64_sign);
+	return (maximum ? (a_key > b_key) : (a_key < b_key)) ? a : b;
+}
+
+// Round a 53-bit significand with three additional guard/round/sticky bits.
+inline ulong kyty_double_round(ulong sign, int exponent, ulong extended) {
+	if (exponent < 1) {
+		extended = kyty_shift_right_sticky(extended, uint(1 - exponent));
+		exponent = 1;
+	}
+	ulong significant = extended >> 3u;
+	const ulong remainder = extended & 7ul;
+	significant += ulong(remainder > 4ul || (remainder == 4ul && (significant & 1ul)));
+	if (significant >= (1ul << 53u)) {
+		significant >>= 1u;
+		++exponent;
+	}
+	if (exponent >= 0x7ff) return sign | kyty_f64_inf;
+	if (significant < (1ul << 52u)) exponent = 0;
+	return sign | (ulong(exponent) << 52u) | (significant & kyty_f64_fraction);
+}
+
+inline ulong kyty_double_add(ulong a, ulong b) {
+	ulong a_abs = a & ~kyty_f64_sign, b_abs = b & ~kyty_f64_sign;
+	if (a_abs > kyty_f64_inf) return a | kyty_f64_quiet;
+	if (b_abs > kyty_f64_inf) return b | kyty_f64_quiet;
+	if (a_abs == kyty_f64_inf || b_abs == kyty_f64_inf) {
+		if (a_abs == b_abs && a != b) return kyty_f64_inf | kyty_f64_quiet;
+		return a_abs == kyty_f64_inf ? a : b;
+	}
+	if ((a_abs | b_abs) == 0ul) return a & b;
+	if (a_abs < b_abs) {
+		const ulong swap = a;
+		a = b;
+		b = swap;
+		const ulong swap_abs = a_abs;
+		a_abs = b_abs;
+		b_abs = swap_abs;
+	}
+	int exponent = max(int(a_abs >> 52u), 1);
+	const int b_exponent = max(int(b_abs >> 52u), 1);
+	const ulong a_sig = (a_abs & kyty_f64_fraction) | ((a_abs >> 52u) ? 1ul << 52u : 0ul);
+	const ulong b_sig = (b_abs & kyty_f64_fraction) | ((b_abs >> 52u) ? 1ul << 52u : 0ul);
+	const ulong b_aligned = kyty_shift_right_sticky(b_sig << 3u, uint(exponent - b_exponent));
+	ulong extended = ((a ^ b) & kyty_f64_sign) ? (a_sig << 3u) - b_aligned : (a_sig << 3u) + b_aligned;
+	if (extended == 0ul) return 0ul;
+	if (extended & (1ul << 56u)) {
+		extended = kyty_shift_right_sticky(extended, 1u);
+		++exponent;
+	} else if (extended < (1ul << 55u)) {
+		const int shift = min(int(clz(extended)) - 8, exponent - 1);
+		extended <<= uint(shift);
+		exponent -= shift;
+	}
+	return kyty_double_round(a & kyty_f64_sign, exponent, extended);
+}
+
+inline ulong kyty_double_multiply(ulong a, ulong b) {
+	const ulong sign = (a ^ b) & kyty_f64_sign;
+	const ulong a_abs = a & ~kyty_f64_sign, b_abs = b & ~kyty_f64_sign;
+	if (a_abs > kyty_f64_inf) return a | kyty_f64_quiet;
+	if (b_abs > kyty_f64_inf) return b | kyty_f64_quiet;
+	if (a_abs == kyty_f64_inf || b_abs == kyty_f64_inf) {
+		return (a_abs == 0ul || b_abs == 0ul) ? kyty_f64_inf | kyty_f64_quiet : sign | kyty_f64_inf;
+	}
+	if (a_abs == 0ul || b_abs == 0ul) return sign;
+	int a_exponent = int(a_abs >> 52u), b_exponent = int(b_abs >> 52u);
+	ulong a_sig = a_abs & kyty_f64_fraction, b_sig = b_abs & kyty_f64_fraction;
+	if (a_exponent != 0) a_sig |= 1ul << 52u;
+	else {
+		const uint shift = clz(a_sig) - 11u;
+		a_sig <<= shift;
+		a_exponent = 1 - int(shift);
+	}
+	if (b_exponent != 0) b_sig |= 1ul << 52u;
+	else {
+		const uint shift = clz(b_sig) - 11u;
+		b_sig <<= shift;
+		b_exponent = 1 - int(shift);
+	}
+
+	// The two 53-bit significands produce a 106-bit product.
+	const ulong low_product = ulong(uint(a_sig)) * uint(b_sig);
+	const ulong middle = (low_product >> 32u) + (a_sig >> 32u) * uint(b_sig) + (b_sig >> 32u) * uint(a_sig);
+	const ulong low = (middle << 32u) | uint(low_product);
+	const ulong high = (a_sig >> 32u) * (b_sig >> 32u) + (middle >> 32u);
+	const bool leading = (high & (1ul << 41u)) != 0ul;
+	const uint shift = leading ? 50u : 49u;
+	const ulong extended = (high << (64u - shift)) | kyty_shift_right_sticky(low, shift);
+	return kyty_double_round(sign, a_exponent + b_exponent - 1023 + int(leading), extended);
+}
+
+)";
+	}
 	if (HasDescriptor(IR::DescriptorBindingKind::BdaPagetable)) {
 		out << R"(
 // Two-level native Metal page table: 16 KiB pages, 1024 entries per leaf.
@@ -2833,13 +3165,16 @@ inline float kyty_med3f(float a, float b, float c) {
 	// NativeBinding layout overlaps as soon as a descriptor group has more than one
 	// element (Buffers at 0..N-1 vs images starting at 1).
 	out << "struct KytyArgumentBuffer {\n";
-	if (program.bindings.descriptors.empty()) {
+	if (program.bindings.descriptors.empty() && program.stage != ShaderType::Vertex) {
 		// A struct with no members cannot be bound as an argument buffer.
 		out << "\tdevice uint *kyty_padding [[id(0)]];\n";
 	}
 	{
 		// (first id, number of ids the member occupies, declaration)
 		std::vector<std::tuple<uint32_t, uint32_t, std::string>> members;
+		if (program.stage == ShaderType::Vertex && !HasDescriptor(IR::DescriptorBindingKind::Buffers)) {
+			members.emplace_back(kMslBufferBase, 64u, "device uint *buffers [[id(0)]][64];");
+		}
 		for (const auto& binding: program.bindings.descriptors) {
 			switch (binding.kind) {
 				case IR::DescriptorBindingKind::Buffers:
@@ -2867,27 +3202,19 @@ inline float kyty_med3f(float a, float b, float c) {
 					                     "device const uint *flattened_srt [[id(" +
 					                         std::to_string(kMslSrtBinding) + ")]];");
 					break;
-				default:
-					if (IsImageBinding(binding.kind)) {
-						const bool storage = static_cast<uint32_t>(binding.kind) >=
-						                     IR::FirstStorageImageBinding;
-						for (const uint32_t resource: binding.resources) {
-							if (resource >= program.info.images.size()) {
-								continue;
-							}
-							const auto slot = ImageSlotOf(resource);
-							if (!slot) {
-								continue;
-							}
-							const auto& image = program.info.images[resource];
-							members.emplace_back(
-							    slot->id, 1u, TextureType(image, storage) + " image_" +
-							                  std::to_string(resource) + " [[id(" +
-							                  std::to_string(slot->id) + ")]];");
-						}
-					}
-					break;
+				default: break;
 			}
+		}
+		// An image can appear repeatedly in a descriptor array (for example one
+		// entry per mip). Direct MSL uses one argument per IR image resource.
+		for (const auto& [resource, slot]: image_slots_) {
+			if (resource >= program.info.images.size()) {
+				continue;
+			}
+			const auto& image = program.info.images[resource];
+			const bool storage = image.resource_class == IR::ImageResourceClass::Storage;
+			members.emplace_back(slot.id, 1u, TextureType(image, storage) + " image_" +
+			                     std::to_string(resource) + " [[id(" + std::to_string(slot.id) + ")]];");
 		}
 		std::sort(members.begin(), members.end(),
 		          [](const auto& lhs, const auto& rhs) { return std::get<0>(lhs) < std::get<0>(rhs); });
@@ -2955,6 +3282,10 @@ inline float kyty_med3f(float a, float b, float c) {
 			    << "uint3 tid [[thread_position_in_threadgroup]], "
 			    << "uint3 tgid [[threadgroup_position_in_grid]], "
 			    << "uint liid [[thread_index_in_threadgroup]]";
+			if (UsesDeviceLds()) {
+				out << ", uint3 grid_groups [[threadgroups_per_grid]], device uint* lds_backing [[buffer("
+				    << DeviceLdsBufferIndex << ")]]";
+			}
 			if (nan_trace_) out << ", device atomic_uint* kyty_nan_dbg [[buffer(28)]]";
 		}
 		out << ") {\n";
@@ -2963,8 +3294,12 @@ inline float kyty_med3f(float a, float b, float c) {
 		out << "\tKytyStageOut out = {};\n";
 	}
 	out << "\t(void)ab; (void)pc_data; (void)sizes;\n";
+	if (TracksPixelValidMask()) out << "\tbool kyty_pixel_valid = true;\n";
 	if (UsesLds()) {
-		if (program.stage == ShaderType::Compute) {
+		if (UsesDeviceLds()) {
+			out << "\tconst ulong lds_group = (ulong(tgid.z) * grid_groups.y + tgid.y) * grid_groups.x + tgid.x;\n"
+			    << "\tdevice uint* kyty_lds = lds_backing + lds_group * " << LdsDwords() << "u;\n";
+		} else if (program.stage == ShaderType::Compute) {
 			out << "\tthreadgroup uint kyty_lds[" << LdsDwords() << "];\n";
 		} else {
 			// Non-kernel stages cannot use the threadgroup address space; per-thread
@@ -3048,7 +3383,10 @@ inline float kyty_med3f(float a, float b, float c) {
 					body << "\t\t\tpc = " << BlockIndex(term.false_block) << "u;\n\t\t}\n\t\tbreak;\n";
 				}
 				break;
-			default: body << "\t\treturn" << (has_out ? " out" : "") << ";\n"; break;
+			default:
+				EmitPixelDiscard();
+				body << "\t\treturn" << (has_out ? " out" : "") << ";\n";
+				break;
 		}
 		body << "\t}\n";
 	}
@@ -3207,6 +3545,7 @@ EmitResult EmitProgram(const IR::Program& program, ShaderStageInputInfo input_in
 	EmitResult result;
 	result.source      = emitter.Emit();
 	result.wave64_pair = emitter.pair_;
+	result.device_lds_dwords = emitter.UsesDeviceLds() ? emitter.LdsDwords() : 0u;
 	if (program.stage == ShaderType::Compute) {
 		const auto* cs = ShaderWorkgroupInput(program.stage, emitter.input_info);
 		std::lock_guard<std::mutex> lock(s_pair_mutex);

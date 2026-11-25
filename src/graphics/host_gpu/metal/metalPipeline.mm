@@ -70,7 +70,8 @@ bool MetalRenderPipelineKey::operator==(const MetalRenderPipelineKey& other) con
 	if (vs_hash != other.vs_hash || fs_hash != other.fs_hash ||
 	    color_target_count != other.color_target_count ||
 	    depth_format != other.depth_format || stencil_format != other.stencil_format ||
-	    sample_count != other.sample_count || primitive_type != other.primitive_type) {
+	    sample_count != other.sample_count || primitive_type != other.primitive_type ||
+	    mesh_threads != other.mesh_threads) {
 		return false;
 	}
 	for (uint32_t i = 0; i < color_target_count; ++i) {
@@ -88,6 +89,7 @@ bool MetalRenderPipelineKey::operator==(const MetalRenderPipelineKey& other) con
 
 size_t MetalRenderPipelineKeyHash::operator()(const MetalRenderPipelineKey& k) const noexcept {
 	size_t h = k.vs_hash ^ (k.fs_hash << 1);
+	h ^= static_cast<size_t>(k.mesh_threads) + 0x9e3779b9 + (h << 6) + (h >> 2);
 	h ^= static_cast<size_t>(k.depth_format) + 0x9e3779b9 + (h << 6) + (h >> 2);
 	h ^= static_cast<size_t>(k.stencil_format) + 0x9e3779b9 + (h << 6) + (h >> 2);
 	h ^= static_cast<size_t>(k.color_target_count) + 0x9e3779b9 + (h << 6) + (h >> 2);
@@ -444,7 +446,7 @@ id<MTLRenderPipelineState> MetalPipelineManager::GetOrCreateRenderPipeline(
 	// KYTY_DEBUG_PS_ANY=1 widens the gate from RG11B10Float targets to every color target.
 	static const bool s_debug_ps_any = KYTY_ENV("KYTY_DEBUG_PS_ANY") != nullptr;
 	const bool debug_ps_active =
-	    s_debug_ps_enabled && key.color_target_count > 0 &&
+	    key.mesh_threads == 0 && s_debug_ps_enabled && key.color_target_count > 0 &&
 	    (s_debug_ps_any || key.color_targets[0].pixel_format == MTLPixelFormatRG11B10Float) &&
 	    MetalDrawSequence() >= s_debug_ps_after;
 	// Substitute through a distinct cache key: otherwise a pipeline built before the
@@ -485,7 +487,7 @@ id<MTLRenderPipelineState> MetalPipelineManager::GetOrCreateRenderPipeline(
 				fragment_function = s_debug_ps_func;
 			}
 		}
-		if (s_debug_quad) {
+		if (s_debug_quad && key.mesh_threads == 0) {
 			dispatch_once_t once = 0;
 			(void)once;
 			if (s_debug_vs == nil || s_debug_ps == nil) {
@@ -536,12 +538,23 @@ id<MTLRenderPipelineState> MetalPipelineManager::GetOrCreateRenderPipeline(
 		desc.vertexFunction = vertex_function;
 		desc.fragmentFunction = fragment_function;
 
+		MTLMeshRenderPipelineDescriptor* mesh_desc = nil;
+		if (key.mesh_threads != 0) {
+			mesh_desc = [MTLMeshRenderPipelineDescriptor new];
+			mesh_desc.meshFunction = vertex_function;
+			mesh_desc.fragmentFunction = fragment_function;
+			mesh_desc.maxTotalThreadsPerMeshThreadgroup = key.mesh_threads;
+			mesh_desc.depthAttachmentPixelFormat = key.depth_format;
+			mesh_desc.stencilAttachmentPixelFormat = key.stencil_format;
+			mesh_desc.rasterSampleCount = std::max(key.sample_count, 1u);
+		}
 		for (uint32_t i = 0; i < key.color_target_count; ++i) {
 			const auto& color_desc = key.color_targets[i];
 			if (color_desc.pixel_format == MTLPixelFormatInvalid) {
 				continue;
 			}
-			MTLRenderPipelineColorAttachmentDescriptor* color_att = desc.colorAttachments[i];
+			MTLRenderPipelineColorAttachmentDescriptor* color_att =
+			    mesh_desc != nil ? mesh_desc.colorAttachments[i] : desc.colorAttachments[i];
 			color_att.pixelFormat = color_desc.pixel_format;
 			color_att.writeMask = color_desc.write_mask;
 			color_att.blendingEnabled = color_desc.blending_enabled ? YES : NO;
@@ -581,16 +594,20 @@ id<MTLRenderPipelineState> MetalPipelineManager::GetOrCreateRenderPipeline(
 		}
 
 		NSError* error = nil;
-		id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+		id<MTLRenderPipelineState> pipeline = mesh_desc != nil
+		    ? [device newRenderPipelineStateWithMeshDescriptor:mesh_desc options:MTLPipelineOptionNone
+		                                         reflection:nil error:&error]
+		    : [device newRenderPipelineStateWithDescriptor:desc error:&error];
 		if (!pipeline) {
 			static std::atomic<uint32_t> s_pipeline_failures {0};
 			const uint32_t count = s_pipeline_failures.fetch_add(1);
 			if (count < 20) {
 				std::fprintf(stderr,
-				             "[MetalPipeline] create failed (%u) vs=0x%016llx ps=0x%016llx fmt=%u: %s\n",
+				             "[MetalPipeline] create failed (%u) vs=0x%016llx ps=0x%016llx fmt=%u threadgroup_limit=%lu: %s\n",
 				             count, static_cast<unsigned long long>(key.vs_hash),
 				             static_cast<unsigned long long>(key.fs_hash),
 				             static_cast<uint32_t>(key.color_targets[0].pixel_format),
+				             static_cast<unsigned long>(device.maxThreadgroupMemoryLength),
 				             error ? [[error localizedDescription] UTF8String] : "Unknown error");
 			}
 			LOGF_COLOR(Log::Color::BrightRed, "Metal: Failed to create render pipeline state: %s\n",
@@ -623,6 +640,10 @@ id<MTLComputePipelineState> MetalPipelineManager::GetOrCreateComputePipeline(
 		desc.label = [NSString stringWithFormat:@"CS %016llx", (unsigned long long)cs_hash];
 		id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
 		if (!pipeline) {
+			std::fprintf(stderr, "[MetalPipeline] compute creation failed cs=0x%016llx threadgroup_limit=%lu: %s\n",
+			             static_cast<unsigned long long>(cs_hash),
+			             static_cast<unsigned long>(device.maxThreadgroupMemoryLength),
+			             error ? [[error localizedDescription] UTF8String] : "Unknown error");
 			LOGF_COLOR(Log::Color::BrightRed, "Metal: Failed to create compute pipeline state: %s\n",
 			           error ? [[error localizedDescription] UTF8String] : "Unknown error");
 			return nil;

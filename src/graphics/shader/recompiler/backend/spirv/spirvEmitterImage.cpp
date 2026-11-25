@@ -379,13 +379,6 @@ uint32_t HorizontalOffsets(EmitterState& state, ImageDimension dimension) {
 	                              offsets[2], offsets[3]);
 }
 
-uint32_t InverseSwizzle(uint32_t swizzle, uint32_t component) {
-	for (uint32_t source = 0; source < 4u; source++) {
-		if (((swizzle >> (source * 3u)) & 7u) == 4u + component) return source;
-	}
-	return UINT32_MAX;
-}
-
 Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
                                                const IR::MemoryInfo& mem) {
 	const auto format = state.program.info.images[mem.resource].conversion_format;
@@ -549,7 +542,7 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	uint32_t   values[4] {};
 	const auto dmask = mem.dmask != 0u ? mem.dmask : 1u;
 	for (uint32_t component = 0; component < 4u; component++) {
-		const auto source = InverseSwizzle(swizzle, component);
+		const auto source = IR::ImageStoreSourceChannel(swizzle, component);
 		uint32_t   raw    = ConstantU32(ctx.state, 0);
 		if (source < 4u && ((dmask >> source) & 1u) != 0u) {
 			const auto packed_index = DmaskComponentIndex(dmask, source);

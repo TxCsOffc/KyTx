@@ -10,7 +10,8 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+                                  ShaderStageInputInfo input_info,
+                                  bool metal_guest_address_space = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

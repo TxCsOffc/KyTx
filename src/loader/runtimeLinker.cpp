@@ -1432,7 +1432,7 @@ RuntimeLinker::~RuntimeLinker() {
 	Clear();
 }
 
-Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
+Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name, bool optional) {
 	KYTY_PROFILER_FUNCTION();
 
 	Common::LockGuard lock(m_mutex);
@@ -1455,6 +1455,10 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 		LoadProgramToMemory(program);
 		ParseProgramDynamicInfo(program);
 		CreateSymbolDatabase(program);
+	} else if (optional) {
+		std::fprintf(stderr, "[Loader] Ignoring non-executable adjacent module: %s\n",
+		             Common::PathToString(elf_name.filename()).c_str());
+		return nullptr;
 	} else {
 		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
 	}
@@ -1935,9 +1939,12 @@ void RuntimeLinker::PreloadAdjacentPrograms() {
 	add_dir(root / "sce_module");
 	add_dir(root / "sce_modules");
 
+	// Adjacent .prx files can contain data for hardware modules. Only an
+	// explicitly requested executable must pass validation.
 	for (const auto& path: module_paths) {
-		auto* program                        = LoadProgram(path);
-		program->fail_if_global_not_resolved = false;
+		if (auto* program = LoadProgram(path, true)) {
+			program->fail_if_global_not_resolved = false;
+		}
 	}
 }
 

@@ -13,6 +13,7 @@
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/LongJump.h>
 
@@ -31,6 +32,7 @@
 #include <mach/mach_vm.h>
 #include <mutex>
 #include <optional>
+#include <pthread.h>
 #include <signal.h>
 #include <string>
 #include <sys/mman.h>
@@ -231,7 +233,8 @@ FEXCore::HostFeatures MakeHostFeatures() {
 	if (sysctlbyname("hw.cachelinesize", &line, &size, nullptr, 0) != 0 || line == 0) {
 		line = 64;
 	}
-	f.DCacheLineLog2               = static_cast<uint32_t>(std::log2(static_cast<double>(line) / 4.0));
+	f.DCacheLineSize               = static_cast<uint32_t>(line);
+	f.ICacheLineSize               = static_cast<uint32_t>(line);
 	f.SupportsCacheMaintenanceOps  = 0;
 	f.SupportsAES                  = SysctlFlag("hw.optional.arm.FEAT_AES");
 	f.SupportsCRC                  = SysctlFlag("hw.optional.arm.FEAT_CRC32");
@@ -305,6 +308,9 @@ struct ThreadState {
 	static constexpr int                        kMaxHleRegsDepth = 16;
 	GuestRegs                                   hle_regs[kMaxHleRegsDepth] {};
 	int                                         hle_regs_depth = 0;
+	GuestContinuation                           continuation {};
+	uint64_t                                    continuation_result = 0;
+	int                                         continuation_depth = 0;
 	HostCallFrame                               bridge[kMaxBridgeDepth] {};
 	int                                         bridge_depth = 0;
 	uint64_t                                    callret_alloc = 0; // call-ret stack incl. guard pages
@@ -346,7 +352,7 @@ ThreadState* GetThreadState() {
 	st.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*cs);
 	st.mxcsr     = 0x1F80;
 
-	ts->thread = g->ctx->CreateThread(&st);
+	ts->thread = g->ctx->CreateThread(st.rip, st.gregs[X86::REG_RSP], &st);
 	if (ts->thread == nullptr) {
 		std::fprintf(stderr, "[fex] CreateThread failed\n");
 		std::abort();
@@ -469,6 +475,8 @@ GuestCallResult RunGuest(uint64_t entry, const GuestCallArgs& a, uint64_t stack_
 	st.gregs[X86::REG_RAX] = 8; // AL = vector registers used, for variadic callees
 
 	ts->depth++;
+	// FEX may leave this thread in write mode after allocating its JIT buffer.
+	pthread_jit_write_protect_np(1);
 	g->ctx->HandleCallback(ts->thread, entry);
 	ts->depth--;
 
@@ -550,6 +558,7 @@ void DispatchHle(FEXCore::Core::CpuStateFrame* frame, uint64_t index) {
 		*reinterpret_cast<__uint128_t*>(&f.v[i]) = *reinterpret_cast<const __uint128_t*>(st.xmm.sse.data[i]);
 	}
 
+
 	const auto n = g->hle_calls.fetch_add(1, std::memory_order_relaxed);
 	// Restrict a diagnostic HLE trace to one guest module without spending its
 	// quota on unrelated rendering/thread calls (begin:end, end exclusive).
@@ -587,8 +596,32 @@ void DispatchHle(FEXCore::Core::CpuStateFrame* frame, uint64_t index) {
 		             static_cast<unsigned long long>(tid));
 	}
 
+	const auto dispatch_depth = ts->hle_regs_depth;
 	if (__builtin_expect(ts->hle_regs_depth > 0, 1)) {
 		--ts->hle_regs_depth;
+	}
+	if (ts->continuation_depth != 0 && ts->continuation_depth == dispatch_depth) {
+		const auto& resume = ts->continuation;
+		st.gregs[X86::REG_RBX] = resume.rbx;
+		st.gregs[X86::REG_RBP] = resume.rbp;
+		st.gregs[X86::REG_RDI] = resume.rdi;
+		st.gregs[X86::REG_RSI] = resume.rsi;
+		st.gregs[X86::REG_R12] = resume.r12;
+		st.gregs[X86::REG_R13] = resume.r13;
+		st.gregs[X86::REG_R14] = resume.r14;
+		st.gregs[X86::REG_R15] = resume.r15;
+		// FEX can translate syscall and the stub's ret in the same block. Put the
+		// continuation on the destination stack so that ret restores both RIP and RSP.
+		st.gregs[X86::REG_RSP] = resume.rsp - sizeof(uint64_t);
+		*reinterpret_cast<uint64_t*>(st.gregs[X86::REG_RSP]) = resume.rip;
+		st.gregs[X86::REG_RAX] = ts->continuation_result;
+		st.rip                = rip + 2;
+		st.mxcsr              = resume.mxcsr;
+		st.FCW                = resume.fcw;
+		// Predicted native return addresses belong to the previous guest stack.
+		st.callret_sp = CallRetDefault(ts->callret_alloc);
+		ts->continuation_depth = 0;
+		return;
 	}
 	st.gregs[X86::REG_RAX] = f.ret_x0;
 	st.gregs[X86::REG_RDX] = f.ret_x1;
@@ -599,14 +632,16 @@ void DispatchHle(FEXCore::Core::CpuStateFrame* frame, uint64_t index) {
 
 class KytySyscallHandler final : public FEXCore::HLE::SyscallHandler {
 public:
-	void HandleSyscall(FEXCore::Core::CpuStateFrame* frame) override {
+	KytySyscallHandler() { OSABI = FEXCore::HLE::SyscallOSABI::OS_GENERIC; }
+
+	uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame, FEXCore::HLE::SyscallArguments*) override {
 		auto&          st  = frame->State;
 		const uint64_t rip = st.rip;
 		if (__builtin_expect(InStubRegion(rip), 1)) {
 			const uint64_t index = (rip - reinterpret_cast<uint64_t>(g->stub_base)) / kStubSlotSize;
 			if (__builtin_expect(index < g->stub_count.load(std::memory_order_acquire), 1)) {
 				DispatchHle(frame, index);
-				return;
+				return st.gregs[X86::REG_RAX];
 			}
 		}
 		// A raw `syscall` in guest code. PS5 games reach the kernel through libkernel (HLE), so
@@ -619,6 +654,7 @@ public:
 		}
 		st.gregs[X86::REG_RAX] = static_cast<uint64_t>(-38);
 		st.rip                 = rip + 2;
+		return st.gregs[X86::REG_RAX];
 	}
 
 	FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* /*thread*/,
@@ -811,6 +847,32 @@ bool GetCurrentGuestRegs(GuestRegs* out) {
 	return true;
 }
 
+bool CaptureContinuation(GuestContinuation* continuation) {
+	GuestRegs regs {};
+	if (!GetCurrentGuestRegs(&regs)) {
+		return false;
+	}
+	const auto& state = State(t_state);
+	*continuation = {
+	    regs.gpr[X86::REG_RBX], regs.gpr[X86::REG_RBP],
+	    regs.gpr[X86::REG_RDI], regs.gpr[X86::REG_RSI],
+	    regs.gpr[X86::REG_R12], regs.gpr[X86::REG_R13],
+	    regs.gpr[X86::REG_R14], regs.gpr[X86::REG_R15],
+	    regs.gpr[X86::REG_RSP] + sizeof(uint64_t), regs.rip,
+	    state.mxcsr, state.FCW,
+	};
+	return true;
+}
+
+void ResumeContinuation(const GuestContinuation& continuation, uint64_t result) {
+	if (t_state == nullptr || t_state->hle_regs_depth == 0 || t_state->continuation_depth != 0) {
+		std::abort();
+	}
+	t_state->continuation = continuation;
+	t_state->continuation_result = result;
+	t_state->continuation_depth = t_state->hle_regs_depth;
+}
+
 bool GetFaultGuestLocation(uint64_t host_pc, GuestFaultLocation* out) {
 	// No new thread state, loader locks, or mutation of the faulting CPU context.
 	if (out == nullptr || g == nullptr || !g->ctx || t_state == nullptr || t_state->thread == nullptr ||
@@ -888,6 +950,7 @@ bool HandleHostFault(int /*sig*/, void* siginfo, void* ucontext) {
 		const uint64_t pc_now = mc->__ss.__pc;
 		if (align && ts != nullptr && ts->thread != nullptr && g->ctx->IsAddressInCodeBuffer(ts->thread, pc_now)) {
 			// __x[0..28], __fp, __lr are contiguous: the 31-entry GPR array FEX expects.
+			const FEXCore::Allocator::ScopedJITWriteProtect allow_backpatch;
 			const auto result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
 			    ts->thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, pc_now, &mc->__ss.__x[0]);
 			if (result.has_value()) {

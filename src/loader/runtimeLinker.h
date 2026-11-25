@@ -143,7 +143,7 @@ public:
 
 	void DbgDump(const std::string& folder);
 
-	Program* LoadProgram(const std::filesystem::path& elf_name);
+	Program* LoadProgram(const std::filesystem::path& elf_name, bool optional = false);
 	void     SaveMainProgram(const std::filesystem::path& elf_name);
 	void     SaveProgram(Program* program, const std::filesystem::path& elf_name);
 	void     UnloadProgram(Program* program);

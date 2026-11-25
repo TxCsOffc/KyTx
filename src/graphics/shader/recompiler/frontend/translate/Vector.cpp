@@ -469,6 +469,8 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MUL_F32: return FloatBinary(inst, IR::ValueOpcode::FPMul32, false);
 		case O::V_ADD_F64: return FloatBinary(inst, IR::ValueOpcode::FPAdd64, false);
 		case O::V_MUL_F64: return FloatBinary(inst, IR::ValueOpcode::FPMul64, false);
+		case O::V_MIN_F64: return FloatBinary(inst, IR::ValueOpcode::FPMin64, false);
+		case O::V_MAX_F64: return FloatBinary(inst, IR::ValueOpcode::FPMax64, false);
 		case O::V_MIN_F32: return FloatBinary(inst, IR::ValueOpcode::FPMin32, false);
 		case O::V_MAX_F32: return FloatBinary(inst, IR::ValueOpcode::FPMax32, false);
 		case O::V_LDEXP_F32: return FloatBinary(inst, IR::ValueOpcode::FPLdexp, false);

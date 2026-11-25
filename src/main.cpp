@@ -45,9 +45,12 @@ static std::string GetBuildString() {
 static void PrintUsage() {
 	::printf("KyTx PS5 Emulator [ARM64 + Metal RDNA->MSL]\n");
 	::printf("%s\n", GetBuildString().c_str());
-	::printf("kytx_emulator --game <dir|elf|zar> [options]\n\n");
+	::printf("kytx_emulator --game <dir|elf|archive> [options]\n\n");
 	::printf("Options:\n");
-	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
+	::printf("  --game <dir|elf|archive>                 Game directory, executable, or archive to load.\n");
+#if defined(__APPLE__)
+	::printf("    .pkg and .fpkg require the external KYTY_FPKG_READER helper.\n");
+#endif
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1920.\n");
 	::printf("  --screen-height <num>                Window height. Default: 1080.\n");
@@ -270,6 +273,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				options.app0_dir = path;
 				options.elf      = "/app0/eboot.bin";
 			} else if (Common::IsSupportedArchive(path) && Common::File::IsFileExisting(path)) {
+				options.game_archive = Common::OpenArchive(path);
+				if (!options.game_archive) {
+					::printf("Could not open game archive: %s\n", value.c_str());
+					return false;
+				}
 				const auto root = Common::MakeArchivePath(path);
 				if (!Common::File::IsFileExisting(root / "eboot.bin")) {
 					::printf("Archive does not contain eboot.bin: %s\n", value.c_str());

@@ -70,6 +70,27 @@ struct GuestRegs {
 };
 bool GetCurrentGuestRegs(GuestRegs* out);
 
+// The SysV register context needed to suspend a guest call and return on a different guest stack.
+struct GuestContinuation {
+	uint64_t rbx = 0;
+	uint64_t rbp = 0;
+	uint64_t rdi = 0;
+	uint64_t rsi = 0;
+	uint64_t r12 = 0;
+	uint64_t r13 = 0;
+	uint64_t r14 = 0;
+	uint64_t r15 = 0;
+	uint64_t rsp = 0;
+	uint64_t rip = 0;
+	uint32_t mxcsr = 0x1f80;
+	uint16_t fcw = 0x37f;
+};
+
+// Valid within HLE. A queued continuation replaces that HLE call's ordinary guest return.
+bool CaptureContinuation(GuestContinuation* continuation);
+void ResumeContinuation(const GuestContinuation& continuation, uint64_t result);
+
+
 // Diagnostic only: FEX's best RIP reconstruction for a fault inside its JIT cache.
 // FEX can fall back to a saved RIP; this is a location hint, not a reconstructed register file.
 struct GuestFaultLocation {

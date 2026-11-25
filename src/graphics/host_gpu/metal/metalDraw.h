@@ -136,6 +136,8 @@ public:
 	// Draw with the arguments read from a GPU buffer (DrawPrimitivesIndirectArguments layout).
 	// Defer diagnostic pass splitting until the last element of a multi-draw;
 	// ending its encoder earlier would discard pipeline/resource state for the rest.
+	bool DrawMesh(uint32_t groups, uint32_t instances, uint32_t threads);
+
 	void DrawIndirect(Prospero::PrimitiveType prim_type, id<MTLBuffer> args_buffer, uint64_t args_offset,
 	                  bool last_in_batch = true);
 	void DrawIndexedIndirect(Prospero::PrimitiveType prim_type, MTLIndexType index_type, id<MTLBuffer> index_buffer,

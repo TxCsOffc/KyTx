@@ -43,6 +43,7 @@ MTLPixelFormat MetalFormatFromBufferFormat(Prospero::BufferFormat format) {
 		case Prospero::BufferFormat::k16_16SInt: return MTLPixelFormatRG16Sint;
 		case Prospero::BufferFormat::k16_16Float: return MTLPixelFormatRG16Float;
 
+		case Prospero::BufferFormat::k10_11_11Float:
 		case Prospero::BufferFormat::k11_11_10Float: return MTLPixelFormatRG11B10Float;
 		case Prospero::BufferFormat::k10_10_10_2UNorm: return MTLPixelFormatRGB10A2Unorm;
 		case Prospero::BufferFormat::k10_10_10_2SNorm: return MTLPixelFormatRGB10A2Unorm;

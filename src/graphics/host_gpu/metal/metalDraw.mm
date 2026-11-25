@@ -399,7 +399,8 @@ void MetalDrawExecutor::UseResource(id<MTLResource> resource, MTLResourceUsage u
 	}
 	id<MTLRenderCommandEncoder> encoder = MetalContext::Instance().GetActiveRenderEncoder();
 	if (encoder) {
-		[encoder useResource:resource usage:usage stages:MTLRenderStageVertex | MTLRenderStageFragment];
+		[encoder useResource:resource usage:usage stages:MTLRenderStageVertex |
+		                                            MTLRenderStageFragment | MTLRenderStageMesh];
 	}
 	id<MTLComputeCommandEncoder> c_encoder = MetalContext::Instance().GetActiveComputeEncoder();
 	if (c_encoder) {
@@ -446,6 +447,34 @@ void MetalDrawExecutor::Draw(Prospero::PrimitiveType prim_type,
 		}
 	}
 
+	if (prim_type == Prospero::PrimitiveType::kTriFan && vertex_count > 3) {
+		// Metal has no triangle fan topology. Index each triangle back to the
+		// first guest vertex while preserving the shader's vertex/instance IDs.
+		const auto index_count = static_cast<uint64_t>(vertex_count - 2u) * 3u;
+		const auto indices = MetalBufferManager::Instance().AllocateDynamic(index_count * sizeof(uint32_t),
+		                                                                   alignof(uint32_t));
+		if (!indices.IsValid() || indices.cpu_addr == nullptr) {
+			return;
+		}
+		auto* data = static_cast<uint32_t*>(indices.cpu_addr);
+		for (uint32_t i = 1; i < vertex_count - 1u; ++i) {
+			*data++ = 0;
+			*data++ = i;
+			*data++ = i + 1u;
+		}
+		PassTimerItem();
+		[encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+		                    indexCount:index_count
+		                     indexType:MTLIndexTypeUInt32
+		                   indexBuffer:indices.buffer
+		             indexBufferOffset:indices.offset
+		                 instanceCount:instance_count
+		                     baseVertex:first_vertex
+		                   baseInstance:first_instance];
+		SplitAfterDraw();
+		return;
+	}
+
 	MTLPrimitiveType mtl_prim = TranslatePrimitiveType(prim_type);
 	// RECTLIST: three corners define a rectangle; the vertex shader wrapper synthesises vertex 3, so a single
 	// rectangle is drawn as a four-vertex strip (two triangles).
@@ -460,6 +489,20 @@ void MetalDrawExecutor::Draw(Prospero::PrimitiveType prim_type,
 	          instanceCount:instance_count
 	           baseInstance:first_instance];
 	SplitAfterDraw();
+}
+
+bool MetalDrawExecutor::DrawMesh(uint32_t groups, uint32_t instances, uint32_t threads) {
+	auto encoder = MetalContext::Instance().GetActiveRenderEncoder();
+	if (!encoder || !m_has_render_pipeline || m_scissor_empty || groups == 0 || instances == 0) {
+		return false;
+	}
+	FaultSignpost(encoder);
+	PassTimerItem();
+	[encoder drawMeshThreadgroups:MTLSizeMake(groups, instances, 1)
+	 threadsPerObjectThreadgroup:MTLSizeMake(0, 0, 0)
+	   threadsPerMeshThreadgroup:MTLSizeMake(threads, 1, 1)];
+	SplitAfterDraw();
+	return true;
 }
 
 void MetalDrawExecutor::DrawIndirect(Prospero::PrimitiveType prim_type, id<MTLBuffer> args_buffer,

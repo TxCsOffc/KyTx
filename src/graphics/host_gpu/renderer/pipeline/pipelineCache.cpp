@@ -791,7 +791,12 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		auto backend_options = options;
+#if defined(__APPLE__)
+		backend_options.metal_guest_address_space =
+		    options.stage == ShaderType::Mesh && Metal::UseNativeMetalBackend();
+#endif
+		auto result = ShaderRecompiler::CompileProgram(std::move(translated), backend_options,
 		                                               specialization, push_data_start_dword);
 
 		// KYTY_MSL_DIRECT=<0|1|2>: exercise the direct RDNA->MSL emitter alongside the
@@ -840,7 +845,9 @@ struct PipelineCache::ProgramCache {
 
 #if defined(__APPLE__)
 		if (Metal::UseNativeMetalBackend()) {
-			const uint64_t metal_hash = options.shader_hash ^ MetalFunctionVariant(options);
+			// Compiled mesh shaders use a different guest-address and argument-buffer layout.
+			const uint64_t mesh_revision = options.stage == ShaderType::Mesh ? 0x97470a932deaf19bull : 0;
+			const uint64_t metal_hash = options.shader_hash ^ MetalFunctionVariant(options) ^ mesh_revision;
 			// KYTY_MSL_BACKEND=1 compiles the direct RDNA->MSL translation. Shaders
 			// the MSL backend cannot express fall back to the SPIR-V path below.
 			static const bool s_msl_backend = [] {
@@ -863,7 +870,7 @@ struct PipelineCache::ProgramCache {
 				const char* value = std::getenv("KYTY_MSL_ONLY");
 				return value != nullptr && value[0] == '1';
 			}();
-			if (s_msl_only) {
+			if (s_msl_only && options.stage != ShaderType::Mesh) {
 				auto msl = ShaderRecompiler::Msl::EmitProgram(result.program, options.input_info);
 				uint64_t msl_hash = Metal::NativeMslFunctionKey(
 				    metal_hash, static_cast<uint32_t>(options.stage), msl.source, msl.success);
@@ -928,6 +935,7 @@ struct PipelineCache::ProgramCache {
 						auto info = std::move(result.program).TakeCompiledInfo();
 						info.shader_hash = msl_hash;
 						info.native_msl  = true;
+						info.metal_device_lds_dwords = msl.device_lds_dwords;
 						return {
 						    .specialization = std::move(specialization),
 						    .program        = std::move(info),
@@ -949,7 +957,7 @@ struct PipelineCache::ProgramCache {
 				    .handle         = {.id = id, .module = nullptr},
 				};
 			}
-			if (s_msl_backend && msl_stage_allowed) {
+			if (s_msl_backend && msl_stage_allowed && options.stage != ShaderType::Mesh) {
 				auto msl = ShaderRecompiler::Msl::EmitProgram(result.program, options.input_info);
 				if (msl.success) {
 					const uint64_t msl_hash = Metal::NativeMslFunctionKey(
@@ -963,6 +971,7 @@ struct PipelineCache::ProgramCache {
 						// variant hash, not the raw shader hash.
 						info.shader_hash = msl_hash;
 						info.native_msl  = true;
+						info.metal_device_lds_dwords = msl.device_lds_dwords;
 						return {
 						    .specialization = std::move(specialization),
 						    .program        = std::move(info),
@@ -974,8 +983,12 @@ struct PipelineCache::ProgramCache {
 				     options.shader_hash, msl.unsupported.size());
 			}
 			const auto spvc_abi = Metal::ComputeSpvcAbiLayout(result.program.bindings, options.stage);
-			Metal::MetalShaderManager::Instance().CompileSpirvToFunction(
+			const auto compiled = Metal::MetalShaderManager::Instance().CompileSpirvToFunction(
 			    result.spirv, "main0", static_cast<uint32_t>(options.stage), metal_hash, &spvc_abi);
+			if (options.stage == ShaderType::Mesh && !compiled.success) {
+				std::fprintf(stderr, "[MetalMesh] compiler failed for 0x%016" PRIx64 ": %s\n",
+				             options.shader_hash, compiled.error_log.c_str());
+			}
 			const auto id = ++next_shader_id;
 			auto info = std::move(result.program).TakeCompiledInfo();
 			info.shader_hash = metal_hash;
@@ -1025,8 +1038,18 @@ struct PipelineCache::ProgramCache {
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		{ ProfileDetailScope key_profile("cpu_program_static_key", params.hash);
-		  BuildStageStaticKey(input_info, lookup_key.static_state); }
+		{
+			ProfileDetailScope key_profile("cpu_program_static_key", params.hash);
+#if defined(__APPLE__)
+			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+				const bool pulls_vertices = stage == ShaderType::Vertex && Metal::UseNativeMetalBackend();
+				BuildStageStaticKey(input_info, lookup_key.static_state, pulls_vertices);
+			} else
+#endif
+			{
+				BuildStageStaticKey(input_info, lookup_key.static_state);
+			}
+		}
 		uint64_t profile_key = params.hash;
 		if (profile.Active()) {
 			ProfileCpuScope fingerprint(*ProfileThread().scheduler, "profile_fingerprint_cpu");
@@ -1449,21 +1472,28 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
-		auto& mesh              = vertex_info[0].mesh;
-		mesh.host_subgroup_size = m_graphics.subgroup_size;
-		const auto& limits      = m_graphics.mesh_shader_properties;
-		const auto  logical_threads =
-		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
-		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
-		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
-		if (host_threads > limits.maxMeshWorkGroupInvocations ||
-		    host_threads > limits.maxMeshWorkGroupSize[0] ||
-		    mesh.max_vertices > limits.maxMeshOutputVertices ||
-		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+#if defined(__APPLE__)
+		if (Metal::UseNativeMetalBackend()) {
+			vertex_info[0].mesh.host_subgroup_size = 32;
+		} else
+#endif
+		{
+			EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+			auto& mesh              = vertex_info[0].mesh;
+			mesh.host_subgroup_size = m_graphics.subgroup_size;
+			const auto& limits      = m_graphics.mesh_shader_properties;
+			const auto  logical_threads =
+			    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
+			const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
+			                          std::min(mesh.host_subgroup_size, mesh.wave_size);
+			if (host_threads > limits.maxMeshWorkGroupInvocations ||
+			    host_threads > limits.maxMeshWorkGroupSize[0] ||
+			    mesh.max_vertices > limits.maxMeshOutputVertices ||
+			    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+			    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
+				EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
+				     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+			}
 		}
 	}
 	ShaderParams pixel_params;
@@ -1541,30 +1571,30 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	// Metal's native emitter can back an oversized LDS with a private buffer.
+	// Keep the guest declaration intact through resource and shader compilation.
+	bool native_metal = false;
 #if defined(__APPLE__)
-	const auto max_lds_dwords = Metal::UseNativeMetalBackend() ? 8192u :
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
-#else
-	const auto max_lds_dwords =
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
+	native_metal = Metal::UseNativeMetalBackend();
+	if (native_metal) input_info.metal_threadgroup_limit_dwords = Metal::NativeMetalThreadgroupLimitDwords();
 #endif
-	if (input_info.lds_size_dwords > max_lds_dwords) {
-		static std::atomic_bool warned = false;
-		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
-			                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
-			                 "be incorrect.",
-			                 input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
-		}
-	}
-	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
-	// KYTY_CS_LDS_MIN=<dwords>: raise the LDS declaration of every compute shader (diagnosis).
+	// KYTY_CS_LDS_MIN=<dwords>: raise the LDS declaration (diagnosis).
 	static const uint32_t lds_min = [] {
 		const char* value = std::getenv("KYTY_CS_LDS_MIN");
 		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
 	}();
-	if (lds_min != 0 && input_info.lds_size_dwords < lds_min) {
-		input_info.lds_size_dwords = std::min(lds_min, max_lds_dwords);
+	input_info.lds_size_dwords = std::max(input_info.lds_size_dwords, lds_min);
+	if (!native_metal) {
+		const auto max_lds_dwords = m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
+		if (input_info.lds_size_dwords > max_lds_dwords) {
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
+				                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
+				                 "be incorrect.", input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
+			}
+			input_info.lds_size_dwords = max_lds_dwords;
+		}
 	}
 	uint32_t          push_data_cursor = 0;
 	auto program = m_program_cache->Get(params, input_info, push_data_cursor);

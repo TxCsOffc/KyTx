@@ -71,6 +71,14 @@ bool IsRuntimeSelect(ValueOpcode op) {
 	       op == ValueOpcode::SelectF32;
 }
 
+uint32_t ReverseDescriptorBits(uint32_t word) {
+	word = ((word & 0x55555555u) << 1u) | ((word >> 1u) & 0x55555555u);
+	word = ((word & 0x33333333u) << 2u) | ((word >> 2u) & 0x33333333u);
+	word = ((word & 0x0f0f0f0fu) << 4u) | ((word >> 4u) & 0x0f0f0f0fu);
+	return ((word & 0x000000ffu) << 24u) | ((word & 0x0000ff00u) << 8u) |
+	       ((word & 0x00ff0000u) >> 8u) | (word >> 24u);
+}
+
 bool IsRuntimeUniformOp(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::ConditionRef:
@@ -104,6 +112,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitwiseOr32:
 		case ValueOpcode::BitwiseXor32:
 		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::BitReverse32:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32:
@@ -811,6 +820,10 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::BitReverse32:
+			if (!Arg(inst, 0, a)) return false;
+			result = ReverseDescriptorBits(static_cast<uint32_t>(a));
+			return true;
 		case ValueOpcode::ShiftLeftLogical32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) << (b & 31u);
@@ -1384,6 +1397,7 @@ private:
 			case ValueOpcode::FPRecipIFlag32:
 			case ValueOpcode::FPIsNan32:
 			case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::BitReverse32:
 			case ValueOpcode::ConditionRef:
 			case ValueOpcode::LogicalNot: Operands(inst, node, 1); break;
 			case ValueOpcode::CompositeConstructU64:
@@ -1821,6 +1835,10 @@ bool CompiledSrtWalker::EvaluateInst(uint32_t id, uint64_t& result) {
 		case ValueOpcode::BitwiseNot32:
 			if (!EvaluateNode(node.args[0], a)) return false;
 			result = ~static_cast<uint32_t>(a);
+			return true;
+		case ValueOpcode::BitReverse32:
+			if (!EvaluateNode(node.args[0], a)) return false;
+			result = ReverseDescriptorBits(static_cast<uint32_t>(a));
 			return true;
 		case ValueOpcode::ShiftLeftLogical32:
 			if (!binary()) return false;

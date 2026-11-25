@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/metal/metalAddressSpace.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -1067,11 +1068,23 @@ void DefineGetBdaPointer(EmitterState& state) {
 	                           address);
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
 	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	auto page = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	uint32_t valid_address = 0;
+	if (state.metal_guest_address_space) {
+		const auto low = Binary(state, spv::OpULessThan, TypeBool(state), address,
+		                        ConstantDeviceAddress(state, LOWER_ADDRESS_SIZE));
+		const auto high = Binary(state, spv::OpULessThan, TypeBool(state), address,
+		                         ConstantDeviceAddress(state, LibKernel::Memory::kExtendedMemoryBase +
+		                             LibKernel::Memory::kExtendedMemorySize));
+		valid_address = EmitLogicalOrBool(state, low, EmitLogicalAndBool(state, extended, high));
+		page = Select(state, TypeU32(state), valid_address, page, ConstantU32(state, 0));
+	}
 	uint32_t base;
-	if (BufferCache::SparseBdaEnabled()) {
+	if (state.metal_guest_address_space || BufferCache::SparseBdaEnabled()) {
+		const uint32_t leaf_bits = state.metal_guest_address_space
+		    ? Metal::GuestAddressLeafBits : BufferCache::BDA_LEAF_BITS;
 		const auto root_index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,
-		                               ConstantU32(state, BufferCache::BDA_LEAF_BITS));
+		                               ConstantU32(state, leaf_bits));
 		const auto root_pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferU64ElementPointer(state),
 		                          root_pointer, state.bda_pagetable_variable,
@@ -1091,7 +1104,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 		const auto leaf_offset = Binary(state, spv::OpShiftLeftLogical, type,
 		    Unary(state, spv::OpUConvert, type,
 		          Binary(state, spv::OpBitwiseAnd, TypeU32(state), page,
-		                 ConstantU32(state, BufferCache::BDA_LEAF_ENTRIES - 1))),
+		                 ConstantU32(state, (1u << leaf_bits) - 1u))),
 		    ConstantDeviceAddress(state, 3));
 		const auto leaf_address = Binary(state, spv::OpIAdd, type, leaf_base, leaf_offset);
 		const auto leaf_pointer = Unary(state, spv::OpConvertUToPtr,
@@ -1114,6 +1127,9 @@ void DefineGetBdaPointer(EmitterState& state) {
 		base = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
 	}
+	if (state.metal_guest_address_space) {
+		base = Select(state, type, valid_address, base, ConstantDeviceAddress(state, 0));
+	}
 	const auto missing =
 	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantDeviceAddress(state, 0));
 	const auto fault_label     = state.builder.AllocateId();
@@ -1123,7 +1139,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpBranchConditional, missing, fault_label, available_label);
 
 	EmitLabel(state, fault_label);
-	RecordBdaFault(state, page);
+	if (!state.metal_guest_address_space) RecordBdaFault(state, page);
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, available_label);

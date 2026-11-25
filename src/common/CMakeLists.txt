@@ -29,6 +29,10 @@ target_link_libraries(common
 		ZArchive::zarchive
 )
 
+if(APPLE)
+	target_link_libraries(common PRIVATE nlohmann_json::nlohmann_json)
+endif()
+
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)
 set(check_headers ${CMAKE_CURRENT_SOURCE_DIR})
 
