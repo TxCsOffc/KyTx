@@ -1942,6 +1942,37 @@ void TestSampleAdjustSamplerScratch() {
                 "SampleAdjust canonicalization discarded border-mode bits");
 }
 
+void TestSamplerDescriptorWords() {
+  for (bool reserved_only : {false, true}) {
+    Fixture fixture(ShaderType::Pixel);
+    const auto word3 = reserved_only
+        ? fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                       {fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                     {fixture.Emit(ValueOpcode::LaneId), Value(0xffu)}),
+                        Value(12u)})
+        : fixture.Emit(ValueOpcode::BitReverse32, {fixture.UserData(3)});
+    const auto image = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                      Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto sampler = fixture.Sampler({Value(4u), Value(0u), Value(0u), word3});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+                 {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x204));
+    fixture.PlanAndTrack();
+
+    const auto source = fixture.program.info.samplers[0].source;
+    const std::array user_data{0u, 0u, 0u, 0x12345601u};
+    SrtRuntime runtime{.user_data = user_data};
+    DescriptorValue descriptor;
+    Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(source, descriptor),
+          "sampler descriptor evaluation failed");
+    Check(descriptor.dwords[3] == (reserved_only ? 0u : 0x806a2c48u),
+          "sampler descriptor lost active border fields");
+  }
+}
+
 void TestFmaskLoadSpecialization() {
   namespace Prospero = Libs::Graphics::Prospero;
   Fixture fixture;
@@ -3463,6 +3494,7 @@ int main() {
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
+    Run("sampler descriptor words", TestSamplerDescriptorWords);
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);

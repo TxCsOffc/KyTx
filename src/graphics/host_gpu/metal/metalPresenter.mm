@@ -29,7 +29,15 @@ struct PresentUniforms {
 	uint32_t pitch;
 	uint32_t format;
 	uint32_t is_tiled;
+	uint32_t encode_srgb;
 };
+
+static bool TextureReadNeedsSrgbEncoding(MTLPixelFormat format) {
+	// Metal reads sRGB textures as linear values. The unorm drawable expects
+	// display-encoded values, so restore the transfer curve just like for linear float targets.
+	return format == MTLPixelFormatRGBA8Unorm_sRGB || format == MTLPixelFormatBGRA8Unorm_sRGB ||
+	       format == MTLPixelFormatRG11B10Float || format == MTLPixelFormatRGBA16Float;
+}
 
 struct MetalPresenter::Impl {
 	SDL_Window*   window     = nullptr;
@@ -64,6 +72,7 @@ struct MetalPresenter::Impl {
 			"    uint pitch;\n"
 			"    uint format;\n"
 			"    uint is_tiled;\n"
+			"    uint encode_srgb;\n"
 			"};\n"
 			"inline float decode_r11(uint val) {\n"
 			"    uint exponent = (val >> 6u) & 0x1Fu;\n"
@@ -104,10 +113,7 @@ struct MetalPresenter::Impl {
 			"    }\n"
 			"    float4 c = src.read(uint2(tex_x, tex_y));\n"
 			"    float3 rgb = clamp(c.rgb, 0.0, 1.0);\n"
-			"    // Display-referred formats (the game's final composite: 8-bit and RGB10A2 flip images) are already\n"
-			"    // encoded for the display, so they are copied straight; only linear HDR targets (RG11B10F, RGBA16F)\n"
-			"    // get the sRGB transfer function.\n"
-			"    if (u.format == 92u || u.format == 115u) {\n"
+			"    if (u.encode_srgb != 0u) {\n"
 			"        rgb = select(rgb * 12.92, 1.055 * pow(rgb, float3(1.0 / 2.4)) - 0.055, rgb > 0.0031308);\n"
 			"    }\n"
 			"    return float4(rgb, 1.0);\n"
@@ -336,6 +342,7 @@ bool MetalPresenter::PresentTexture(void* texture) {
 		if (align < 64) align = 64;
 		u.pitch = static_cast<uint32_t>((u.width * 4 + align - 1) & ~(align - 1));
 		u.format = static_cast<uint32_t>(src_tex.pixelFormat);
+		u.encode_srgb = TextureReadNeedsSrgbEncoding(src_tex.pixelFormat);
 		static int s_env_flip_y = -1;
 		if (s_env_flip_y == -1) {
 			const char* env = std::getenv("KYTY_FLIP_Y");
@@ -537,6 +544,7 @@ bool MetalPresenter::DumpTextureToPpm(void* texture, const char* path) {
 		u.height = height;
 		u.pitch  = static_cast<uint32_t>(row_bytes);
 		u.format = static_cast<uint32_t>(src.pixelFormat);
+		u.encode_srgb = TextureReadNeedsSrgbEncoding(src.pixelFormat);
 		u.is_tiled = 0;
 
 		id<MTLCommandBuffer> cmd = [queue commandBuffer];

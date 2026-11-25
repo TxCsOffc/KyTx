@@ -106,6 +106,7 @@ struct MetalRenderPipelineKey {
 	MTLPixelFormat                                 stencil_format  = static_cast<MTLPixelFormat>(0);
 	uint32_t                                       sample_count    = 1;
 	uint32_t                                       primitive_type  = 0;
+	uint32_t                                       mesh_threads    = 0;
 
 	bool operator==(const MetalRenderPipelineKey& other) const noexcept;
 };

@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cerrno>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -12,6 +15,18 @@
 #include <unordered_map>
 #include <utility>
 #include <zarchive/zarchivereader.h>
+
+#if defined(__APPLE__)
+#include <fcntl.h>
+#include <map>
+#include <nlohmann/json.hpp>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 // POSIX hosts and MinGW's pthread-backed libstdc++ have cancellable condition waits.
 // MSVC/ClangCL and MinGW's native Win32 threading backend do not use pthread waits.
@@ -87,12 +102,203 @@ std::shared_ptr<ArchiveReader> OpenZArchive(const std::filesystem::path& path) {
 	return reader ? std::make_shared<ZArchiveReaderBackend>(std::move(reader)) : nullptr;
 }
 
+#if defined(__APPLE__)
+// The optional local helper owns the package decoder. The socket carries only
+// the file index and bounded offset reads of the original, read-only package.
+class FpkgArchiveReader final: public ArchiveReader {
+public:
+	FpkgArchiveReader(int socket, pid_t child): m_socket(socket), m_child(child) {}
+	~FpkgArchiveReader() override {
+		close(m_socket);
+		while (waitpid(m_child, nullptr, 0) < 0 && errno == EINTR) {}
+	}
+
+	bool LoadIndex() {
+		uint32_t size = 0;
+		if (!Receive(&size, sizeof(size)) || size == 0 || size > MaxMessageSize) {
+			kill(m_child, SIGTERM);
+			return false;
+		}
+		std::string data(size, '\0');
+		if (!Receive(data.data(), size)) {
+			kill(m_child, SIGTERM);
+			return false;
+		}
+
+		const auto index = nlohmann::json::parse(data, nullptr, false);
+		if (!index.is_array()) {
+			return false;
+		}
+		m_files.emplace("", Entry {0, 0, false});
+		for (uint32_t i = 0; i < index.size(); ++i) {
+			const auto& member = index[i];
+			if (!member.is_object() || !member.contains("path") || !member.contains("size") ||
+			    !member["path"].is_string() || !member["size"].is_number_unsigned()) {
+				return false;
+			}
+			const auto& path = member["path"].get_ref<const std::string&>();
+			if (!ValidPath(path) ||
+			    !m_files.emplace(path, Entry {i, member["size"].get<uint64_t>(), true}).second) {
+				return false;
+			}
+			for (auto parent = path.rfind('/'); parent != std::string::npos;) {
+				const auto [dir, added] = m_files.try_emplace(path.substr(0, parent), Entry {0, 0, false});
+				if (dir->second.is_file) {
+					return false;
+				}
+				if (!added) {
+					break;
+				}
+				parent = path.rfind('/', parent - 1);
+			}
+		}
+		for (const auto& [path, entry]: m_files) {
+			if (path.empty()) {
+				continue;
+			}
+			const auto split = path.rfind('/');
+			m_children[split == std::string::npos ? "" : path.substr(0, split)].push_back(
+			    {path.substr(split == std::string::npos ? 0 : split + 1), entry.is_file});
+		}
+		return true;
+	}
+
+	std::optional<Entry> Find(std::string_view member) override {
+		const auto it = m_files.find(member);
+		return it == m_files.end() ? std::nullopt : std::optional {it->second};
+	}
+
+	std::vector<File::DirEntry> List(std::string_view member) override {
+		const auto it = m_children.find(member);
+		return it == m_children.end() ? std::vector<File::DirEntry> {} : it->second;
+	}
+
+	uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) override {
+		struct Request {
+			uint32_t file;
+			uint32_t size;
+			uint64_t offset;
+		};
+		static_assert(sizeof(Request) == 16);
+		const Request request {static_cast<uint32_t>(id), size, offset};
+		uint32_t received = 0;
+		if (!m_failed && size <= MaxMessageSize && Send(&request, sizeof(request)) &&
+		    Receive(&received, sizeof(received)) && received <= size && Receive(data, received)) {
+			return received;
+		}
+		m_failed = true;
+		return 0;
+	}
+
+private:
+	static constexpr uint32_t MaxMessageSize = 8u << 20;
+
+	static bool ValidPath(std::string_view path) {
+		if (path.empty() || path.back() == '/' || path.find('\\') != path.npos ||
+		    path.find('\0') != path.npos) {
+			return false;
+		}
+		while (!path.empty()) {
+			const auto separator = path.find('/');
+			const auto component = path.substr(0, separator);
+			if (component.empty() || component == "." || component == "..") {
+				return false;
+			}
+			path.remove_prefix(separator == path.npos ? path.size() : separator + 1);
+		}
+		return true;
+	}
+
+	bool Send(const void* source, size_t size) {
+		auto* bytes = static_cast<const uint8_t*>(source);
+		while (size != 0) {
+			const auto sent = send(m_socket, bytes, size, 0);
+			if (sent < 0 && errno == EINTR) {
+				continue;
+			}
+			if (sent <= 0) {
+				return false;
+			}
+			bytes += sent;
+			size -= static_cast<size_t>(sent);
+		}
+		return true;
+	}
+
+	bool Receive(void* destination, size_t size) {
+		auto* bytes = static_cast<uint8_t*>(destination);
+		while (size != 0) {
+			const auto got = recv(m_socket, bytes, size, 0);
+			if (got < 0 && errno == EINTR) {
+				continue;
+			}
+			if (got <= 0) {
+				return false;
+			}
+			bytes += got;
+			size -= static_cast<size_t>(got);
+		}
+		return true;
+	}
+
+	int m_socket;
+	pid_t m_child;
+	bool m_failed = false; // Reads run on the single archive I/O thread.
+	std::map<std::string, Entry, std::less<>> m_files;
+	std::map<std::string, std::vector<File::DirEntry>, std::less<>> m_children;
+};
+
+std::shared_ptr<ArchiveReader> OpenFpkg(const std::filesystem::path& path) {
+	const char* helper = std::getenv("KYTY_FPKG_READER");
+	if (helper == nullptr || helper[0] != '/' || access(helper, X_OK) != 0) {
+		std::fprintf(stderr, "Set KYTY_FPKG_READER to the executable path of a local FPKG reader.\n");
+		return {};
+	}
+	int sockets[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+		return {};
+	}
+	const timeval timeout {30, 0};
+	const int no_sigpipe = 1;
+	int result = fcntl(sockets[0], F_SETFD, FD_CLOEXEC) |
+	             fcntl(sockets[1], F_SETFD, FD_CLOEXEC) |
+	             setsockopt(sockets[0], SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) |
+	             setsockopt(sockets[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) |
+	             setsockopt(sockets[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+	posix_spawn_file_actions_t actions;
+	pid_t child = 0;
+	if (result == 0 && (result = posix_spawn_file_actions_init(&actions)) == 0) {
+		result = posix_spawn_file_actions_adddup2(&actions, sockets[1], STDIN_FILENO) |
+		         posix_spawn_file_actions_adddup2(&actions, sockets[1], STDOUT_FILENO);
+		if (result == 0) {
+			char mode[] = "serve";
+			char* const args[] = {const_cast<char*>(helper), mode, const_cast<char*>(path.c_str()), nullptr};
+			result = posix_spawn(&child, helper, &actions, nullptr, args, environ);
+		}
+		posix_spawn_file_actions_destroy(&actions);
+	}
+	close(sockets[1]);
+	if (result != 0) {
+		close(sockets[0]);
+		return {};
+	}
+	auto reader = std::make_shared<FpkgArchiveReader>(sockets[0], child);
+	return reader->LoadIndex() ? reader : nullptr;
+}
+#endif
+
 struct ArchiveFormat {
 	std::string_view extension;
 	std::shared_ptr<ArchiveReader> (*open)(const std::filesystem::path&);
 };
 
-constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}};
+constexpr ArchiveFormat Formats[] = {
+    {".zar", OpenZArchive},
+#if defined(__APPLE__)
+    {".pkg", OpenFpkg},
+    {".fpkg", OpenFpkg},
+#endif
+};
 using NativeView                  = std::basic_string_view<std::filesystem::path::value_type>;
 
 const ArchiveFormat* FindFormat(NativeView path) {

@@ -594,7 +594,8 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
 
-void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
+void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key,
+                         bool specialize_vertex_pulling) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
@@ -640,6 +641,13 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		key.push_back(destination.registers_num);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
 		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+		if (specialize_vertex_pulling && i < 27) {
+			// Native MSL pulls from each attribute's buffer and bakes its stride and index source.
+			const auto binding = destination.buffer_index;
+			const bool pulls = !resource.SwizzleEnabled() && binding >= 0 && binding < info.buffers_num;
+			key.push_back(pulls ? info.buffers[binding].stride : 0u);
+			key.push_back(pulls ? (info.buffers[binding].fetch_index != 0 ? 2u : 1u) : 0u);
+		}
 	}
 }
 
@@ -687,6 +695,7 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.host_subgroup_size);
 	key.push_back(info.thread_ids_num);
 	key.push_back(info.lds_size_dwords);
+	key.push_back(info.metal_threadgroup_limit_dwords);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
 	for (int i = 0; i < 3; i++) {

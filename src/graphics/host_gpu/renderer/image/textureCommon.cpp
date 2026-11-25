@@ -35,6 +35,11 @@ struct HostFormatInfo {
 
 HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
                                  Prospero::ChannelOrder order) {
+	if (guest_format == Prospero::BufferFormat::k10_11_11Float) {
+		// The host's 10-bit blue stores the guest's 10-bit red. Keep the packed bits
+		// unchanged so aliased guest buffers retain their layout.
+		return {vk::Format::eB10G11R11UfloatPack32, Prospero::ColorMappingBgra};
+	}
 	if (order == Prospero::ChannelOrder::kAlt) {
 		switch (guest_format) {
 			case Prospero::BufferFormat::k8_8_8_8UNorm:

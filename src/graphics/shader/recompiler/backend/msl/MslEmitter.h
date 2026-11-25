@@ -10,6 +10,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Msl {
 
+inline constexpr uint32_t DeviceLdsBufferIndex = 29;
+
 // Direct RDNA (IR) -> Metal Shading Language translation. Bypasses SPIR-V and
 // SPIRV-Cross: the IR already carries typed memory, image and export semantics.
 struct EmitResult {
@@ -20,6 +22,7 @@ struct EmitResult {
 	// The kernel runs each wave64 as 32 host lanes that each carry two guest lanes (see Wave64Pair): the dispatch must launch
 	// half as many host threads per group, in one dimension.
 	bool wave64_pair = false;
+	uint32_t device_lds_dwords = 0;
 };
 
 [[nodiscard]] EmitResult EmitProgram(const IR::Program& program,

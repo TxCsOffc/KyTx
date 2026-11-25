@@ -36,9 +36,13 @@ uint32_t PossibleU32Bits(Value value) {
 			return PossibleU32Bits(inst->Arg(0)) | PossibleU32Bits(inst->Arg(1));
 		case ValueOpcode::ShiftLeftLogical32: {
 			const auto shift = inst->Arg(1).Resolve();
-			return shift.IsImmediate() && shift.GetType() == Type::U32
-			           ? PossibleU32Bits(inst->Arg(0)) << (shift.U32() & 31u)
-			           : UINT32_MAX;
+			if (shift.IsImmediate() && shift.GetType() == Type::U32) {
+				const uint32_t s = shift.U32() & 31u;
+				// Low s bits are always zero; upper bits depend on the input.
+				const uint32_t lo_zero = (1u << s) - 1u;
+				return (PossibleU32Bits(inst->Arg(0)) << s) & ~lo_zero;
+			}
+			return UINT32_MAX;
 		}
 		default: return UINT32_MAX;
 	}
@@ -563,10 +567,14 @@ private:
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
 		}
 		const auto dword0 = descriptor.dwords[0].Resolve();
-		if (sampler && dword0.IsImmediate() && dword0.GetType() == Type::U32 &&
-		    (dword0.U32() & SamplerBorderClampMask) == 0) {
-			// Border color and its table index are unused unless a clamp axis selects border mode.
-			descriptor.dwords[3] = Value(0u);
+		if (sampler) {
+			const bool ignores_border = (PossibleU32Bits(dword0) & SamplerBorderClampMask) == 0;
+			const bool only_reserved =
+			    (PossibleU32Bits(descriptor.dwords[3]) & ~SamplerDword3ReservedMask) == 0;
+			if (ignores_border || only_reserved) {
+				// GPU expressions in reserved bits do not affect the sampler fields.
+				descriptor.dwords[3] = Value(0u);
+			}
 		}
 		m_resolved_handles.push_back({&handle, pc, descriptor, {}});
 	}
@@ -1673,8 +1681,11 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			const auto word = descriptor.dwords[bad_dword].Resolve();
+			const auto* def = word.TryInstruction();
+			Fail(pc, fmt::format("{} dword {} is not a valid runtime value ({})",
+			                     ValueOpcodeName(expected), bad_dword,
+			                     def != nullptr ? ValueOpcodeName(def->GetOpcode()) : "immediate"));
 		}
 		source = InternSource(descriptor);
 		return true;

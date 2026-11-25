@@ -16,7 +16,7 @@
 namespace Libs::Graphics::Metal {
 namespace {
 constexpr uint64_t kPageSize = 1ull << 14;
-constexpr uint64_t kLeafEntries = 1ull << 10;
+constexpr uint64_t kLeafEntries = 1ull << GuestAddressLeafBits;
 constexpr uint64_t kLowerSize = 1ull << 40;
 constexpr uint64_t kPackedSize = kLowerSize + LibKernel::Memory::kExtendedMemorySize;
 constexpr uint64_t kRootEntries = kPackedSize / (kPageSize * kLeafEntries);
@@ -33,7 +33,7 @@ uint64_t PackedAddress(uint64_t address) {
 
 class GuestAddressSpace {
 public:
-	uint64_t Bind() {
+	id<MTLBuffer> Bind(bool mesh_stage) {
 		std::vector<LibKernel::Memory::GuestBackingMapping> mappings;
 		uint64_t generation = m_generation;
 		if (LibKernel::Memory::GetGuestBackingMappings(generation, mappings)) {
@@ -48,22 +48,22 @@ public:
 			}
 			if (!ok) {
 				std::fprintf(stderr, "[MetalBda] could not publish guest mapping generation %llu\n", static_cast<unsigned long long>(generation));
-				return 0;
+				return nil;
 			}
 			m_generation = generation;
 		}
-		if (m_root == nil) return 0;
+		if (m_root == nil) return nil;
 		// The table stores raw GPU addresses, so binding the root alone cannot
 		// make the leaves or shared physical backing resident. Encoders retain
 		// this immutable version while newer mappings create a new version.
 		if (auto encoder = MetalContext::Instance().GetActiveRenderEncoder()) {
-			[encoder useResources:m_resources.data() count:m_resources.size() usage:MTLResourceUsageRead
-			                stages:MTLRenderStageVertex | MTLRenderStageFragment];
+			const auto stages = mesh_stage ? MTLRenderStageMesh : MTLRenderStageVertex | MTLRenderStageFragment;
+			[encoder useResources:m_resources.data() count:m_resources.size() usage:MTLResourceUsageRead stages:stages];
 		}
 		if (auto encoder = MetalContext::Instance().GetActiveComputeEncoder()) {
 			[encoder useResources:m_resources.data() count:m_resources.size() usage:MTLResourceUsageRead];
 		}
-		return m_root.gpuAddress;
+		return m_root;
 	}
 
 private:
@@ -142,9 +142,13 @@ private:
 };
 }
 
-uint64_t BindGuestAddressSpace() {
+id<MTLBuffer> BindGuestAddressSpaceBuffer(bool mesh_stage) {
 	// Graphics/compute encoding is serialized by MetalRenderer::m_mutex.
 	static GuestAddressSpace space;
-	return space.Bind();
+	return space.Bind(mesh_stage);
+}
+
+uint64_t BindGuestAddressSpace() {
+	return BindGuestAddressSpaceBuffer(false).gpuAddress;
 }
 }

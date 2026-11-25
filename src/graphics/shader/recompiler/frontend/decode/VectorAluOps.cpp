@@ -289,6 +289,8 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x14cu, Opcode::V_FMA_F64},
     {0x164u, Opcode::V_ADD_F64},
     {0x165u, Opcode::V_MUL_F64},
+    {0x166u, Opcode::V_MIN_F64},
+    {0x167u, Opcode::V_MAX_F64},
     {0x148u, Opcode::V_BFE_U32},
     {0x149u, Opcode::V_BFE_I32},
     {0x14au, Opcode::V_BFI_B32},
@@ -1221,6 +1223,8 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_ADD_F64:
 		case Opcode::V_MUL_F64:
+		case Opcode::V_MIN_F64:
+		case Opcode::V_MAX_F64:
 		case Opcode::V_MUL_LO_U32:
 		case Opcode::V_MUL_HI_U32:
 		case Opcode::V_MUL_LO_I32:
@@ -1373,6 +1377,8 @@ bool SupportsNativeVop3SourceModifiers(Opcode opcode) {
 		case Opcode::V_MAD_F32:
 		case Opcode::V_ADD_F64:
 		case Opcode::V_MUL_F64:
+		case Opcode::V_MIN_F64:
+		case Opcode::V_MAX_F64:
 		case Opcode::V_FMA_F64:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_PACK_B32_F16:

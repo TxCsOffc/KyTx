@@ -23,6 +23,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
 			return;
+		case O::S_OR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, false);
+			return;
 		case O::S_ANDN1_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false);
 			return;
@@ -31,6 +34,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return;
 		case O::S_AND_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true);
+			return;
+		case O::S_OR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true);
 			return;
 		case O::S_ANDN1_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true);

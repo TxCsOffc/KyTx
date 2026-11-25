@@ -5,6 +5,11 @@
 #include "common/stringUtils.h"
 
 #include <filesystem>
+#include <memory>
+
+namespace Common {
+class ArchiveReader;
+}
 
 namespace Emulator {
 
@@ -13,6 +18,7 @@ struct RunOptions {
 	std::filesystem::path app0_dir;
 	std::filesystem::path elf;
 	std::filesystem::path game_patch;
+	std::shared_ptr<Common::ArchiveReader> game_archive;
 };
 
 void Run(const RunOptions& options);

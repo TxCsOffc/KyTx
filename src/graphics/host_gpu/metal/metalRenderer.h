@@ -141,6 +141,7 @@ void RegisterComputeWrittenImage(uint64_t addr, void* texture);
 
 // Check if native Metal backend is enabled (e.g. KYTY_BACKEND=metal or KYTY_USE_METAL=1)
 [[nodiscard]] bool UseNativeMetalBackend() noexcept;
+[[nodiscard]] uint32_t NativeMetalThreadgroupLimitDwords();
 
 // Global data share, as seen by compute kernels (ds_append/ds_consume counters). The guest moves counters between GDS and
 // memory with DMA_DATA packets; the copies are ordered with the GPU work on the Metal queue.

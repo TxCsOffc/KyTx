@@ -10255,6 +10255,28 @@ void TestEmbeddedFetchPreservesSharedScalarLoad() {
   Check(MakeStageStaticKey(layout) == key,
         "pipeline-only vertex layout fragmented the shader module cache key");
 
+  const auto metal_key = [](const ShaderVertexInputInfo &vertex) {
+    std::vector<uint32_t> key;
+    BuildStageStaticKey(vertex, key, true);
+    return key;
+  };
+  auto pulled = layout;
+  pulled.resources_dst[0].buffer_index = 0;
+  pulled.buffers[0].stride = 76;
+  auto different_stride = pulled;
+  different_stride.buffers[0].stride = 108;
+  Check(metal_key(pulled) != metal_key(different_stride),
+        "Metal vertex pulling reused a shader with a different stride");
+  auto different_index = pulled;
+  different_index.buffers[0].fetch_index = 0;
+  Check(metal_key(pulled) != metal_key(different_index),
+        "Metal vertex pulling reused a shader with a different index source");
+  auto moved_buffer = pulled;
+  moved_buffer.resources[0].UpdateAddress48(0x12340000u);
+  moved_buffer.buffers[0].addr = 0x12340000u;
+  Check(metal_key(pulled) == metal_key(moved_buffer),
+        "Metal vertex pulling specialized on a dynamic buffer address");
+
   auto formatted = input;
   formatted.resources[0].fields[3] =
       (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32UInt) << 12u) |

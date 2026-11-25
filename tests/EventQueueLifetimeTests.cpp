@@ -91,6 +91,32 @@ void TestPeriodicTimerEvents() {
 	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete timer queue");
 }
 
+void TestAmprAndUserEventsShareAnId() {
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	constexpr int id = 5;
+	auto* userdata = reinterpret_cast<void*>(0x1234);
+	auto* completion = reinterpret_cast<void*>(0x5678);
+	Check(EventQueue::KernelCreateEqueue(&queue, "apr-test") == OK, "create AMPR queue");
+	Check(EventQueue::KernelAddUserEventEdge(queue, id) == OK, "add user event");
+	Check(EventQueue::KernelAddAmprEvent(queue, id, userdata) == OK, "add AMPR event");
+	Check(EventQueue::KernelTriggerEvent(queue, id, EventQueue::KERNEL_EVFILT_AMPR,
+	                                     completion) == OK,
+	      "trigger AMPR completion");
+
+	EventQueue::KernelEvent event {};
+	int count = 0;
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, &event, 1, &count, &timeout) == OK && count == 1,
+	      "receive AMPR completion");
+	Check(event.ident == id && event.filter == EventQueue::KERNEL_EVFILT_AMPR &&
+	          event.udata == userdata && event.data == reinterpret_cast<intptr_t>(completion),
+	      "AMPR completion reports its own filter and payload");
+	Check(EventQueue::KernelDeleteAmprEvent(queue, id) == OK, "delete AMPR event");
+	Check(EventQueue::KernelTriggerUserEvent(queue, id, userdata) == OK,
+	      "user event survives deletion of AMPR event sharing the id");
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete AMPR queue");
+}
+
 void CountDeletedEvent(EventQueue::KernelEqueue, EventQueue::KernelEqueueEvent* event) {
 	auto* count = static_cast<std::atomic_uint32_t*>(event->filter.data);
 	count->fetch_add(1, std::memory_order_relaxed);
@@ -496,6 +522,7 @@ void TestConcurrentDelete() {
 
 int main() {
 	TestPeriodicTimerEvents();
+	TestAmprAndUserEventsShareAnId();
 	TestDuplicateAddPreservesEventState();
 	TestCallbackStateOutlivesPort();
 	TestCallbackOwnsPayload();
