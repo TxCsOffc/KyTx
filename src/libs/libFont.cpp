@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -570,7 +571,7 @@ static void fill_text_codes(FontTextCodes* text_codes, FontCharacterState* chara
 }
 
 static void fill_metrics(FontGlyphMetrics* metrics, const FontState* font = nullptr);
-static void fill_metrics_for_code(FontGlyphMetrics* metrics, const FontState* font, uint32_t code);
+static void fill_layout_metrics(FontGlyphMetrics* metrics, FontState* font, uint32_t code);
 
 static void fill_writing_metrics(FontWritingMetrics* metrics, uint32_t character_count) {
 	if (metrics == nullptr) {
@@ -598,9 +599,8 @@ static void fill_writing_step(FontWritingStep* step, FontCharacterState* charact
 	step->profile.character_count = character != nullptr ? 1u : 0u;
 	step->profile.invisible_glyph = 0u;
 	step->glyph_code              = character != nullptr ? character->code : 0u;
-	fill_metrics_for_code(&step->glyph_metrics,
-	                      static_cast<FontState*>(character != nullptr ? character->font : nullptr),
-	                      character != nullptr ? character->code : static_cast<uint32_t>('?'));
+	fill_layout_metrics(&step->glyph_metrics, static_cast<FontState*>(step->font),
+	                    character ? character->code : static_cast<uint32_t>('?'));
 }
 
 static void fill_writing_letter_step(FontWritingLetterStep* letter_step,
@@ -801,9 +801,13 @@ static bool ensure_stb_font(FontState* font) {
 	return font->has_ttf;
 }
 
+static float layout_dimension(float value, float fallback) {
+	return std::isfinite(value) && value > 0.0f ? value : fallback;
+}
+
 static float stb_font_pixel_height(const FontState* font) {
-	const float scale = (font != nullptr && font->scale_h > 1.0f ? font->scale_h : 16.0f);
-	return static_cast<float>(std::clamp(static_cast<int>(scale + 0.5f), 8, FONT_BITMAP_MAX_DIM));
+	const float height = layout_dimension(font ? font->scale_h : 0.0f, 16.0f);
+	return std::round(std::clamp(height, 8.0f, static_cast<float>(FONT_BITMAP_MAX_DIM)));
 }
 
 static float stb_font_scale(FontState* font) {
@@ -820,7 +824,7 @@ static uint32_t stb_supported_codepoint(FontState* font, uint32_t code) {
 	return code;
 }
 
-static bool get_stb_metrics(FontState* font, uint32_t code, FontGlyphMetrics* metrics) {
+static bool get_stb_bitmap_metrics(FontState* font, uint32_t code, FontGlyphMetrics* metrics) {
 	if (metrics == nullptr || !ensure_stb_font(font)) {
 		return false;
 	}
@@ -923,11 +927,39 @@ static void fill_metrics_for_code(FontGlyphMetrics* metrics, const FontState* fo
 		return;
 	}
 
-	if (get_stb_metrics(const_cast<FontState*>(font), code, metrics)) {
+	if (get_stb_bitmap_metrics(const_cast<FontState*>(font), code, metrics)) {
 		return;
 	}
 
 	fill_bitmap_metrics(metrics, font);
+}
+
+// Layout uses the requested coordinate system even when glyphs are rasterized
+// into a much smaller bitmap. Measuring the bitmap here collapses advances.
+static void fill_layout_metrics(FontGlyphMetrics* metrics, FontState* font, uint32_t code) {
+	if (metrics == nullptr) return;
+	const float height = layout_dimension(font ? font->scale_h : 0.0f, 16.0f);
+	const float width = layout_dimension(font ? font->scale_w : 0.0f, height);
+	*metrics = {};
+	metrics->vertical.advance = height;
+	if (!ensure_stb_font(font)) {
+		metrics->width = width * 0.5f;
+		metrics->height = height;
+		metrics->horizontal.bearing_y = height * 0.75f;
+		metrics->horizontal.advance = metrics->width;
+		return;
+	}
+	const int glyph = stbtt_FindGlyphIndex(&font->font_info, stb_supported_codepoint(font, code));
+	const float sx = stbtt_ScaleForPixelHeight(&font->font_info, width);
+	const float sy = stbtt_ScaleForPixelHeight(&font->font_info, height);
+	int advance = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+	stbtt_GetGlyphHMetrics(&font->font_info, glyph, &advance, nullptr);
+	stbtt_GetGlyphBox(&font->font_info, glyph, &x0, &y0, &x1, &y1);
+	metrics->width = static_cast<float>(x1 - x0) * sx;
+	metrics->height = static_cast<float>(y1 - y0) * sy;
+	metrics->horizontal.bearing_x = static_cast<float>(x0) * sx;
+	metrics->horizontal.bearing_y = static_cast<float>(y1) * sy;
+	metrics->horizontal.advance = static_cast<float>(advance) * sx;
 }
 
 static void fill_metrics(FontGlyphMetrics* metrics, const FontState* font) {
@@ -1424,8 +1456,9 @@ int KYTY_SYSV_ABI FontGetHorizontalLayout(FontHandle font_handle, FontHorizontal
 	}
 
 	auto* font = static_cast<FontState*>(font_handle);
+	const float height = layout_dimension(font->scale_h, 16.0f);
 	if (ensure_stb_font(font)) {
-		const float scale    = stb_font_scale(font);
+		const float scale    = stbtt_ScaleForPixelHeight(&font->font_info, height);
 		int         ascent   = 0;
 		int         descent  = 0;
 		int         line_gap = 0;
@@ -1434,8 +1467,8 @@ int KYTY_SYSV_ABI FontGetHorizontalLayout(FontHandle font_handle, FontHorizontal
 		layout->line_height   = static_cast<float>(ascent - descent + line_gap) * scale;
 		layout->effect_height = layout->line_height;
 	} else {
-		layout->base_line_y   = static_cast<float>(scaled_font_height(font)) * 0.75f;
-		layout->line_height   = static_cast<float>(scaled_font_height(font));
+		layout->base_line_y   = height * 0.75f;
+		layout->line_height   = height;
 		layout->effect_height = layout->line_height;
 	}
 
@@ -2088,7 +2121,7 @@ int KYTY_SYSV_ABI FontGetCharGlyphMetrics(FontHandle font_handle, uint32_t code,
 	LOGF("\t handle = 0x%016" PRIx64 ", code = 0x%08" PRIx32 ", metrics = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(font_handle), code, reinterpret_cast<uint64_t>(metrics));
 
-	fill_metrics_for_code(metrics, static_cast<FontState*>(font_handle), code);
+	fill_layout_metrics(metrics, static_cast<FontState*>(font_handle), code);
 
 	return OK;
 }
