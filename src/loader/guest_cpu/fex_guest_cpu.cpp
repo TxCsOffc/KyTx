@@ -13,6 +13,7 @@
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/LongJump.h>
 
@@ -31,6 +32,7 @@
 #include <mach/mach_vm.h>
 #include <mutex>
 #include <optional>
+#include <pthread.h>
 #include <signal.h>
 #include <string>
 #include <sys/mman.h>
@@ -231,7 +233,8 @@ FEXCore::HostFeatures MakeHostFeatures() {
 	if (sysctlbyname("hw.cachelinesize", &line, &size, nullptr, 0) != 0 || line == 0) {
 		line = 64;
 	}
-	f.DCacheLineLog2               = static_cast<uint32_t>(std::log2(static_cast<double>(line) / 4.0));
+	f.DCacheLineSize               = static_cast<uint32_t>(line);
+	f.ICacheLineSize               = static_cast<uint32_t>(line);
 	f.SupportsCacheMaintenanceOps  = 0;
 	f.SupportsAES                  = SysctlFlag("hw.optional.arm.FEAT_AES");
 	f.SupportsCRC                  = SysctlFlag("hw.optional.arm.FEAT_CRC32");
@@ -346,7 +349,7 @@ ThreadState* GetThreadState() {
 	st.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(*cs);
 	st.mxcsr     = 0x1F80;
 
-	ts->thread = g->ctx->CreateThread(&st);
+	ts->thread = g->ctx->CreateThread(st.rip, st.gregs[X86::REG_RSP], &st);
 	if (ts->thread == nullptr) {
 		std::fprintf(stderr, "[fex] CreateThread failed\n");
 		std::abort();
@@ -469,6 +472,8 @@ GuestCallResult RunGuest(uint64_t entry, const GuestCallArgs& a, uint64_t stack_
 	st.gregs[X86::REG_RAX] = 8; // AL = vector registers used, for variadic callees
 
 	ts->depth++;
+	// FEX may leave this thread in write mode after allocating its JIT buffer.
+	pthread_jit_write_protect_np(1);
 	g->ctx->HandleCallback(ts->thread, entry);
 	ts->depth--;
 
@@ -599,14 +604,16 @@ void DispatchHle(FEXCore::Core::CpuStateFrame* frame, uint64_t index) {
 
 class KytySyscallHandler final : public FEXCore::HLE::SyscallHandler {
 public:
-	void HandleSyscall(FEXCore::Core::CpuStateFrame* frame) override {
+	KytySyscallHandler() { OSABI = FEXCore::HLE::SyscallOSABI::OS_GENERIC; }
+
+	uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* frame, FEXCore::HLE::SyscallArguments*) override {
 		auto&          st  = frame->State;
 		const uint64_t rip = st.rip;
 		if (__builtin_expect(InStubRegion(rip), 1)) {
 			const uint64_t index = (rip - reinterpret_cast<uint64_t>(g->stub_base)) / kStubSlotSize;
 			if (__builtin_expect(index < g->stub_count.load(std::memory_order_acquire), 1)) {
 				DispatchHle(frame, index);
-				return;
+				return st.gregs[X86::REG_RAX];
 			}
 		}
 		// A raw `syscall` in guest code. PS5 games reach the kernel through libkernel (HLE), so
@@ -619,6 +626,7 @@ public:
 		}
 		st.gregs[X86::REG_RAX] = static_cast<uint64_t>(-38);
 		st.rip                 = rip + 2;
+		return st.gregs[X86::REG_RAX];
 	}
 
 	FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* /*thread*/,
@@ -888,6 +896,7 @@ bool HandleHostFault(int /*sig*/, void* siginfo, void* ucontext) {
 		const uint64_t pc_now = mc->__ss.__pc;
 		if (align && ts != nullptr && ts->thread != nullptr && g->ctx->IsAddressInCodeBuffer(ts->thread, pc_now)) {
 			// __x[0..28], __fp, __lr are contiguous: the 31-entry GPR array FEX expects.
+			const FEXCore::Allocator::ScopedJITWriteProtect allow_backpatch;
 			const auto result = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(
 			    ts->thread, FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier, pc_now, &mc->__ss.__x[0]);
 			if (result.has_value()) {

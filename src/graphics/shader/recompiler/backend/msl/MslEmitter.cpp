@@ -880,7 +880,7 @@ struct Emitter {
 
 	[[nodiscard]] bool UsesLds() const {
 		for (const auto& info: program.memory_info) {
-			if (info.kind == IR::ResourceKind::Lds) {
+			if (info.kind == IR::ResourceKind::Lds || (info.kind == IR::ResourceKind::Gds && !GdsMem(info))) {
 				return true;
 			}
 		}
@@ -1006,6 +1006,39 @@ struct Emitter {
 		}
 		const auto attr = *attr_value;
 		const auto chan = *chan_value;
+		if (program.stage == ShaderType::Vertex && input_info.vertex != nullptr &&
+		    attr < 27u && attr < static_cast<uint32_t>(input_info.vertex->resources_num) &&
+		    program.info.buffers.size() <= 32u) {
+			const auto& vertex = *input_info.vertex;
+			const auto& resource = vertex.resources[attr];
+			const auto format = Format::GetFormatInfo(resource.Format());
+			const auto binding = vertex.resources_dst[attr].buffer_index;
+			if (!resource.SwizzleEnabled() && binding >= 0 && binding < vertex.buffers_num &&
+			    chan < format.component_count && format.component_bits[chan] > 0 &&
+			    format.component_bits[chan] <= 32 && format.type != Format::ComponentType::Unknown) {
+				const auto slot = std::to_string(32u + attr);
+				const auto bits = format.component_bits[chan];
+				const auto offset = format.packed_bitfield ? 0u : Format::GetFormatComponentByteOffset(format, chan);
+				const auto bytes = format.packed_bitfield ? 4u : (bits + 7u) / 8u;
+				const auto id = vertex.buffers[binding].fetch_index != 0 ? "iid" : "vid";
+				const auto stride = std::to_string(vertex.buffers[binding].stride);
+				const auto pos = "(ulong(" + std::string(id) + ") * " + stride + "u + " + std::to_string(offset) + "u)";
+				const auto ptr = "((device uchar*)ab.buffers[" + slot + "])";
+				std::string raw = "(";
+				for (uint32_t b = 0; b < bytes; ++b) {
+					if (b != 0) raw += " | ";
+					raw += "(uint(" + ptr + "[" + pos + " + " + std::to_string(b) + "u]) << " + std::to_string(b * 8) + "u)";
+				}
+				raw += ")";
+				if (format.packed_bitfield && bits < 32) {
+					raw = "((" + raw + " >> " + std::to_string(format.component_bit_offset[chan]) +
+					      "u) & " + U32Literal((1u << bits) - 1u) + ")";
+				}
+				EmitAssignment(inst, "(" + pos + " + " + std::to_string(bytes) + "u <= sizes[" + slot +
+				                        "] ? " + NormalizeFormatComponent(format, chan, raw) + " : 0u)");
+				return;
+			}
+		}
 		if (program.stage != ShaderType::Pixel) {
 			Unsupported(inst, "vertex-stage attribute fetch");
 			EmitAssignment(inst, "0u");
@@ -2833,13 +2866,16 @@ inline float kyty_med3f(float a, float b, float c) {
 	// NativeBinding layout overlaps as soon as a descriptor group has more than one
 	// element (Buffers at 0..N-1 vs images starting at 1).
 	out << "struct KytyArgumentBuffer {\n";
-	if (program.bindings.descriptors.empty()) {
+	if (program.bindings.descriptors.empty() && program.stage != ShaderType::Vertex) {
 		// A struct with no members cannot be bound as an argument buffer.
 		out << "\tdevice uint *kyty_padding [[id(0)]];\n";
 	}
 	{
 		// (first id, number of ids the member occupies, declaration)
 		std::vector<std::tuple<uint32_t, uint32_t, std::string>> members;
+		if (program.stage == ShaderType::Vertex && !HasDescriptor(IR::DescriptorBindingKind::Buffers)) {
+			members.emplace_back(kMslBufferBase, 64u, "device uint *buffers [[id(0)]][64];");
+		}
 		for (const auto& binding: program.bindings.descriptors) {
 			switch (binding.kind) {
 				case IR::DescriptorBindingKind::Buffers:

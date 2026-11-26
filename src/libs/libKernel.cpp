@@ -267,7 +267,8 @@ int KYTY_SYSV_ABI KernelDlsym(KernelModule handle, const char* symbol, void** ad
 	}
 
 	if (handle == 0 && std::strcmp(symbol, "scriptingGetMem") == 0) {
-		*addr = reinterpret_cast<void*>(&KernelApplicationHeapGetMem);
+		*addr = reinterpret_cast<void*>(Loader::GuestCpu::GetHostFunctionStub(
+		    reinterpret_cast<uint64_t>(&KernelApplicationHeapGetMem), "KernelApplicationHeapGetMem"));
 		if (index < 32 || (index % 600) == 0) {
 			LOGF("\t resolved = 0x%016" PRIx64 " (application heap scriptingGetMem)\n",
 			     reinterpret_cast<uint64_t>(*addr));
@@ -1250,8 +1251,16 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		WaitForSignalDispatch(thread, signum);
 		return OK;
 #else
-		auto ctx = CreateSignalUcontext();
-		handler(signum, &ctx);
+		if (thread == PthreadSelfOrNull()) {
+			SignalDispatchScope scope;
+			auto ctx = CreateSignalUcontext();
+			SanitizeNonGuestSignalUcontext(&ctx, thread);
+			handler(signum, &ctx);
+		} else {
+			// The target dispatches the handler when it wakes from a guest wait.
+			PthreadQueuePendingSignal(thread, signum);
+			PthreadWakeForSignal(thread);
+		}
 #endif
 	}
 
@@ -3460,7 +3469,7 @@ static void AddLibkernelUnityFunc(Loader::SymbolDatabase* s, const char* nid, ui
 	sr.module_version_major = 1;
 	sr.module_version_minor = 1;
 	sr.type                 = Loader::SymbolType::Func;
-	s->Add(sr, func, dbg_name);
+	s->Add(sr, Loader::GuestCpu::GetHostFunctionStub(func, dbg_name.c_str()), dbg_name);
 }
 
 LIB_DEFINE(InitLibKernel_1) {

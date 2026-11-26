@@ -1,0 +1,7 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 1d6b5e5..d1e3591 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1165 +1165 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+-    ::Loader::Fex::KytyRecordKnownBlockSnapshot(reinterpret_cast<uintptr_t>(Bytes), Bytes, CaptureLen);
++    // The embedding host does not provide the optional snapshot recorder.

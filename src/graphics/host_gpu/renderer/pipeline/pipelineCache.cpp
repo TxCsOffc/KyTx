@@ -1025,8 +1025,18 @@ struct PipelineCache::ProgramCache {
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		{ ProfileDetailScope key_profile("cpu_program_static_key", params.hash);
-		  BuildStageStaticKey(input_info, lookup_key.static_state); }
+		{
+			ProfileDetailScope key_profile("cpu_program_static_key", params.hash);
+#if defined(__APPLE__)
+			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+				const bool pulls_vertices = stage == ShaderType::Vertex && Metal::UseNativeMetalBackend();
+				BuildStageStaticKey(input_info, lookup_key.static_state, pulls_vertices);
+			} else
+#endif
+			{
+				BuildStageStaticKey(input_info, lookup_key.static_state);
+			}
+		}
 		uint64_t profile_key = params.hash;
 		if (profile.Active()) {
 			ProfileCpuScope fingerprint(*ProfileThread().scheduler, "profile_fingerprint_cpu");

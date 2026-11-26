@@ -5133,6 +5133,16 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 			const size_t vb_bytes = static_cast<size_t>(vertex_buffers[i].stride) * vertex_buffers[i].num_records;
 			BindGuestBuffer(static_cast<uint32_t>(i), vertex_buffers[i].addr, vb_bytes, vb_bytes);
 		}
+		if (args == vs_args && stage.program && stage.program->native_msl &&
+		    stage.program->info.buffers.size() <= 32) {
+			for (int i = 0; i < vs_info.resources_num && i < 27; ++i) {
+				const auto& resource = vs_info.resources[i];
+				const auto bytes = static_cast<size_t>(resource.GetSize());
+				const auto slot = 32u + static_cast<uint32_t>(i);
+				vs_sizes[slot] = static_cast<uint32_t>(std::min<size_t>(bytes, UINT32_MAX));
+				if (bytes != 0) BindGuestBuffer(slot, resource.Base48(), bytes, bytes);
+			}
+		}
 		if (stage.resources) {
 			const auto& snap = *stage.resources;
 			for (size_t b = 0; b < snap.buffers.size() && b < 64; ++b) {

@@ -60,7 +60,7 @@ using Pthread           = PthreadPrivate*;
 using KernelCpumask     = uint64_t;
 using PthreadMutex      = PthreadMutexPrivate*;
 using PthreadMutexattr  = PthreadMutexattrPrivate*;
-using KernelSchedParam  = struct sched_param;
+struct KernelSchedParam { int sched_priority; };
 using PthreadRwlock     = PthreadRwlockPrivate*;
 using PthreadRwlockattr = PthreadRwlockattrPrivate*;
 using KernelUseconds    = unsigned int;

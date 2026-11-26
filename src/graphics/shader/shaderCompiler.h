@@ -26,7 +26,8 @@ struct ShaderParams {
 	}
 };
 
-void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<uint32_t>& key);
+void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<uint32_t>& key,
+                         bool specialize_vertex_pulling = false);
 void BuildStageStaticKey(const ShaderPixelInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<uint32_t>& key);
 
