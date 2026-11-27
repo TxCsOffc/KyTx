@@ -1,4 +1,5 @@
 #include "common/archive.h"
+#include "common/pkg/PkgUnpacker.h"
 #include <cstdlib>
 #include "common/common.h"
 #include "common/dateTime.h"
@@ -45,9 +46,15 @@ static std::string GetBuildString() {
 static void PrintUsage() {
 	::printf("KyTx PS5 Emulator [ARM64 + Metal RDNA->MSL]\n");
 	::printf("%s\n", GetBuildString().c_str());
-	::printf("kytx_emulator --game <dir|elf|zar> [options]\n\n");
+	::printf("kytx_emulator --game <dir|elf|zar> [options]\n");
+	::printf("kytx_emulator --unpack-pkg <file.pkg> [--output <dir>] [--passcode <32chars>]\n");
+	::printf("kytx_emulator --list-pkg <file.pkg> [--passcode <32chars>]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
+	::printf("  --unpack-pkg <file.pkg>              Unpack PS4/PS5 FPKG package to directory.\n");
+	::printf("  --list-pkg <file.pkg>                Inspect PS4/PS5 FPKG/PKG contents.\n");
+	::printf("  --output <dir>                       Output directory for --unpack-pkg.\n");
+	::printf("  --passcode <32chars>                 32-char FPKG passcode (default: 32 zeroes).\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1920.\n");
 	::printf("  --screen-height <num>                Window height. Default: 1080.\n");
@@ -188,7 +195,15 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 	return true;
 }
 
-static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
+struct PkgCliOptions {
+	std::filesystem::path unpack_pkg;
+	std::filesystem::path list_pkg;
+	std::filesystem::path output_dir;
+	std::string           passcode = std::string(Common::Pkg::kDefaultFpkgPasscode);
+};
+
+static bool ParseArgs(int argc, char* argv[], RunOptions& options, PkgCliOptions& pkg_options,
+                      bool& show_help) {
 	show_help = false;
 
 	for (int i = 1; i < argc; i++) {
@@ -290,6 +305,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				         value.c_str());
 				return false;
 			}
+		} else if (arg == "--unpack-pkg") {
+			pkg_options.unpack_pkg = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+		} else if (arg == "--list-pkg") {
+			pkg_options.list_pkg = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+		} else if (arg == "--output") {
+			pkg_options.output_dir = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+		} else if (arg == "--passcode") {
+			pkg_options.passcode = value;
 		} else if (arg == "--game-patch") {
 			if (!options.game_patch.empty()) {
 				::printf("--game-patch can only be specified once\n");
@@ -441,22 +464,67 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		options.config.vulkan_validation_enabled = true;
 	}
 
-	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
+	const bool has_pkg_action = !pkg_options.unpack_pkg.empty() || !pkg_options.list_pkg.empty();
+	return show_help || has_pkg_action || (!options.app0_dir.empty() && !options.elf.empty());
+}
+
+static int HandlePkgCli(const PkgCliOptions& pkg_options) {
+	if (!pkg_options.list_pkg.empty()) {
+		const auto res = Common::Pkg::InspectPkg(pkg_options.list_pkg, pkg_options.passcode);
+		if (!res.success) {
+			::fprintf(stderr, "PKG inspect failed: %s\n", res.error.c_str());
+			return 1;
+		}
+		::printf("Content-ID:     %s\n", res.info.content_id.c_str());
+		::printf("PFS encrypted:  %s\n", res.info.pfs_encrypted ? "yes" : "no");
+		::printf("PFSC compressed:%s\n", res.info.pfs_compressed ? "yes" : "no");
+		::printf("Passcode valid: %s\n", res.info.passcode_valid ? "yes" : "no");
+		::printf("Entries: %zu, PFS files: %zu\n", res.info.entries.size(),
+		         res.info.pfs_files.size());
+		for (const auto& f: res.info.pfs_files) {
+			::printf("  %s\n", f.c_str());
+		}
+		return 0;
+	}
+
+	std::filesystem::path out_dir = pkg_options.output_dir;
+	if (out_dir.empty()) {
+		const auto inspected = Common::Pkg::InspectPkg(pkg_options.unpack_pkg, pkg_options.passcode);
+		out_dir = (inspected.success && !inspected.info.content_id.empty())
+		              ? std::filesystem::path(inspected.info.content_id)
+		              : pkg_options.unpack_pkg.stem();
+	}
+	Common::Pkg::PkgUnpackOptions opts;
+	opts.passcode    = pkg_options.passcode;
+	opts.on_progress = [](std::string_view rel, uint64_t done, uint64_t total) {
+		::printf("[FPKG] %s (%llu / %llu bytes)\n", std::string(rel).c_str(),
+		         static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
+	};
+	const auto res = Common::Pkg::UnpackPkg(pkg_options.unpack_pkg, out_dir, opts);
+	if (!res.success) {
+		::fprintf(stderr, "FPKG unpack failed: %s\n", res.error.c_str());
+		return 1;
+	}
+	::printf("Unpacked %llu files (%llu bytes) -> %s\n",
+	         static_cast<unsigned long long>(res.files_extracted),
+	         static_cast<unsigned long long>(res.bytes_extracted), out_dir.string().c_str());
+	return 0;
 }
 
 static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
 
-	RunOptions options;
-	bool       show_help = false;
+	RunOptions    options;
+	PkgCliOptions pkg_options;
+	bool          show_help = false;
 
 	if (argc < 2) {
 		PrintUsage();
 		return 0;
 	}
 
-	if (!ParseArgs(argc, argv, options, show_help)) {
+	if (!ParseArgs(argc, argv, options, pkg_options, show_help)) {
 		PrintUsage();
 		return 1;
 	}
@@ -464,6 +532,10 @@ static int Main(int argc, char* argv[]) {
 	if (show_help) {
 		PrintUsage();
 		return 0;
+	}
+
+	if (!pkg_options.list_pkg.empty() || !pkg_options.unpack_pkg.empty()) {
+		return HandlePkgCli(pkg_options);
 	}
 
 	Run(options);
