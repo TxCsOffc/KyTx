@@ -622,6 +622,18 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(kytx_pkg_unpack
+	"${KYTY_SOURCE_DIR}/tools/pkgUnpackMain.cpp"
+)
+target_link_libraries(kytx_pkg_unpack common)
+target_include_directories(kytx_pkg_unpack PRIVATE ${inc_headers})
+
+add_executable(pkg_unpacker_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PkgUnpackerTests.cpp"
+)
+target_link_libraries(pkg_unpacker_tests common)
+target_include_directories(pkg_unpacker_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -676,6 +688,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
+	add_test(NAME pkg_unpacker COMMAND $<TARGET_FILE:pkg_unpacker_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
