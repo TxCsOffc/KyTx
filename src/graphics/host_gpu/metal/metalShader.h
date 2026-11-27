@@ -3,12 +3,16 @@
 
 #include "common/common.h"
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __OBJC__
@@ -74,6 +78,14 @@ public:
 	void ClearCache();
 
 private:
+	bool WaitOrBeginCompile(uint64_t hash);
+	void EndCompile(uint64_t hash);
+
+	mutable std::shared_mutex    m_cache_mutex;
+	std::mutex                   m_inflight_mutex;
+	std::condition_variable      m_inflight_cv;
+	std::unordered_set<uint64_t> m_inflight_hashes;
+
 #ifdef __OBJC__
 	std::unordered_map<uint64_t, id<MTLFunction>> m_function_cache;
 #else

@@ -8,6 +8,7 @@
 // one 64-bit slot per resource id (see BindMetalShaderResources).
 
 #include "graphics/shader/recompiler/backend/msl/MslEmitter.h"
+#include "graphics/shader/recompiler/backend/msl/MslTextBuffer.h"
 
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/shader.h"
@@ -18,14 +19,15 @@
 
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <cinttypes>
 #include <atomic>
 #include <cstdio>
 #include <iterator>
 #include <mutex>
 #include <optional>
-#include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -56,9 +58,20 @@ using IR::Value;
 using IR::ValueOpcode;
 
 std::string U32Literal(uint32_t value) {
-	char buffer[32];
-	std::snprintf(buffer, sizeof(buffer), "0x%08xu", value);
-	return buffer;
+	static constexpr char kHex[] = "0123456789abcdef";
+	std::string           result(11, '\0');
+	result[0]  = '0';
+	result[1]  = 'x';
+	result[2]  = kHex[(value >> 28u) & 0xfu];
+	result[3]  = kHex[(value >> 24u) & 0xfu];
+	result[4]  = kHex[(value >> 20u) & 0xfu];
+	result[5]  = kHex[(value >> 16u) & 0xfu];
+	result[6]  = kHex[(value >> 12u) & 0xfu];
+	result[7]  = kHex[(value >> 8u) & 0xfu];
+	result[8]  = kHex[(value >> 4u) & 0xfu];
+	result[9]  = kHex[value & 0xfu];
+	result[10] = 'u';
+	return result;
 }
 
 // Runaway-loop guard (KYTY_LOOP_CAP=<n> overrides): structured code returns once one entry into a loop has run this many
@@ -82,9 +95,7 @@ uint32_t MslDispatcherCap() {
 }
 
 std::string F32Literal(uint32_t bits) {
-	char buffer[48];
-	std::snprintf(buffer, sizeof(buffer), "as_type<float>(0x%08xu)", bits);
-	return buffer;
+	return "as_type<float>(" + U32Literal(bits) + ")";
 }
 
 const char* MslType(IR::Type type) {
@@ -140,11 +151,11 @@ struct Emitter {
 	ShaderStageInputInfo input_info;
 	std::vector<std::string> unsupported;
 
-	std::ostringstream body;
-	std::unordered_map<const Inst*, std::string> names;
-	uint32_t next_name = 0;
-	uint32_t next_phi_edge = 0;
-	uint32_t next_loop = 0; // structured loops emitted so far: each gets its own runaway guard counter
+	MslTextBuffer                             body;
+	std::unordered_map<const Inst*, uint32_t> name_ids;
+	uint32_t                                  next_name     = 0;
+	uint32_t                                  next_phi_edge = 0;
+	uint32_t                                  next_loop     = 0; // structured loops emitted so far: each gets its own runaway guard counter
 
 	// Wave64 pair lowering (see Wave64Pair in MslEmitter.h): every instruction is emitted once per emulated half of the wave, with
 	// the results of half 1 named "<name>_h"; half_ is the half being emitted.
@@ -338,18 +349,26 @@ struct Emitter {
 		}
 	}
 
+	uint32_t NameId(const Inst& inst) {
+		auto [it, inserted] = name_ids.try_emplace(&inst, next_name);
+		if (inserted) {
+			++next_name;
+		}
+		return it->second;
+	}
+
 	std::string Name(const Inst& inst) { return HalfName(inst, half_); }
 
 	std::string HalfName(const Inst& inst, uint32_t half) {
-		std::string name;
-		auto        it = names.find(&inst);
-		if (it != names.end()) {
-			name = it->second;
-		} else {
-			name = "v" + std::to_string(next_name++);
-			names.emplace(&inst, name);
+		char buf[20];
+		buf[0]         = 'v';
+		auto [ptr, ec] = std::to_chars(buf + 1, buf + sizeof(buf) - 2, NameId(inst));
+		(void)ec;
+		if (pair_ && half == 1) {
+			*ptr++ = '_';
+			*ptr++ = 'h';
 		}
-		return pair_ && half == 1 ? name + "_h" : name;
+		return std::string(buf, static_cast<size_t>(ptr - buf));
 	}
 
 	// The expression of a value as seen by one emulated half of the wave.
@@ -2692,7 +2711,90 @@ std::string Emitter::Emit() {
 		}
 	}
 	BuildImageSlots();
-	std::ostringstream out;
+	BuildInterface();
+	const bool has_out = HasOutInterface();
+	const bool has_in  = HasInInterface();
+
+	// Pre-assign SSA variable IDs in deterministic block order before generating body
+	// so preamble helper pruning runs against the completed body with identical names.
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: block->Instructions()) {
+			if (MslType(inst.GetType()) != nullptr) {
+				(void)NameId(inst);
+			}
+		}
+	}
+
+	body.Clear();
+	body.Reserve(program.blocks.size() * 256u + 1024u);
+	const auto unsupported_before_flow = unsupported.size();
+	std::vector<bool> seen(program.blocks.size(), false);
+	std::vector<std::pair<uint32_t, uint32_t>> loops;
+	const bool structured = !program.dispatcher_fallback && std::getenv("KYTY_MSL_DISPATCHER") == nullptr &&
+	    EmitStructuredRegion(0, UINT32_MAX, loops, seen);
+	if (!structured) {
+		body.Clear();
+		unsupported.resize(unsupported_before_flow);
+	}
+	if (std::getenv("KYTY_LOG_MSL_FLOW") != nullptr) {
+		std::fprintf(stderr, "[MslFlow] hash=0x%016llx blocks=%zu structured=%d\n",
+		             static_cast<unsigned long long>(program.shader_hash), program.blocks.size(), structured);
+	}
+	// A dispatcher remains available for irreducible or unsupported regions and A/B checks.
+	static const bool use_goto = false;
+	if (!structured) for (size_t index = 0; index < program.blocks.size(); ++index) {
+		const auto* block = program.blocks[index];
+		if (use_goto) {
+			body << "L" << index << ": {\n";
+			if (program.block_info[index].terminator.loop_header) {
+				// Bound runaway loops so one bad guest loop cannot wedge the whole device queue.
+				body << "\t\tif (++kyty_iterations > " << MslLoopCap() << "u) { return" << (has_out ? " out" : "") << "; }\n";
+			}
+		} else {
+			body << "\tcase " << index << ": {\n";
+		}
+		for (const auto& inst: block->Instructions()) {
+			if (inst.GetOpcode() == IR::ValueOpcode::Phi || IsResourceType(inst.GetType())) {
+				continue;
+			}
+			EmitWaveInstruction(inst);
+		}
+
+		const auto& term = program.block_info[index].terminator;
+		switch (term.kind) {
+			case CFG::TerminatorKind::Branch:
+				EmitPhiCopies(block, term.true_block);
+				if (use_goto) {
+					body << "\t\tgoto L" << BlockIndex(term.true_block) << ";\n";
+				} else {
+					body << "\t\tpc = " << BlockIndex(term.true_block) << "u; break;\n";
+				}
+				break;
+			case CFG::TerminatorKind::ConditionalBranch:
+				body << "\t\tif (" << Expr(program.block_info[index].condition) << ") {\n";
+				EmitPhiCopies(block, term.true_block);
+				if (use_goto) {
+					body << "\t\t\tgoto L" << BlockIndex(term.true_block) << ";\n\t\t} else {\n";
+					EmitPhiCopies(block, term.false_block);
+					body << "\t\t\tgoto L" << BlockIndex(term.false_block) << ";\n\t\t}\n";
+				} else {
+					body << "\t\t\tpc = " << BlockIndex(term.true_block) << "u;\n\t\t} else {\n";
+					EmitPhiCopies(block, term.false_block);
+					body << "\t\t\tpc = " << BlockIndex(term.false_block) << "u;\n\t\t}\n\t\tbreak;\n";
+				}
+				break;
+			default: body << "\t\treturn" << (has_out ? " out" : "") << ";\n"; break;
+		}
+		body << "\t}\n";
+	}
+
+	const std::string_view body_sv = body.View();
+	const auto uses_helper = [body_sv](std::string_view needle) {
+		return body_sv.find(needle) != std::string_view::npos;
+	};
+
+	MslTextBuffer out;
+	out.Reserve(body_sv.size() + 4096u);
 	out << "// generated by Kyty RDNA->MSL backend\n";
 	for (const auto& [resource, slot]: image_slots_) {
 		out << "// image_" << resource << " id=" << slot.id
@@ -2701,7 +2803,8 @@ std::string Emitter::Emit() {
 	out << "#include <metal_stdlib>\n";
 	out << "#include <simd/simd.h>\n";
 	out << "using namespace metal;\n\n";
-	if (HasDescriptor(IR::DescriptorBindingKind::BdaPagetable)) {
+	if (HasDescriptor(IR::DescriptorBindingKind::BdaPagetable) &&
+	    (uses_helper("kyty_load_guest(") || uses_helper("kyty_guest_pointer("))) {
 		out << R"(
 // Two-level native Metal page table: 16 KiB pages, 1024 entries per leaf.
 inline device const uchar* kyty_guest_pointer(device const ulong* root, ulong address) {
@@ -2732,30 +2835,37 @@ inline uint kyty_load_guest(device const ulong* root, ulong address, uint bytes)
 )";
 	}
 
-	// Wave-wide ballot lowered to the simdgroup builtin, matching the SPIR-V path's
-	// uint4 representation (low 32 lanes in .x, high lanes in .y).
-	out << "inline uint4 kyty_ballot(bool v) {\n";
-	out << "\tsimd_vote vote = simd_ballot(v);\n";
-	out << "\treturn uint4(as_type<uint2>((simd_vote::vote_t)vote), 0u, 0u);\n";
-	out << "}\n\n";
-	// Pair-packed wave64: the ballot of the two emulated halves (low 32 lanes in .x, high lanes in .y), the first set lane of it, and a
-	// read of lane `lane64` of a wave whose lanes 0..31 are `lo` and 32..63 are `hi` on this simdgroup.
-	out << "inline uint4 kyty_ballot2(bool lo, bool hi) {\n";
-	out << "\tsimd_vote a = simd_ballot(lo);\n\tsimd_vote b = simd_ballot(hi);\n";
-	out << "\treturn uint4(as_type<uint2>((simd_vote::vote_t)a).x, as_type<uint2>((simd_vote::vote_t)b).x, 0u, 0u);\n";
-	out << "}\n\n";
-	out << "inline uint kyty_first64(uint4 b) {\n";
-	out << "\treturn b.x != 0u ? ctz(b.x) : (b.y != 0u ? 32u + ctz(b.y) : 0u);\n";
-	out << "}\n\n";
-	out << "inline uint kyty_shuffle64(uint lo, uint hi, uint lane64) {\n";
-	out << "\tuint a = simd_shuffle(lo, (ushort)(lane64 & 31u));\n\tuint b = simd_shuffle(hi, (ushort)(lane64 & 31u));\n";
-	out << "\treturn (lane64 & 32u) != 0u ? b : a;\n";
-	out << "}\n\n";
-	out << "inline ushort kyty_first_lane(uint4 ballot) {\n";
-	out << "\treturn ballot.x != 0u ? (ushort)ctz(ballot.x) : (ballot.y != 0u ? (ushort)min(ctz(ballot.y) + 32u, 31u) : 0u);\n";
-	out << "}\n\n";
+	if (uses_helper("kyty_ballot(")) {
+		out << "inline uint4 kyty_ballot(bool v) {\n";
+		out << "\tsimd_vote vote = simd_ballot(v);\n";
+		out << "\treturn uint4(as_type<uint2>((simd_vote::vote_t)vote), 0u, 0u);\n";
+		out << "}\n\n";
+	}
+	if (uses_helper("kyty_ballot2(")) {
+		out << "inline uint4 kyty_ballot2(bool lo, bool hi) {\n";
+		out << "\tsimd_vote a = simd_ballot(lo);\n\tsimd_vote b = simd_ballot(hi);\n";
+		out << "\treturn uint4(as_type<uint2>((simd_vote::vote_t)a).x, as_type<uint2>((simd_vote::vote_t)b).x, 0u, 0u);\n";
+		out << "}\n\n";
+	}
+	if (uses_helper("kyty_first64(")) {
+		out << "inline uint kyty_first64(uint4 b) {\n";
+		out << "\treturn b.x != 0u ? ctz(b.x) : (b.y != 0u ? 32u + ctz(b.y) : 0u);\n";
+		out << "}\n\n";
+	}
+	if (uses_helper("kyty_shuffle64(")) {
+		out << "inline uint kyty_shuffle64(uint lo, uint hi, uint lane64) {\n";
+		out << "\tuint a = simd_shuffle(lo, (ushort)(lane64 & 31u));\n\tuint b = simd_shuffle(hi, (ushort)(lane64 & 31u));\n";
+		out << "\treturn (lane64 & 32u) != 0u ? b : a;\n";
+		out << "}\n\n";
+	}
+	if (uses_helper("kyty_first_lane(")) {
+		out << "inline ushort kyty_first_lane(uint4 ballot) {\n";
+		out << "\treturn ballot.x != 0u ? (ushort)ctz(ballot.x) : (ballot.y != 0u ? (ushort)min(ctz(ballot.y) + 32u, 31u) : 0u);\n";
+		out << "}\n\n";
+	}
 
-	out << R"(
+	if (uses_helper("kyty_class_f32(")) {
+		out << R"(
 inline bool kyty_class_f32(uint bits, uint mask) {
     uint magnitude = bits & 0x7fffffffu;
     bool negative = (bits >> 31) != 0u;
@@ -2768,9 +2878,11 @@ inline bool kyty_class_f32(uint bits, uint mask) {
     return (mask & (1u << category)) != 0u;
 }
 
-// v_cvt_pkrtz_f16_f32 rounds toward zero: a finite value past the half range becomes the largest finite half (65504), not inf. half()
-// rounds to nearest, so every HDR colour export above 65504 (16-bit exports are packed this way) turned into inf and later passes made
-// NaN of it (inf * 0). Same bit construction as the SPIR-V path (EmitF32ToF16RtzBits).
+)";
+	}
+	if (uses_helper("kyty_f16_rtz(")) {
+		out << R"(
+// v_cvt_pkrtz_f16_f32 rounds toward zero: a finite value past the half range becomes the largest finite half (65504), not inf.
 inline uint kyty_f16_rtz(float f) {
     uint bits = as_type<uint>(f);
     uint sign = (bits >> 16) & 0x8000u;
@@ -2784,48 +2896,67 @@ inline uint kyty_f16_rtz(float f) {
 }
 
 )";
-	out << R"(// RDNA semantics the generic MSL builtins do not give (mirrors the SPIR-V path: EmitFlushF32DenormToSignedZero, EmitF32ToU32, EmitFPMedTri32).
-inline float kyty_ftz(float v) {
+	}
+	if (uses_helper("kyty_ftz(")) {
+		out << R"(inline float kyty_ftz(float v) {
 	uint b = as_type<uint>(v);
 	return (b & 0x7f800000u) == 0u ? as_type<float>(b & 0x80000000u) : v;
 }
-inline uint kyty_f2u(float v) {
+)";
+	}
+	if (uses_helper("kyty_f2u(")) {
+		out << R"(inline uint kyty_f2u(float v) {
 	if (isnan(v) || v <= 0.0f) return 0u;
 	if (v >= 4294967296.0f) return 0xffffffffu;
 	return (uint)trunc(v);
 }
-inline uint kyty_f2i(float v) {
+)";
+	}
+	if (uses_helper("kyty_f2i(")) {
+		out << R"(inline uint kyty_f2i(float v) {
 	if (isnan(v)) return 0u;
 	if (v <= -2147483648.0f) return 0x80000000u;
 	if (v >= 2147483648.0f) return 0x7fffffffu;
 	return as_type<uint>((int)trunc(v));
 }
-inline float kyty_med3f(float a, float b, float c) {
+)";
+	}
+	if (uses_helper("kyty_med3f(")) {
+		out << R"(inline float kyty_med3f(float a, float b, float c) {
 	float minimum = fmin(fmin(a, b), c);
 	float median  = fmax(fmin(a, b), fmin(fmax(a, b), c));
 	return (isnan(a) || isnan(b) || isnan(c)) ? minimum : median;
 }
 )";
-	out << "inline float4 kyty_sample_cmp(float4 s, float ref) {\n";
-	out << "\treturn float4(ref <= s.x ? 1.0f : 0.0f);\n}\n\n";
-	out << "inline float4 kyty_gather_cmp(float4 g, float ref) {\n";
-	out << "\treturn float4(ref <= g.x ? 1.0f : 0.0f, ref <= g.y ? 1.0f : 0.0f, ref <= g.z ? 1.0f : 0.0f, ref <= g.w ? 1.0f : 0.0f);\n}\n\n";
-	// D16 image data: two 16-bit components per dword. `mask` is the dmask (enabled texel components in order).
-	out << "inline uint4 kyty_d16_pack(uint4 t, uint mask, bool is_float) {\n";
-	out << "\tuint v[4] = {0u, 0u, 0u, 0u};\n\tuint n = 0u;\n";
-	out << "\tfor (uint k = 0u; k < 4u; ++k) {\n";
-	out << "\t\tif (((mask >> k) & 1u) != 0u) {\n";
-	out << "\t\t\tv[n++] = is_float ? (uint)as_type<ushort>(half(as_type<float>(t[k]))) : (t[k] & 0xffffu);\n";
-	out << "\t\t}\n\t}\n";
-	out << "\treturn uint4(v[0] | (v[1] << 16), v[2] | (v[3] << 16), 0u, 0u);\n}\n\n";
-	out << "inline uint4 kyty_d16_unpack(uint4 d, uint mask, bool is_float) {\n";
-	out << "\tuint4 r = uint4(0u);\n\tuint n = 0u;\n";
-	out << "\tfor (uint k = 0u; k < 4u; ++k) {\n";
-	out << "\t\tif (((mask >> k) & 1u) != 0u) {\n";
-	out << "\t\t\tuint raw = (d[n >> 1] >> ((n & 1u) * 16u)) & 0xffffu;\n";
-	out << "\t\t\tr[k] = is_float ? as_type<uint>(float(as_type<half>((ushort)raw))) : raw;\n";
-	out << "\t\t\t++n;\n\t\t}\n\t}\n";
-	out << "\treturn r;\n}\n\n";
+	}
+	if (uses_helper("kyty_sample_cmp(")) {
+		out << "inline float4 kyty_sample_cmp(float4 s, float ref) {\n";
+		out << "\treturn float4(ref <= s.x ? 1.0f : 0.0f);\n}\n\n";
+	}
+	if (uses_helper("kyty_gather_cmp(")) {
+		out << "inline float4 kyty_gather_cmp(float4 g, float ref) {\n";
+		out << "\treturn float4(ref <= g.x ? 1.0f : 0.0f, ref <= g.y ? 1.0f : 0.0f, ref <= g.z ? 1.0f : 0.0f, ref <= g.w ? 1.0f : 0.0f);\n}\n\n";
+	}
+	if (uses_helper("kyty_d16_pack(")) {
+		// D16 image data: two 16-bit components per dword. `mask` is the dmask (enabled texel components in order).
+		out << "inline uint4 kyty_d16_pack(uint4 t, uint mask, bool is_float) {\n";
+		out << "\tuint v[4] = {0u, 0u, 0u, 0u};\n\tuint n = 0u;\n";
+		out << "\tfor (uint k = 0u; k < 4u; ++k) {\n";
+		out << "\t\tif (((mask >> k) & 1u) != 0u) {\n";
+		out << "\t\t\tv[n++] = is_float ? (uint)as_type<ushort>(half(as_type<float>(t[k]))) : (t[k] & 0xffffu);\n";
+		out << "\t\t}\n\t}\n";
+		out << "\treturn uint4(v[0] | (v[1] << 16), v[2] | (v[3] << 16), 0u, 0u);\n}\n\n";
+	}
+	if (uses_helper("kyty_d16_unpack(")) {
+		out << "inline uint4 kyty_d16_unpack(uint4 d, uint mask, bool is_float) {\n";
+		out << "\tuint4 r = uint4(0u);\n\tuint n = 0u;\n";
+		out << "\tfor (uint k = 0u; k < 4u; ++k) {\n";
+		out << "\t\tif (((mask >> k) & 1u) != 0u) {\n";
+		out << "\t\t\tuint raw = (d[n >> 1] >> ((n & 1u) * 16u)) & 0xffffu;\n";
+		out << "\t\t\tr[k] = is_float ? as_type<uint>(float(as_type<half>((ushort)raw))) : raw;\n";
+		out << "\t\t\t++n;\n\t\t}\n\t}\n";
+		out << "\treturn r;\n}\n\n";
+	}
 
 	out << "struct PushData {\n\tuint dwords[32];\n};\n\n";
 
@@ -2905,14 +3036,10 @@ inline float kyty_med3f(float a, float b, float c) {
 	}
 	out << "};\n\n";
 
-	BuildInterface();
-
 	const char* stage_qualifier = program.stage == ShaderType::Vertex    ? "vertex "
 	                              : program.stage == ShaderType::Pixel   ? "fragment "
 	                              : program.stage == ShaderType::Compute ? "kernel "
 	                                                                     : "";
-	const bool has_out = HasOutInterface();
-	const bool has_in  = HasInInterface();
 
 	if (has_out) {
 		out << "struct KytyStageOut {\n";
@@ -2989,80 +3116,16 @@ inline float kyty_med3f(float a, float b, float c) {
 		}
 	}
 
-	body.str("");
-	body.clear();
-	const auto unsupported_before_flow = unsupported.size();
-	std::vector<bool> seen(program.blocks.size(), false);
-	std::vector<std::pair<uint32_t, uint32_t>> loops;
-	const bool structured = !program.dispatcher_fallback && std::getenv("KYTY_MSL_DISPATCHER") == nullptr &&
-	    EmitStructuredRegion(0, UINT32_MAX, loops, seen);
-	if (!structured) {
-		body.str("");
-		body.clear();
-		unsupported.resize(unsupported_before_flow);
-	}
-	if (std::getenv("KYTY_LOG_MSL_FLOW") != nullptr) {
-		std::fprintf(stderr, "[MslFlow] hash=0x%016llx blocks=%zu structured=%d\n",
-		             static_cast<unsigned long long>(program.shader_hash), program.blocks.size(), structured);
-	}
-	// A dispatcher remains available for irreducible or unsupported regions and A/B checks.
-	static const bool use_goto = false;
-	if (!structured) for (size_t index = 0; index < program.blocks.size(); ++index) {
-		const auto* block = program.blocks[index];
-		if (use_goto) {
-			body << "L" << index << ": {\n";
-			if (program.block_info[index].terminator.loop_header) {
-				// Bound runaway loops so one bad guest loop cannot wedge the whole device queue.
-				body << "\t\tif (++kyty_iterations > " << MslLoopCap() << "u) { return" << (has_out ? " out" : "") << "; }\n";
-			}
-		} else {
-			body << "\tcase " << index << ": {\n";
-		}
-		for (const auto& inst: block->Instructions()) {
-			if (inst.GetOpcode() == IR::ValueOpcode::Phi || IsResourceType(inst.GetType())) {
-				continue;
-			}
-			EmitWaveInstruction(inst);
-		}
-
-		const auto& term = program.block_info[index].terminator;
-		switch (term.kind) {
-			case CFG::TerminatorKind::Branch:
-				EmitPhiCopies(block, term.true_block);
-				if (use_goto) {
-					body << "\t\tgoto L" << BlockIndex(term.true_block) << ";\n";
-				} else {
-					body << "\t\tpc = " << BlockIndex(term.true_block) << "u; break;\n";
-				}
-				break;
-			case CFG::TerminatorKind::ConditionalBranch:
-				body << "\t\tif (" << Expr(program.block_info[index].condition) << ") {\n";
-				EmitPhiCopies(block, term.true_block);
-				if (use_goto) {
-					body << "\t\t\tgoto L" << BlockIndex(term.true_block) << ";\n\t\t} else {\n";
-					EmitPhiCopies(block, term.false_block);
-					body << "\t\t\tgoto L" << BlockIndex(term.false_block) << ";\n\t\t}\n";
-				} else {
-					body << "\t\t\tpc = " << BlockIndex(term.true_block) << "u;\n\t\t} else {\n";
-					EmitPhiCopies(block, term.false_block);
-					body << "\t\t\tpc = " << BlockIndex(term.false_block) << "u;\n\t\t}\n\t\tbreak;\n";
-				}
-				break;
-			default: body << "\t\treturn" << (has_out ? " out" : "") << ";\n"; break;
-		}
-		body << "\t}\n";
-	}
-
 	// Apple GPUs kill the queue when a shader stops making progress. Bound the
 	// dispatcher iterations per invocation so a mistranslated guest loop cannot wedge
 	// the whole device (mirrors KYTY_LOOP_CAP in the SPIR-V backend).
 	if (structured) {
 		out << "\tuint kyty_iterations = 0u;\n";
-		out << body.str();
+		out.Append(body_sv);
 		out << "}\n";
 	} else if (use_goto) {
 		out << "\tuint kyty_iterations = 0u;\n";
-		out << body.str();
+		out.Append(body_sv);
 		out << "\treturn" << (has_out ? " out" : "") << ";\n";
 		out << "}\n";
 	} else {
@@ -3072,7 +3135,7 @@ inline float kyty_med3f(float a, float b, float c) {
 	out << "\t\tif (++kyty_iterations > " << MslDispatcherCap() << "u) { return" << (has_out ? " out" : "")
 	    << "; }\n";
 	out << "\t\tswitch (pc) {\n";
-	out << body.str();
+	out.Append(body_sv);
 	out << "\t\tdefault: return" << (has_out ? " out" : "") << ";\n";
 	out << "\t\t}\n\t}\n";
 	out << "}\n";
@@ -3140,11 +3203,7 @@ inline float kyty_med3f(float a, float b, float c) {
 		out << "\treturn kyty_vs_impl(ab, pc_data, sizes, vid, iid);\n}\n";
 	}
 
-	EmitResult result;
-	result.source      = out.str();
-	result.unsupported = unsupported;
-	result.success     = unsupported.empty();
-	return result.source;
+	return out.Take();
 }
 
 } // namespace

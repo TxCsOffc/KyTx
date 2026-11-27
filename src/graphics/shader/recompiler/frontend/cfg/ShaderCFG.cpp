@@ -1570,7 +1570,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 			if (next_pc <= end_pc) {
 				labels.insert(next_pc);
 			}
-		} else if (inst.opcode == Opcode::S_ENDPGM) {
+		} else if (Decoder::IsProgramEnd(inst.opcode)) {
 			labels.insert(next_pc);
 		}
 	}
@@ -1618,7 +1618,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 		const auto& last    = program.instructions[block.inst_end - 1u];
 		const auto  next_pc = InstructionEndPc(last);
-		if (last.opcode == Opcode::S_ENDPGM) {
+		if (Decoder::IsProgramEnd(last.opcode)) {
 			block.terminator.kind = TerminatorKind::Return;
 		} else if (last.opcode == Opcode::S_SETPC_B64) {
 			const auto& target_info = setpc_targets.at(last.pc);

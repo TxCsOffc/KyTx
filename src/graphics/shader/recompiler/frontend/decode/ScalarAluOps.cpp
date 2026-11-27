@@ -28,7 +28,8 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x24u, Opcode::S_BFM_B32},
     {0x25u, Opcode::S_BFM_B64},         {0x26u, Opcode::S_MUL_I32},
     {0x27u, Opcode::S_BFE_U32},         {0x28u, Opcode::S_BFE_I32},
-    {0x29u, Opcode::S_BFE_U64},         {0x2cu, Opcode::S_ABSDIFF_I32},
+    {0x29u, Opcode::S_BFE_U64},         {0x2au, Opcode::S_BFE_I64},
+    {0x2cu, Opcode::S_ABSDIFF_I32},
     {0x2eu, Opcode::S_LSHL1_ADD_U32},
     {0x2fu, Opcode::S_LSHL2_ADD_U32},   {0x30u, Opcode::S_LSHL3_ADD_U32},
     {0x31u, Opcode::S_LSHL4_ADD_U32},   {0x32u, Opcode::S_PACK_LL_B32_B16},
@@ -40,6 +41,7 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
 constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x03u, Opcode::S_MOV_B32},
     {0x04u, Opcode::S_MOV_B64},
+    {0x05u, Opcode::S_CMOV_B32},
     {0x06u, Opcode::S_CMOV_B64},
     {0x07u, Opcode::S_NOT_B32},
     {0x08u, Opcode::S_NOT_B64},
@@ -47,27 +49,61 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x0au, Opcode::S_WQM_B64},
     {0x0bu, Opcode::S_BREV_B32},
     {0x0cu, Opcode::S_BREV_B64},
+    {0x0du, Opcode::S_BCNT0_I32_B32},
+    {0x0eu, Opcode::S_BCNT0_I32_B64},
     {0x0fu, Opcode::S_BCNT1_I32_B32},
     {0x10u, Opcode::S_BCNT1_I32_B64},
+    {0x11u, Opcode::S_FF0_I32_B32},
+    {0x12u, Opcode::S_FF0_I32_B64},
     {0x13u, Opcode::S_FF1_I32_B32},
     {0x14u, Opcode::S_FF1_I32_B64},
     {0x15u, Opcode::S_FLBIT_I32_B32},
     {0x16u, Opcode::S_FLBIT_I32_B64},
+    {0x17u, Opcode::S_FLBIT_I32},
+    {0x18u, Opcode::S_FLBIT_I32_I64},
+    {0x19u, Opcode::S_SEXT_I32_I8},
+    {0x1au, Opcode::S_SEXT_I32_I16},
     {0x1bu, Opcode::S_BITSET0_B32},
     {0x1cu, Opcode::S_BITSET0_B64},
     {0x1du, Opcode::S_BITSET1_B32},
     {0x1eu, Opcode::S_BITSET1_B64},
     {0x1fu, Opcode::S_GETPC_B64},
     {0x20u, Opcode::S_SETPC_B64},
+    {0x21u, Opcode::S_SWAPPC_B64},
+    {0x22u, Opcode::S_RFE_B64},
     {0x24u, Opcode::S_AND_SAVEEXEC_B64},
+    {0x25u, Opcode::S_OR_SAVEEXEC_B64},
+    {0x26u, Opcode::S_XOR_SAVEEXEC_B64},
+    {0x27u, Opcode::S_ANDN2_SAVEEXEC_B64},
     {0x28u, Opcode::S_ORN2_SAVEEXEC_B64},
+    {0x29u, Opcode::S_NAND_SAVEEXEC_B64},
+    {0x2au, Opcode::S_NOR_SAVEEXEC_B64},
+    {0x2bu, Opcode::S_XNOR_SAVEEXEC_B64},
+    {0x2cu, Opcode::S_QUADMASK_B32},
     {0x2du, Opcode::S_QUADMASK_B64},
+    {0x2eu, Opcode::S_MOVRELS_B32},
+    {0x2fu, Opcode::S_MOVRELS_B64},
+    {0x30u, Opcode::S_MOVRELD_B32},
+    {0x31u, Opcode::S_MOVRELD_B64},
     {0x34u, Opcode::S_ABS_I32},
     {0x37u, Opcode::S_ANDN1_SAVEEXEC_B64},
+    {0x38u, Opcode::S_ORN1_SAVEEXEC_B64},
+    {0x39u, Opcode::S_ANDN1_WREXEC_B64},
+    {0x3au, Opcode::S_ANDN2_WREXEC_B64},
     {0x3bu, Opcode::S_BITREPLICATE_B64_B32},
     {0x3cu, Opcode::S_AND_SAVEEXEC_B32},
+    {0x3du, Opcode::S_OR_SAVEEXEC_B32},
+    {0x3eu, Opcode::S_XOR_SAVEEXEC_B32},
+    {0x3fu, Opcode::S_ANDN2_SAVEEXEC_B32},
     {0x40u, Opcode::S_ORN2_SAVEEXEC_B32},
+    {0x41u, Opcode::S_NAND_SAVEEXEC_B32},
+    {0x42u, Opcode::S_NOR_SAVEEXEC_B32},
+    {0x43u, Opcode::S_XNOR_SAVEEXEC_B32},
     {0x44u, Opcode::S_ANDN1_SAVEEXEC_B32},
+    {0x45u, Opcode::S_ORN1_SAVEEXEC_B32},
+    {0x46u, Opcode::S_ANDN1_WREXEC_B32},
+    {0x47u, Opcode::S_ANDN2_WREXEC_B32},
+    {0x49u, Opcode::S_MOVRELSD_2_B32},
 };
 
 constexpr OpcodeMap SOPC_OPCODE_LIST[] = {
@@ -81,12 +117,14 @@ constexpr OpcodeMap SOPC_OPCODE_LIST[] = {
 };
 
 constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
-    {0x00u, Opcode::S_MOVK_I32},   {0x03u, Opcode::S_CMP_EQ_I32}, {0x04u, Opcode::S_CMP_LG_I32},
+    {0x00u, Opcode::S_MOVK_I32},   {0x01u, Opcode::S_VERSION},    {0x02u, Opcode::S_CMOVK_I32},
+    {0x03u, Opcode::S_CMP_EQ_I32}, {0x04u, Opcode::S_CMP_LG_I32},
     {0x05u, Opcode::S_CMP_GT_I32}, {0x06u, Opcode::S_CMP_GE_I32}, {0x07u, Opcode::S_CMP_LT_I32},
     {0x08u, Opcode::S_CMP_LE_I32}, {0x09u, Opcode::S_CMP_EQ_U32}, {0x0au, Opcode::S_CMP_LG_U32},
     {0x0bu, Opcode::S_CMP_GT_U32}, {0x0cu, Opcode::S_CMP_GE_U32}, {0x0du, Opcode::S_CMP_LT_U32},
     {0x0eu, Opcode::S_CMP_LE_U32}, {0x0fu, Opcode::S_ADD_I32},    {0x10u, Opcode::S_MULK_I32},
-    {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT},    {0x18u, Opcode::S_WAITCNT},
+    {0x12u, Opcode::S_GETREG_B32}, {0x13u, Opcode::S_SETREG_B32}, {0x15u, Opcode::S_SETREG_IMM32_B32},
+    {0x16u, Opcode::S_CALL_B64},   {0x17u, Opcode::S_WAITCNT},    {0x18u, Opcode::S_WAITCNT},
     {0x19u, Opcode::S_WAITCNT},    {0x1au, Opcode::S_WAITCNT},
     {0x1bu, Opcode::S_SUBVECTOR_LOOP_BEGIN}, {0x1cu, Opcode::S_SUBVECTOR_LOOP_END},
 };
@@ -95,6 +133,7 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x00u, Opcode::S_NOP},
     {0x01u, Opcode::S_ENDPGM},
     {0x02u, Opcode::S_BRANCH},
+    {0x03u, Opcode::S_WAKEUP},
     {0x04u, Opcode::S_CBRANCH_SCC0},
     {0x05u, Opcode::S_CBRANCH_SCC1},
     {0x06u, Opcode::S_CBRANCH_VCCZ},
@@ -102,16 +141,32 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x08u, Opcode::S_CBRANCH_EXECZ},
     {0x09u, Opcode::S_CBRANCH_EXECNZ},
     {0x0au, Opcode::S_BARRIER},
+    {0x0bu, Opcode::S_ENDPGM},
     {0x0cu, Opcode::S_WAITCNT},
+    {0x0du, Opcode::S_SETHALT},
     {0x0eu, Opcode::S_SLEEP},
     {0x0fu, Opcode::S_SETPRIO},
     {0x10u, Opcode::S_SENDMSG},
+    {0x11u, Opcode::S_SENDMSGHALT},
     {0x12u, Opcode::S_TRAP},
+    {0x13u, Opcode::S_ICACHE_INV},
+    {0x14u, Opcode::S_INCPERFLEVEL},
+    {0x15u, Opcode::S_DECPERFLEVEL},
     {0x16u, Opcode::S_TTRACEDATA},
     {0x17u, Opcode::S_CBRANCH_CDBGSYS},
+    {0x18u, Opcode::S_CBRANCH_CDBG},
     {0x19u, Opcode::S_CBRANCH_CDBGSYS_OR_USER},
+    {0x1au, Opcode::S_CBRANCH_CDBG},
+    {0x1bu, Opcode::S_ENDPGM},
+    {0x1eu, Opcode::S_ENDPGM},
+    {0x1fu, Opcode::S_CODE_END},
     {0x20u, Opcode::S_INST_PREFETCH},
+    {0x21u, Opcode::S_CLAUSE},
+    {0x22u, Opcode::S_WAIT_IDLE},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
+    {0x24u, Opcode::S_ROUND_MODE},
+    {0x25u, Opcode::S_DENORM_MODE},
+    {0x28u, Opcode::S_TTRACEDATA},
 };
 
 constexpr auto SOP1_OPS = Detail::MakeOpcodeTable<0x100>(SOP1_OPCODE_LIST);
@@ -220,10 +275,28 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	switch (inst.opcode) {
-		case Opcode::S_MOVK_I32: DecodeScalarDestination(sdst, pc, inst.dst); return;
+		case Opcode::S_VERSION:
+			inst.dst.kind  = OperandKind::Null;
+			inst.src_count = 0;
+			return;
+		case Opcode::S_SETREG_IMM32_B32:
+			inst.dst.kind  = OperandKind::Null;
+			inst.src1      = inst.src0;
+			DecodeScalarSource(0xffu, pc, inst.src0);
+			inst.src_count = 2;
+			ReadLiteralOperands(code, word_index, inst);
+			return;
+		case Opcode::S_MOVK_I32:
+		case Opcode::S_CMOVK_I32:
+			DecodeScalarDestination(sdst, pc, inst.dst);
+			return;
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:
+		case Opcode::S_CALL_B64:
 			DecodeScalarDestination(sdst, pc, inst.dst);
+			if (inst.opcode == Opcode::S_CALL_B64) {
+				inst.data_dwords = 2u;
+			}
 			inst.branch_target = pc + 4u + static_cast<uint32_t>(imm * 4);
 			return;
 		case Opcode::S_WAITCNT: {
@@ -234,6 +307,10 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			inst.src_count         = 1;
 			return;
 		}
+		case Opcode::S_GETREG_B32:
+			DecodeScalarDestination(sdst, pc, inst.dst);
+			inst.src0.value = word & 0xffffu;
+			return;
 		case Opcode::S_SETREG_B32:
 			inst.dst.kind        = OperandKind::Null;
 			inst.src1.kind       = OperandKind::LiteralConstant;
@@ -295,10 +372,15 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                           ? static_cast<int32_t>(inst.src0.value)
 	                           : static_cast<int32_t>(static_cast<int16_t>(simm));
 	inst.src_count = (inst.opcode == Opcode::S_NOP || inst.opcode == Opcode::S_WAITCNT ||
-	                  inst.opcode == Opcode::S_WAITCNT_DEPCTR || inst.opcode == Opcode::S_SLEEP ||
-	                  inst.opcode == Opcode::S_SETPRIO ||
-	                  inst.opcode == Opcode::S_SENDMSG || inst.opcode == Opcode::S_TRAP ||
-	                  inst.opcode == Opcode::S_TTRACEDATA || inst.opcode == Opcode::S_INST_PREFETCH)
+	                  inst.opcode == Opcode::S_WAITCNT_DEPCTR || inst.opcode == Opcode::S_WAIT_IDLE ||
+	                  inst.opcode == Opcode::S_SLEEP || inst.opcode == Opcode::S_SETPRIO ||
+	                  inst.opcode == Opcode::S_SENDMSG || inst.opcode == Opcode::S_SENDMSGHALT ||
+	                  inst.opcode == Opcode::S_TRAP || inst.opcode == Opcode::S_TTRACEDATA ||
+	                  inst.opcode == Opcode::S_INST_PREFETCH || inst.opcode == Opcode::S_CLAUSE ||
+	                  inst.opcode == Opcode::S_CBRANCH_CDBG || inst.opcode == Opcode::S_ICACHE_INV ||
+	                  inst.opcode == Opcode::S_INCPERFLEVEL || inst.opcode == Opcode::S_DECPERFLEVEL ||
+	                  inst.opcode == Opcode::S_ROUND_MODE || inst.opcode == Opcode::S_DENORM_MODE ||
+	                  inst.opcode == Opcode::S_SETHALT)
 	                     ? 1
 	                     : 0;
 	const auto branch_offset = static_cast<int32_t>(static_cast<int16_t>(simm)) * 4;

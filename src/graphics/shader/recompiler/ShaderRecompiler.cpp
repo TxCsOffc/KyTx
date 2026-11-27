@@ -13,6 +13,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/FastIrOptimizer.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -627,11 +628,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return result;
 }
 
-CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
-                             const IR::ResourceSpecialization& specialization,
-                             uint32_t                          push_data_start_dword) {
-	const auto emit_begin = std::chrono::steady_clock::now();
-	auto&      ir         = translated.program;
+FinalizedProgram FinalizeProgramForBackend(TranslateResult                   translated,
+                                           const CompileOptions&             options,
+                                           const IR::ResourceSpecialization& specialization,
+                                           uint32_t                          push_data_start_dword) {
+	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
@@ -665,6 +666,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	}
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir.blocks);
+	(void)IR::OptimizeFast(ir);
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
@@ -677,6 +679,18 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		}
 	}
 
+	FinalizedProgram finalized;
+	finalized.program = std::move(ir);
+	if (options.dump_ir) {
+		finalized.decoded_dump = std::move(translated.decoded_dump);
+		finalized.ir_dump      = std::move(ir_dump);
+	}
+	return finalized;
+}
+
+std::vector<uint32_t> EmitSpirvForFinalizedProgram(const IR::Program&    ir,
+                                                   const CompileOptions& options) {
+	const auto emit_begin = std::chrono::steady_clock::now();
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info);
@@ -708,13 +722,20 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			     GetDumpLabel(options), diagnostics.c_str());
 		}
 	}
+	return spirv;
+}
+
+CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
+                             const IR::ResourceSpecialization& specialization,
+                             uint32_t                          push_data_start_dword) {
+	auto finalized = FinalizeProgramForBackend(std::move(translated), options, specialization,
+	                                           push_data_start_dword);
+	auto spirv     = EmitSpirvForFinalizedProgram(finalized.program, options);
 	CompileResult result;
-	result.spirv   = std::move(spirv);
-	result.program = std::move(ir);
-	if (options.dump_ir) {
-		result.decoded_dump = std::move(translated.decoded_dump);
-		result.ir_dump      = std::move(ir_dump);
-	}
+	result.spirv        = std::move(spirv);
+	result.program      = std::move(finalized.program);
+	result.decoded_dump = std::move(finalized.decoded_dump);
+	result.ir_dump      = std::move(finalized.ir_dump);
 	return result;
 }
 

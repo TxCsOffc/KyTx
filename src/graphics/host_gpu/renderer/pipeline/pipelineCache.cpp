@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/metal/MetalBackend.h"
 #include "graphics/shader/recompiler/backend/msl/MslEmitter.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -791,8 +792,8 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
+		auto finalized = ShaderRecompiler::FinalizeProgramForBackend(
+		    std::move(translated), options, specialization, push_data_start_dword);
 
 		// KYTY_MSL_DIRECT=<0|1|2>: exercise the direct RDNA->MSL emitter alongside the
 		// existing SPIR-V path. 1 = log coverage, 2 = also dump the generated source.
@@ -801,7 +802,7 @@ struct PipelineCache::ProgramCache {
 			return value != nullptr ? std::atoi(value) : 0;
 		}();
 		if (s_msl_direct > 0) {
-			auto msl = ShaderRecompiler::Msl::EmitProgram(result.program, options.input_info);
+			auto msl = ShaderRecompiler::Msl::EmitProgram(finalized.program, options.input_info);
 			LOGF("[MSL] hash=0x%016" PRIx64 " stage=%u success=%d unsupported=%zu\n",
 			     options.shader_hash, static_cast<uint32_t>(options.stage),
 			     msl.success ? 1 : 0, msl.unsupported.size());
@@ -831,25 +832,21 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
-			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
-			     options.shader_hash);
-		}
-		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-
 #if defined(__APPLE__)
 		if (Metal::UseNativeMetalBackend()) {
 			const uint64_t metal_hash = options.shader_hash ^ MetalFunctionVariant(options);
+			const auto& metal_backend = ShaderRecompiler::MetalBackend::GetMetalShaderBackend(
+			    ShaderRecompiler::MetalBackend::SelectedMetalBackendKind());
+			const ShaderRecompiler::MetalBackend::MetalEmitOptions metal_emit_options {
+			    .input_info = options.input_info,
+			};
 			// KYTY_MSL_BACKEND=1 compiles the direct RDNA->MSL translation. Shaders
 			// the MSL backend cannot express fall back to the SPIR-V path below.
 			static const bool s_msl_backend = [] {
 				const char* value = std::getenv("KYTY_MSL_BACKEND");
 				return value != nullptr && value[0] == '1';
 			}();
-			// Compute kernels stay on the SPIR-V path by default: the MSL dispatcher
-			// can place threadgroup barriers inside divergent state-machine cases,
-			// which deadlocks the GPU (progress timeout). Opt in with KYTY_MSL_COMPUTE=1.
+			// Compute kernels stay on the SPIR-V path by default unless opted in.
 			static const bool s_msl_compute = [] {
 				const char* value = std::getenv("KYTY_MSL_COMPUTE");
 				return value != nullptr && value[0] == '1';
@@ -857,16 +854,15 @@ struct PipelineCache::ProgramCache {
 			const bool msl_stage_allowed =
 			    options.stage != ShaderType::Compute || s_msl_compute;
 			// KYTY_MSL_ONLY=1: the direct RDNA->MSL emitter is the only Metal path. No SPIR-V
-			// compile happens here. A shader it cannot translate is logged once and registered
-			// without a Metal function, so draws that use it are skipped (see draw paths).
+			// compile or emission happens here.
 			static const bool s_msl_only = [] {
 				const char* value = std::getenv("KYTY_MSL_ONLY");
 				return value != nullptr && value[0] == '1';
 			}();
 			if (s_msl_only) {
-				auto msl = ShaderRecompiler::Msl::EmitProgram(result.program, options.input_info);
+				auto msl = metal_backend.Emit(finalized.program, metal_emit_options);
 				uint64_t msl_hash = Metal::NativeMslFunctionKey(
-				    metal_hash, static_cast<uint32_t>(options.stage), msl.source, msl.success);
+				    metal_hash, static_cast<uint32_t>(options.stage), msl.msl_source, msl.success);
 				// KYTY_MSL_OVERRIDE_FILE=<path> KYTY_MSL_OVERRIDE_HASH=<hash>: compile the given MSL file
 				// instead of the emitted source for that one shader (diagnostic probes only).
 				if (const char* ov_file = std::getenv("KYTY_MSL_OVERRIDE_FILE")) {
@@ -879,7 +875,7 @@ struct PipelineCache::ProgramCache {
 							size_t n = 0;
 							while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
 							std::fclose(f);
-							msl.source = std::move(text);
+							msl.msl_source = std::move(text);
 							msl.success = true;
 							std::fprintf(stderr, "[MSL] override hash=0x%016llx from %s\n",
 							           static_cast<unsigned long long>(msl_hash), ov_file);
@@ -905,7 +901,7 @@ struct PipelineCache::ProgramCache {
 				// Include every baked resource format/stride and static state, not only fragment exports.
 				// Recompute after diagnostics so a failed/overridden permutation cannot reuse another function.
 				msl_hash = Metal::NativeMslFunctionKey(
-				    metal_hash, static_cast<uint32_t>(options.stage), msl.source, msl.success);
+				    metal_hash, static_cast<uint32_t>(options.stage), msl.msl_source, msl.success);
 				if (std::getenv("KYTY_MSL_DUMP_BY_HASH") != nullptr) {
 					std::fprintf(stderr, "[MSL] variant 0x%016llx from shader 0x%016llx\n",
 					             static_cast<unsigned long long>(msl_hash), static_cast<unsigned long long>(options.shader_hash));
@@ -914,18 +910,18 @@ struct PipelineCache::ProgramCache {
 						std::error_code dump_ec;
 						std::filesystem::create_directories(dump_path.parent_path(), dump_ec);
 						if (FILE* dump_file = std::fopen(dump_path.c_str(), "w"); dump_file != nullptr) {
-							std::fwrite(msl.source.data(), 1, msl.source.size(), dump_file);
+							std::fwrite(msl.msl_source.data(), 1, msl.msl_source.size(), dump_file);
 							std::fclose(dump_file);
 						}
 					}
 				}
 				if (msl.success) {
 					auto compiled = Metal::MetalShaderManager::Instance().CompileMslToFunction(
-					    msl.source, "main0", static_cast<uint32_t>(options.stage), msl_hash);
+					    msl.msl_source, "main0", static_cast<uint32_t>(options.stage), msl_hash);
 					if (compiled.success) {
 						MslCoverageCount(true, options.stage);
 						const auto id = ++next_shader_id;
-						auto info = std::move(result.program).TakeCompiledInfo();
+						auto info = std::move(finalized.program).TakeCompiledInfo();
 						info.shader_hash = msl_hash;
 						info.native_msl  = true;
 						return {
@@ -940,7 +936,7 @@ struct PipelineCache::ProgramCache {
 				}
 				MslCoverageCount(false, options.stage);
 				const auto id = ++next_shader_id;
-				auto info = std::move(result.program).TakeCompiledInfo();
+				auto info = std::move(finalized.program).TakeCompiledInfo();
 				info.shader_hash = msl_hash;
 				info.native_msl  = true;
 				return {
@@ -950,15 +946,15 @@ struct PipelineCache::ProgramCache {
 				};
 			}
 			if (s_msl_backend && msl_stage_allowed) {
-				auto msl = ShaderRecompiler::Msl::EmitProgram(result.program, options.input_info);
+				auto msl = metal_backend.Emit(finalized.program, metal_emit_options);
 				if (msl.success) {
 					const uint64_t msl_hash = Metal::NativeMslFunctionKey(
-					    metal_hash, static_cast<uint32_t>(options.stage), msl.source);
+					    metal_hash, static_cast<uint32_t>(options.stage), msl.msl_source);
 					auto compiled = Metal::MetalShaderManager::Instance().CompileMslToFunction(
-					    msl.source, "main0", static_cast<uint32_t>(options.stage), msl_hash);
+					    msl.msl_source, "main0", static_cast<uint32_t>(options.stage), msl_hash);
 					if (compiled.success) {
 						const auto id = ++next_shader_id;
-						auto info = std::move(result.program).TakeCompiledInfo();
+						auto info = std::move(finalized.program).TakeCompiledInfo();
 						// Draws look the Metal function up by this hash; it must be the
 						// variant hash, not the raw shader hash.
 						info.shader_hash = msl_hash;
@@ -973,11 +969,18 @@ struct PipelineCache::ProgramCache {
 				LOGF("[MSL] backend fallback for hash=0x%016" PRIx64 " unsupported=%zu\n",
 				     options.shader_hash, msl.unsupported.size());
 			}
-			const auto spvc_abi = Metal::ComputeSpvcAbiLayout(result.program.bindings, options.stage);
+			auto spirv = ShaderRecompiler::EmitSpirvForFinalizedProgram(finalized.program, options);
+			if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, spirv)) {
+				DumpShaderSpirv(stage_name, options.shader_hash, spirv);
+				EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
+				     options.shader_hash);
+			}
+			DumpShaderSpirv(stage_name, options.shader_hash, spirv);
+			const auto spvc_abi = Metal::ComputeSpvcAbiLayout(finalized.program.bindings, options.stage);
 			Metal::MetalShaderManager::Instance().CompileSpirvToFunction(
-			    result.spirv, "main0", static_cast<uint32_t>(options.stage), metal_hash, &spvc_abi);
+			    spirv, "main0", static_cast<uint32_t>(options.stage), metal_hash, &spvc_abi);
 			const auto id = ++next_shader_id;
-			auto info = std::move(result.program).TakeCompiledInfo();
+			auto info = std::move(finalized.program).TakeCompiledInfo();
 			info.shader_hash = metal_hash;
 			return {
 			    .specialization = std::move(specialization),
@@ -987,8 +990,16 @@ struct PipelineCache::ProgramCache {
 		}
 #endif
 
+		auto spirv = ShaderRecompiler::EmitSpirvForFinalizedProgram(finalized.program, options);
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, spirv)) {
+			DumpShaderSpirv(stage_name, options.shader_hash, spirv);
+			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
+			     options.shader_hash);
+		}
+		DumpShaderSpirv(stage_name, options.shader_hash, spirv);
+
 		const auto before_module = VramEventsEnabled() ? ReadMemorySnapshot(graphics) : MemorySnapshot {};
-		const auto module = CompileSPV(result.spirv, device);
+		const auto module = CompileSPV(spirv, device);
 		const auto id     = ++next_shader_id;
 		if (VramEventsEnabled()) {
 			LogVramEvent("shader_module", id, before_module, ReadMemorySnapshot(graphics),
@@ -997,11 +1008,11 @@ struct PipelineCache::ProgramCache {
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
-			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+			     static_cast<uint64_t>(spirv.size()), options.wave_size);
 		}
 		return {
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program        = std::move(finalized.program).TakeCompiledInfo(),
 		    .handle         = {.id = id, .module = module},
 		};
 	}

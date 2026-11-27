@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/metal/metalEnv.h"
 #include "graphics/host_gpu/metal/metalShader.h"
 #include "graphics/host_gpu/metal/metalShaderAbi.h"
+#include "graphics/host_gpu/metal/metalShaderCache.h"
 #include "graphics/host_gpu/metal/metalContext.h"
 #include "common/logging/log.h"
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <sstream>
 #include <regex>
+#include <xxhash.h>
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -23,19 +25,27 @@ namespace Libs::Graphics::Metal {
 
 uint64_t NativeMslFunctionKey(uint64_t shader_hash, uint32_t stage,
                             std::string_view source, bool emitted) {
-	uint64_t hash = 14695981039346656037ull;
-	const auto mix = [&](uint8_t byte) { hash = (hash ^ byte) * 1099511628211ull; };
-	for (unsigned shift = 0; shift < 64; shift += 8) mix(uint8_t(shader_hash >> shift));
-	for (unsigned shift = 0; shift < 32; shift += 8) mix(uint8_t(stage >> shift));
-	mix(emitted ? 1 : 0);
-	for (unsigned char byte: source) mix(byte);
+	struct KeyHeader {
+		uint64_t shader_hash;
+		uint32_t stage;
+		uint8_t  emitted;
+	} header {shader_hash, stage, static_cast<uint8_t>(emitted ? 1u : 0u)};
+	const uint64_t seed = XXH3_64bits(&header, sizeof(header));
+	const uint64_t hash = XXH3_64bits_withSeed(source.data(), source.size(), seed);
 	return hash != 0 ? hash : 1; // Zero is reserved for an absent shader in the draw paths.
 }
 
 // Hashes whose MSL declares the descriptor argument buffer at buffer 0 (see ShaderHasArgumentBuffer0).
+static std::shared_mutex           s_arg_buffer0_mutex;
 static std::unordered_set<uint64_t> s_arg_buffer0_hashes;
-static void RecordArgBuffer0(uint64_t hash) { s_arg_buffer0_hashes.insert(hash); }
-bool ShaderHasArgumentBuffer0(uint64_t hash) { return s_arg_buffer0_hashes.count(hash) != 0; }
+static void RecordArgBuffer0(uint64_t hash) {
+	std::unique_lock lock(s_arg_buffer0_mutex);
+	s_arg_buffer0_hashes.insert(hash);
+}
+bool ShaderHasArgumentBuffer0(uint64_t hash) {
+	std::shared_lock lock(s_arg_buffer0_mutex);
+	return s_arg_buffer0_hashes.count(hash) != 0;
+}
 
 // KYTY_PS_PROBE=alpha1|uv|tex|cb: diagnostic rewrite of fragment entry returns.
 // Overwrites the [[color(0)]] output with a known value before each `return out;`.
@@ -438,8 +448,8 @@ static std::string SanitizeMslSource(std::string_view msl) {
 }
 
 MetalShaderManager& MetalShaderManager::Instance() {
-	static MetalShaderManager instance;
-	return instance;
+	static auto* instance = new MetalShaderManager();
+	return *instance;
 }
 
 MetalShaderManager::MetalShaderManager() = default;
@@ -447,25 +457,51 @@ MetalShaderManager::~MetalShaderManager() {
 	ClearCache();
 }
 
+bool MetalShaderManager::WaitOrBeginCompile(uint64_t hash) {
+	std::unique_lock lock(m_inflight_mutex);
+	while (m_inflight_hashes.count(hash) != 0) {
+		m_inflight_cv.wait(lock);
+		std::shared_lock cache_lock(m_cache_mutex);
+		if (m_function_cache.find(hash) != m_function_cache.end()) {
+			return false;
+		}
+	}
+	m_inflight_hashes.insert(hash);
+	return true;
+}
+
+void MetalShaderManager::EndCompile(uint64_t hash) {
+	{
+		std::lock_guard lock(m_inflight_mutex);
+		m_inflight_hashes.erase(hash);
+	}
+	m_inflight_cv.notify_all();
+}
+
 void MetalShaderManager::ClearCache() {
+	std::unique_lock lock(m_cache_mutex);
 	m_function_cache.clear();
 }
 
 // MSL disk cache key: schema version (bump when translator/sanitizer output changes) and
 // probe mode, so stale or probed entries are never reused across builds or experiments.
-static constexpr const char* kMslCacheSchema = "msl-s2";
+static constexpr const char* kMslCacheSchema = "msl-s3";
 
 static bool MslDiskCacheDisabled() {
-	static const bool s_off = KYTY_ENV("KYTY_MSL_NO_DISK_CACHE") != nullptr ||
-	                          KYTY_ENV("KYTY_PS_PROBE") != nullptr ||
-	                          KYTY_ENV("KYTY_VS_PROBE") != nullptr ||
-	                          KYTY_ENV("KYTY_SPVC_ABI") != nullptr ||
-	                          KYTY_ENV("KYTY_MSL_ONLY") != nullptr;
-	return s_off;
+	return KYTY_ENV("KYTY_MSL_NO_DISK_CACHE") != nullptr ||
+	       KYTY_ENV("KYTY_PS_PROBE") != nullptr ||
+	       KYTY_ENV("KYTY_VS_PROBE") != nullptr ||
+	       KYTY_ENV("KYTY_SPVC_ABI") != nullptr;
 }
 
 static NSString* MslCacheDir() {
 	const char* probe = KYTY_ENV("KYTY_PS_PROBE");
+	if (probe == nullptr && MetalBinaryCache::Instance().IsEnabled()) {
+		const auto dir = MetalBinaryCache::Instance().MslDir();
+		if (!dir.empty()) {
+			return [NSString stringWithUTF8String:dir.c_str()];
+		}
+	}
 	NSString* base = [NSString stringWithFormat:@"_PipelineCache/msl/%s", kMslCacheSchema];
 	return probe != nullptr ? [base stringByAppendingFormat:@"/probe-%s", probe] : base;
 }
@@ -477,10 +513,24 @@ static NSString* MslCachePath(uint64_t hash) {
 #ifdef __OBJC__
 id<MTLFunction> MetalShaderManager::GetFunction(uint64_t hash) {
 	if (hash == 0) return nil;
-	auto it = m_function_cache.find(hash);
-	if (it != m_function_cache.end()) {
-		return it->second;
+	{
+		std::shared_lock lock(m_cache_mutex);
+		auto it = m_function_cache.find(hash);
+		if (it != m_function_cache.end()) {
+			return it->second;
+		}
 	}
+
+	if (!WaitOrBeginCompile(hash)) {
+		std::shared_lock lock(m_cache_mutex);
+		auto it = m_function_cache.find(hash);
+		return it != m_function_cache.end() ? it->second : nil;
+	}
+	struct Guard {
+		MetalShaderManager* mgr;
+		uint64_t            hash;
+		~Guard() { mgr->EndCompile(hash); }
+	} guard {this, hash};
 
 	NSString* path = MslCachePath(hash);
 	if (!MslDiskCacheDisabled() && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
@@ -518,7 +568,12 @@ id<MTLFunction> MetalShaderManager::GetFunction(uint64_t hash) {
 					if ([names count] > 0) fn = [lib newFunctionWithName:[names firstObject]];
 				}
 				if (fn) {
-					m_function_cache.emplace(hash, fn);
+					{
+						std::unique_lock lock(m_cache_mutex);
+						auto [it, inserted] = m_function_cache.try_emplace(hash, fn);
+						fn = it->second;
+					}
+					MetalBinaryCache::Instance().RecordMslDiskHit();
 					static std::atomic<uint32_t> s_disk_loaded {0};
 					if (s_disk_loaded.fetch_add(1) < 20) {
 						std::fprintf(stderr, "[MetalShaderManager] Loaded MSL for 0x%016llx from disk cache\n", (unsigned long long)hash);
@@ -532,6 +587,7 @@ id<MTLFunction> MetalShaderManager::GetFunction(uint64_t hash) {
 }
 #else
 id MetalShaderManager::GetFunction(uint64_t hash) {
+	std::shared_lock lock(m_cache_mutex);
 	auto it = m_function_cache.find(hash);
 	return it != m_function_cache.end() ? it->second : nullptr;
 }
@@ -587,6 +643,21 @@ MetalShaderCompileResult MetalShaderManager::CompileSpirvToFunction(
 		result.success  = true;
 		return result;
 	}
+	if (!WaitOrBeginCompile(shader_hash)) {
+		std::shared_lock lock(m_cache_mutex);
+		auto it = m_function_cache.find(shader_hash);
+		if (it != m_function_cache.end() && it->second != nil) {
+			result.function = it->second;
+			result.success  = true;
+			return result;
+		}
+		return result;
+	}
+	struct MslInflightGuard {
+		MetalShaderManager* mgr;
+		uint64_t            hash;
+		~MslInflightGuard() { mgr->EndCompile(hash); }
+	} inflight_guard {this, shader_hash};
 #endif
 
 	try {
@@ -731,13 +802,19 @@ MetalShaderCompileResult MetalShaderManager::CompileSpirvToFunction(
 		result.library  = library;
 		result.function = function;
 		result.success  = true;
-		m_function_cache.emplace(shader_hash, function);
+		{
+			std::unique_lock lock(m_cache_mutex);
+			auto [it, inserted] = m_function_cache.try_emplace(shader_hash, function);
+			result.function = it->second;
+		}
 
 		NSString* msl_dir = MslCacheDir();
 		NSString* msl_path = MslCachePath(shader_hash);
 		if (!MslDiskCacheDisabled()) {
 			[[NSFileManager defaultManager] createDirectoryAtPath:msl_dir withIntermediateDirectories:YES attributes:nil error:nil];
-			[source_str writeToFile:msl_path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+			if ([source_str writeToFile:msl_path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+				MetalBinaryCache::Instance().RecordMslDiskWrite();
+			}
 		}
 
 		LOGF_COLOR(Log::Color::BrightGreen,
@@ -814,6 +891,21 @@ MetalShaderCompileResult MetalShaderManager::CompileMslToFunction(
 		result.success  = true;
 		return result;
 	}
+	if (!WaitOrBeginCompile(shader_hash)) {
+		std::shared_lock lock(m_cache_mutex);
+		auto it = m_function_cache.find(shader_hash);
+		if (it != m_function_cache.end() && it->second != nil) {
+			result.function = it->second;
+			result.success  = true;
+			return result;
+		}
+		return result;
+	}
+	struct MslInflightGuard {
+		MetalShaderManager* mgr;
+		uint64_t            hash;
+		~MslInflightGuard() { mgr->EndCompile(hash); }
+	} inflight_guard {this, shader_hash};
 #endif
 
 	// A native vertex shader that exports nothing but the position (depth-only passes) can still be paired with a
@@ -902,10 +994,26 @@ MetalShaderCompileResult MetalShaderManager::CompileMslToFunction(
 			return result;
 		}
 
+		if (result.msl_source.find("[[buffer(0)]]") != std::string::npos) {
+			RecordArgBuffer0(shader_hash);
+		}
+		if (!MslDiskCacheDisabled()) {
+			NSString* msl_dir  = MslCacheDir();
+			NSString* msl_path = MslCachePath(shader_hash);
+			[[NSFileManager defaultManager] createDirectoryAtPath:msl_dir withIntermediateDirectories:YES attributes:nil error:nil];
+			if ([source_str writeToFile:msl_path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+				MetalBinaryCache::Instance().RecordMslDiskWrite();
+			}
+		}
+
 		result.library  = library;
 		result.function = function;
 		result.success  = true;
-		m_function_cache.emplace(shader_hash, function);
+		{
+			std::unique_lock lock(m_cache_mutex);
+			auto [it, inserted] = m_function_cache.try_emplace(shader_hash, function);
+			result.function = it->second;
+		}
 		static std::atomic<uint32_t> s_msl_compiled {0};
 		if (s_msl_compiled.fetch_add(1) < 200) {
 			std::fprintf(stderr, "[MSL] direct compiled 0x%016llx entry=%s\n",
