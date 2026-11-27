@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/metal/metalPipeline.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -110,10 +111,14 @@ private:
 	bool AppendJournalComputeLocked(uint64_t cs_hash);
 	bool AppendJournalRenderLocked(const MetalRenderPipelineKey& key);
 	void SerializeArchiveLocked();
+	void MaybeScheduleArchiveFlushLocked();
 
-	mutable std::mutex    m_mutex;
-	std::atomic<bool>     m_enabled {false};
-	bool                  m_archive_dirty = false;
+	mutable std::mutex                    m_mutex;
+	std::atomic<bool>                     m_enabled {false};
+	std::atomic<bool>                     m_flush_scheduled {false};
+	bool                                  m_archive_dirty        = false;
+	uint32_t                              m_pending_archive_adds = 0;
+	std::chrono::steady_clock::time_point m_last_flush_time = std::chrono::steady_clock::now();
 	std::filesystem::path m_cache_dir;
 	std::filesystem::path m_msl_dir;
 	std::filesystem::path m_archive_path;

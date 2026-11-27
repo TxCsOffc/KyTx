@@ -222,9 +222,12 @@ bool MetalBinaryCache::Initialize(id<MTLDevice> device, const std::string& cache
 	m_loaded_render_keys.clear();
 	m_recorded_compute_hashes.clear();
 	m_recorded_render_keys.clear();
-	m_archive_dirty = false;
-	m_archive       = nil;
-	m_device        = device;
+	m_archive_dirty        = false;
+	m_pending_archive_adds = 0;
+	m_last_flush_time      = std::chrono::steady_clock::now();
+	m_flush_scheduled.store(false, std::memory_order_relaxed);
+	m_archive              = nil;
+	m_device               = device;
 
 	std::filesystem::path root_path;
 	if (!cache_root.empty()) {
@@ -355,11 +358,13 @@ void MetalBinaryCache::AddRenderPipeline(MTLRenderPipelineDescriptor*  desc,
 			NSError* err = nil;
 			if ([m_archive addRenderPipelineFunctionsWithDescriptor:desc error:&err]) {
 				m_archive_dirty = true;
+				++m_pending_archive_adds;
 				m_stats.archive_adds.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
 	}
 	(void)AppendJournalRenderLocked(key);
+	MaybeScheduleArchiveFlushLocked();
 }
 
 void MetalBinaryCache::AddComputePipeline(MTLComputePipelineDescriptor* desc, uint64_t cs_hash) {
@@ -372,11 +377,30 @@ void MetalBinaryCache::AddComputePipeline(MTLComputePipelineDescriptor* desc, ui
 			NSError* err = nil;
 			if ([m_archive addComputePipelineFunctionsWithDescriptor:desc error:&err]) {
 				m_archive_dirty = true;
+				++m_pending_archive_adds;
 				m_stats.archive_adds.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
 	}
 	(void)AppendJournalComputeLocked(cs_hash);
+	MaybeScheduleArchiveFlushLocked();
+}
+
+void MetalBinaryCache::MaybeScheduleArchiveFlushLocked() {
+	if (!m_archive_dirty || m_archive == nil) {
+		return;
+	}
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = now - m_last_flush_time;
+	if (m_pending_archive_adds < 16u && elapsed < std::chrono::seconds(3)) {
+		return;
+	}
+	if (!m_flush_scheduled.exchange(true, std::memory_order_acq_rel)) {
+		MetalCompilePool::Instance().Enqueue([this]() {
+			Flush();
+			m_flush_scheduled.store(false, std::memory_order_release);
+		});
+	}
 }
 
 void MetalBinaryCache::SerializeArchiveLocked() {
@@ -393,7 +417,9 @@ void MetalBinaryCache::SerializeArchiveLocked() {
 			std::error_code ec;
 			std::filesystem::rename(tmp_path, m_archive_path, ec);
 			if (!ec) {
-				m_archive_dirty = false;
+				m_archive_dirty        = false;
+				m_pending_archive_adds = 0;
+				m_last_flush_time      = std::chrono::steady_clock::now();
 				return;
 			}
 		} else if (err != nil) {
