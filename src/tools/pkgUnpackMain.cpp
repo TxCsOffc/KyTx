@@ -115,8 +115,12 @@ int main(int argc, char* argv[]) {
 	}
 
 	options.on_progress = [](std::string_view rel, uint64_t done, uint64_t total) {
-		::printf("[FPKG] %s (%llu / %llu bytes)\n", std::string(rel).c_str(),
-		         static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
+		const double pct      = (total > 0u) ? (100.0 * static_cast<double>(done) / static_cast<double>(total)) : 100.0;
+		const double done_gib = static_cast<double>(done) / static_cast<double>(1ull << 30);
+		const double tot_gib  = static_cast<double>(total) / static_cast<double>(1ull << 30);
+		::printf("[FPKG] %5.1f%% (%.2f / %.2f GiB) %s\n", pct, done_gib, tot_gib,
+		         std::string(rel).c_str());
+		::fflush(stdout);
 	};
 
 	const auto res = Common::Pkg::UnpackPkg(pkg_path, output_dir, options);

@@ -4,11 +4,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -1759,10 +1762,11 @@ public:
 		return true;
 	}
 
-	bool StreamToFile(uint64_t                     logical,
-	                  uint64_t                     size,
-	                  const std::filesystem::path& dst_path,
-	                  std::string&                 out_error) const {
+	bool StreamToFile(uint64_t                                      logical,
+	                  uint64_t                                      size,
+	                  const std::filesystem::path&                  dst_path,
+	                  std::string&                                  out_error,
+	                  const std::function<void(uint64_t delta)>&    on_chunk = {}) const {
 		std::error_code ec;
 		std::filesystem::create_directories(dst_path.parent_path(), ec);
 		if (ec) {
@@ -1774,28 +1778,208 @@ public:
 			out_error = "Failed to create output file: " + dst_path.string();
 			return false;
 		}
-		uint64_t       pos = logical;
-		const uint64_t end = logical + size;
-		while (pos < end) {
-			const size_t idx = FindBlock(pos);
-			if (idx == SIZE_MAX || !EnsureBlockLoaded(idx, out_error)) {
-				std::fclose(out);
-				if (out_error.empty()) {
-					out_error = "No NAPS block covers logical offset";
+
+		// Small files reuse the single-block cache; large files batch-decode in parallel.
+		if (size <= (4ull << 20)) {
+			uint64_t       pos = logical;
+			const uint64_t end = logical + size;
+			while (pos < end) {
+				const size_t idx = FindBlock(pos);
+				if (idx == SIZE_MAX || !EnsureBlockLoaded(idx, out_error)) {
+					std::fclose(out);
+					if (out_error.empty()) {
+						out_error = "No NAPS block covers logical offset";
+					}
+					return false;
 				}
-				return false;
+				const auto&  blk    = m_blocks[idx];
+				const size_t within = static_cast<size_t>(pos - blk.logical);
+				const size_t n =
+				    static_cast<size_t>(std::min<uint64_t>(blk.uncomp - within, end - pos));
+				if (std::fwrite(m_decoded_buf.data() + within, 1, n, out) != n) {
+					std::fclose(out);
+					out_error = "Failed writing output file: " + dst_path.string();
+					return false;
+				}
+				pos += n;
 			}
-			const auto&  blk    = m_blocks[idx];
-			const size_t within = static_cast<size_t>(pos - blk.logical);
-			const size_t n =
-			    static_cast<size_t>(std::min<uint64_t>(blk.uncomp - within, end - pos));
-			if (std::fwrite(m_decoded_buf.data() + within, 1, n, out) != n) {
-				std::fclose(out);
-				out_error = "Failed writing output file: " + dst_path.string();
-				return false;
-			}
-			pos += n;
+			std::fclose(out);
+			return true;
 		}
+
+		std::vector<char> io_buf(1u << 20);
+		std::setvbuf(out, io_buf.data(), _IOFBF, io_buf.size());
+
+		struct BatchItem {
+			size_t               blk_idx      = 0;
+			size_t               slice_off    = 0;
+			size_t               slice_len    = 0;
+			bool                 needs_decode = false;
+			std::vector<uint8_t> comp_buf;
+			std::vector<uint8_t> dec_buf;
+		};
+
+		constexpr size_t       kBatchBlocks    = 64u;
+		constexpr uint64_t     kReportInterval = 512ull << 20;
+		std::vector<BatchItem> batch(kBatchBlocks);
+
+		uint64_t       pos         = logical;
+		const uint64_t end         = logical + size;
+		uint64_t       chunk_accum = 0;
+		size_t         hint_idx    = FindBlock(pos);
+
+		auto format_kraken_error = [&](const NapsUBlock& blk, const KrakenResult& kres) {
+			char msg[256];
+			if (kres.status == KrakenStatus::UnsupportedEntropy) {
+				std::snprintf(msg, sizeof(msg),
+				              "Unsupported Kraken entropy type %u at logical 0x%llx",
+				              kres.entropy_type, static_cast<unsigned long long>(blk.logical));
+			} else {
+				std::snprintf(msg, sizeof(msg),
+				              "Malformed Kraken block at logical 0x%llx (comp=%u uncomp=%u flags=0x%x)",
+				              static_cast<unsigned long long>(blk.logical), blk.comp, blk.uncomp,
+				              blk.flags);
+			}
+			return std::string(msg);
+		};
+
+		while (pos < end) {
+			size_t batch_count  = 0;
+			size_t decode_count = 0;
+
+			// Phase A: sequential I/O into reusable batch buffers.
+			while (pos < end && batch_count < kBatchBlocks) {
+				size_t idx = hint_idx;
+				if (idx >= m_blocks.size() || pos < m_blocks[idx].logical ||
+				    pos >= m_blocks[idx].logical + m_blocks[idx].uncomp) {
+					idx = FindBlock(pos);
+				}
+				if (idx == SIZE_MAX) {
+					std::fclose(out);
+					out_error = "No NAPS block covers logical offset";
+					return false;
+				}
+				const auto&  blk    = m_blocks[idx];
+				const size_t within = static_cast<size_t>(pos - blk.logical);
+				const size_t n =
+				    static_cast<size_t>(std::min<uint64_t>(blk.uncomp - within, end - pos));
+
+				auto& item     = batch[batch_count++];
+				item.blk_idx   = idx;
+				item.slice_off = within;
+				item.slice_len = n;
+
+				if (blk.comp == 0u) {
+					item.dec_buf.resize(blk.uncomp);
+					std::fill(item.dec_buf.begin(), item.dec_buf.end(), uint8_t {0});
+					item.needs_decode = false;
+				} else if (blk.comp == blk.uncomp) {
+					item.dec_buf.resize(blk.uncomp);
+					if (!m_image->ReadAt(blk.on_disk, item.dec_buf.data(), blk.comp, out_error)) {
+						std::fclose(out);
+						return false;
+					}
+					item.needs_decode = false;
+				} else {
+					item.comp_buf.resize(blk.comp);
+					item.dec_buf.resize(blk.uncomp);
+					if (!m_image->ReadAt(blk.on_disk, item.comp_buf.data(), blk.comp, out_error)) {
+						std::fclose(out);
+						return false;
+					}
+					item.needs_decode = true;
+					++decode_count;
+				}
+
+				pos += n;
+				hint_idx = idx + 1u;
+			}
+
+			// Phase B: parallel Kraken CPU decoding across workers.
+			if (decode_count > 0u) {
+				const size_t hw = std::max<size_t>(1u, std::thread::hardware_concurrency());
+				const size_t num_workers =
+				    std::min<size_t>(8u, std::min(decode_count, hw));
+				if (num_workers <= 1u) {
+					for (size_t i = 0; i < batch_count; ++i) {
+						auto& item = batch[i];
+						if (!item.needs_decode) {
+							continue;
+						}
+						const auto&        blk  = m_blocks[item.blk_idx];
+						const KrakenResult kres = DecodeKrakenBlock(item.comp_buf, blk.flags,
+						                                            blk.even_comp, item.dec_buf);
+						if (kres.status != KrakenStatus::Ok) {
+							std::fclose(out);
+							out_error = format_kraken_error(blk, kres);
+							return false;
+						}
+					}
+				} else {
+					std::atomic<size_t> next_idx {0};
+					std::atomic<size_t> failed_idx {SIZE_MAX};
+					KrakenResult        failed_res {};
+
+					auto worker = [&]() {
+						for (;;) {
+							if (failed_idx.load(std::memory_order_relaxed) != SIZE_MAX) {
+								return;
+							}
+							const size_t i = next_idx.fetch_add(1u, std::memory_order_relaxed);
+							if (i >= batch_count) {
+								return;
+							}
+							auto& item = batch[i];
+							if (!item.needs_decode) {
+								continue;
+							}
+							const auto&        blk  = m_blocks[item.blk_idx];
+							const KrakenResult kres = DecodeKrakenBlock(
+							    item.comp_buf, blk.flags, blk.even_comp, item.dec_buf);
+							if (kres.status != KrakenStatus::Ok) {
+								size_t expected = SIZE_MAX;
+								if (failed_idx.compare_exchange_strong(expected, i)) {
+									failed_res = kres;
+								}
+								return;
+							}
+						}
+					};
+
+					std::vector<std::thread> workers;
+					workers.reserve(num_workers);
+					for (size_t w = 0; w < num_workers; ++w) {
+						workers.emplace_back(worker);
+					}
+					for (auto& t: workers) {
+						t.join();
+					}
+					const size_t err_i = failed_idx.load(std::memory_order_acquire);
+					if (err_i != SIZE_MAX) {
+						std::fclose(out);
+						out_error = format_kraken_error(m_blocks[batch[err_i].blk_idx], failed_res);
+						return false;
+					}
+				}
+			}
+
+			// Phase C: sequential disk write.
+			for (size_t i = 0; i < batch_count; ++i) {
+				const auto& item = batch[i];
+				if (std::fwrite(item.dec_buf.data() + item.slice_off, 1, item.slice_len, out) !=
+				    item.slice_len) {
+					std::fclose(out);
+					out_error = "Failed writing output file: " + dst_path.string();
+					return false;
+				}
+				chunk_accum += item.slice_len;
+				if (on_chunk && chunk_accum >= kReportInterval) {
+					on_chunk(chunk_accum);
+					chunk_accum = 0;
+				}
+			}
+		}
+
 		std::fclose(out);
 		return true;
 	}
@@ -2480,14 +2664,23 @@ PkgUnpackResult UnpackPkg(const std::filesystem::path& pkg_path,
 
 		if (options.extract_pfs && inner != nullptr) {
 			for (const auto& f: selected_files) {
-				const auto dst_path = output_dir / f.rel_path;
-				if (!inner->StreamToFile(f.logical, f.size, dst_path, res.error)) {
+				const auto dst_path          = output_dir / f.rel_path;
+				uint64_t   reported_for_file = 0;
+				auto       on_chunk          = [&](uint64_t delta) {
+                    reported_for_file += delta;
+                    if (options.on_progress) {
+                        options.on_progress(f.rel_path.generic_string(),
+                                            res.bytes_extracted + reported_for_file,
+                                            total_bytes);
+                    }
+				};
+				if (!inner->StreamToFile(f.logical, f.size, dst_path, res.error, on_chunk)) {
 					res.info = std::move(parsed.info);
 					return res;
 				}
 				res.files_extracted++;
 				res.bytes_extracted += f.size;
-				if (options.on_progress) {
+				if (options.on_progress && reported_for_file < f.size) {
 					options.on_progress(f.rel_path.generic_string(), res.bytes_extracted,
 					                    total_bytes);
 				}
