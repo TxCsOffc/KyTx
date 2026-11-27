@@ -1,4 +1,5 @@
 #include "common/pkg/PkgCrypto.h"
+#include "common/pkg/PkgKraken.h"
 #include "common/pkg/PkgUnpacker.h"
 
 #include <algorithm>
@@ -418,11 +419,312 @@ void TestSyntheticFpkgUnpack() {
 	Check(!evil_res.success, "path traversal entry '../evil' must be rejected");
 }
 
+void TestKrakenDecoder() {
+	// 1. Verbatim block copies when payload size matches destination size
+	const std::array<uint8_t, 8> raw = {1, 2, 3, 4, 5, 6, 7, 8};
+	std::array<uint8_t, 8>       dst {};
+	const auto                   r1 = Common::Pkg::DecodeKrakenBlock(raw, 0x02u, 8u, dst);
+	Check(r1.status == Common::Pkg::KrakenStatus::Ok, "verbatim Kraken decode failed");
+	Check(dst == raw, "verbatim Kraken payload mismatch");
+
+	// 2. Memcpy entropy array (non-LZ chunk)
+	const std::array<uint8_t, 6> memcpy_src = {0x80u, 0x04u, 9u, 8u, 7u, 6u};
+	std::array<uint8_t, 4>       dst4 {};
+	const auto                   r2 = Common::Pkg::DecodeKrakenBlock(memcpy_src, 0x00u, 0u, dst4);
+	Check(r2.status == Common::Pkg::KrakenStatus::Ok, "memcpy Kraken entropy decode failed");
+	Check((dst4 == std::array<uint8_t, 4> {9u, 8u, 7u, 6u}), "memcpy Kraken output mismatch");
+
+	// 3. Unsupported tANS entropy type is cleanly reported
+	const std::array<uint8_t, 5> tans_src = {0x90u, 0x04u, 0x02u, 0u, 0u};
+	std::array<uint8_t, 16>      dst16 {};
+	const auto                   r3 = Common::Pkg::DecodeKrakenBlock(tans_src, 0x00u, 0u, dst16);
+	Check(r3.status == Common::Pkg::KrakenStatus::UnsupportedEntropy && r3.entropy_type == 1u,
+	      "tANS entropy must report UnsupportedEntropy(1)");
+}
+
+void WriteFlatInode(uint8_t* p, uint16_t mode, uint64_t size, uint64_t logical) {
+	WriteLe16(p + 0x00, mode);
+	WriteLe16(p + 0x02, 1u);
+	WriteLe64(p + 0x08, size);
+	WriteLe64(p + 0x10, size);
+	WriteLe64(p + 0x60, logical);
+}
+
+void WriteDinodeS64(uint8_t* p, uint16_t mode, uint64_t size, uint32_t blocks, uint64_t start_blk) {
+	WriteLe16(p + 0x00, mode);
+	WriteLe16(p + 0x02, 1u);
+	WriteLe64(p + 0x08, size);
+	WriteLe64(p + 0x10, size);
+	WriteLe32(p + 0x60, blocks);
+	for (uint32_t k = 0; k < 12u; ++k) {
+		const uint64_t val =
+		    (k == 0u || (blocks > 1u && k < blocks)) ? (start_blk + k) : 0ull;
+		WriteLe64(p + 0x68 + k * 40u + 32u, val);
+	}
+	for (uint32_t k = 0; k < 5u; ++k) {
+		WriteLe64(p + 0x68 + (12u + k) * 40u + 32u, 0ull);
+	}
+}
+
+std::vector<uint8_t> BuildSyntheticPs5FihPkg(uint8_t                     signed_byte,
+                                             const std::vector<uint8_t>& param_json,
+                                             const std::vector<uint8_t>& eboot_data,
+                                             const std::vector<uint8_t>& test_data) {
+	constexpr uint32_t kBlkSize    = 0x10000u;
+	constexpr uint64_t kMountSize  = 0x90000ull; // 9 inner blocks of 64 KiB
+	constexpr uint64_t kMetaBase   = 0x50000ull;
+
+	// Build stored pfs_image.dat (0x54000 bytes -> 6 outer blocks):
+	//   [0x00000..0x04000): eboot.bin (0x4000)
+	//   [0x04000..0x14000): Data/test.bin + zero pad (mapped at logical 0x40000..0x50000)
+	//   [0x14000..0x54000): inner PFSv2 metadata tail (mapped at logical 0x50000..0x90000)
+	std::vector<uint8_t> pfs_image(0x54000u, 0u);
+	std::memcpy(pfs_image.data() + 0x00000u, eboot_data.data(), eboot_data.size());
+	std::memcpy(pfs_image.data() + 0x04000u, test_data.data(), test_data.size());
+
+	uint8_t* tail = pfs_image.data() + 0x14000u; // logical 0x50000
+	WriteLe64(tail + 0x00, 2ull);               // ver = 2
+	WriteLe64(tail + 0x08, 20130315ull);        // magic
+	WriteLe16(tail + 0x1c, 0x0010u);            // flat mode
+	WriteLe32(tail + 0x20, kBlkSize);
+	WriteLe64(tail + 0x30, 5ull);               // 5 inner inodes
+	WriteLe64(tail + 0x38, kMountSize / kBlkSize);
+
+	uint8_t* in_inodes = tail + kBlkSize; // logical 0x60000
+	// inode 0: root (dir at 0x70000), 1: uroot (dir at 0x70000+0x4000), 2: Data (dir at 0x80000),
+	// 3: eboot.bin (0x00000), 4: Data/test.bin (0x40000)
+	WriteFlatInode(in_inodes + 0u * 0xa8u, 0x416du, 0x1000u, 0x70000ull);
+	WriteFlatInode(in_inodes + 1u * 0xa8u, 0x416du, 0x1000u, 0x74000ull);
+	WriteFlatInode(in_inodes + 2u * 0xa8u, 0x416du, 0x1000u, 0x80000ull);
+	WriteFlatInode(in_inodes + 3u * 0xa8u, 0x816du, eboot_data.size(), 0x00000ull);
+	WriteFlatInode(in_inodes + 4u * 0xa8u, 0x816du, test_data.size(), 0x40000ull);
+
+	auto write_dir_at = [&](size_t tail_off, auto&& fn) {
+		std::vector<uint8_t> blk(kBlkSize, 0u);
+		size_t               pos = 0;
+		fn(blk, pos);
+		std::memcpy(tail + tail_off, blk.data(), 0x1000u);
+	};
+	write_dir_at(0x20000u, [&](std::vector<uint8_t>& blk, size_t& pos) {
+		WriteDirent(blk, pos, 0u, 4, ".");
+		WriteDirent(blk, pos, 0u, 5, "..");
+		WriteDirent(blk, pos, 1u, 3, "uroot");
+	});
+	write_dir_at(0x24000u, [&](std::vector<uint8_t>& blk, size_t& pos) {
+		WriteDirent(blk, pos, 1u, 4, ".");
+		WriteDirent(blk, pos, 0u, 5, "..");
+		WriteDirent(blk, pos, 3u, 2, "eboot.bin");
+		WriteDirent(blk, pos, 2u, 3, "Data");
+	});
+	write_dir_at(0x30000u, [&](std::vector<uint8_t>& blk, size_t& pos) {
+		WriteDirent(blk, pos, 2u, 4, ".");
+		WriteDirent(blk, pos, 1u, 5, "..");
+		WriteDirent(blk, pos, 4u, 2, "test.bin");
+	});
+
+	// Build naps_pkg_layout.dat:
+	//   5 file_offsets: 0 (file), 0x4000 (kind 0x40 sparse), 0x40000 (file), 0x50000 (file), 0x90000 (kind 0x40 mount)
+	//   num_outer_blocks = 6 (0x54000 -> 6 * 64KiB), num_ublocks = 3, num_cblock_info = 4 (encoded 2)
+	const uint32_t       num_files        = 5u;
+	const uint32_t       num_outer_blocks = 6u;
+	const uint32_t       num_ublocks      = 3u;
+	const uint32_t       num_u2c          = (num_ublocks + 8u) >> 3u;
+	const uint32_t       num_cblocks      = 4u;
+	const uint64_t       w0 = static_cast<uint64_t>(num_files - 1u) | (2ull << 24u) |
+	                          (static_cast<uint64_t>(num_ublocks) << 32u);
+	const uint64_t       w1 = static_cast<uint64_t>(num_outer_blocks) |
+	                          (static_cast<uint64_t>(num_cblocks - 2u) << 24u);
+	const size_t         fidx_off  = 16u + num_outer_blocks * 8u;
+	const size_t         u2c_off   = fidx_off + num_files * 6u;
+	const size_t         cb_off    = ((u2c_off + num_u2c * 10u + 7u) / 8u) * 8u;
+	std::vector<uint8_t> naps(cb_off + num_cblocks * 9u, 0u);
+	WriteLe64(naps.data() + 0u, w0);
+	WriteLe64(naps.data() + 8u, w1);
+
+	auto write_fo = [&](size_t idx, uint8_t kind, uint64_t off) {
+		uint8_t* p = naps.data() + fidx_off + idx * 6u;
+		for (size_t b = 0; b < 5u; ++b) {
+			p[b] = static_cast<uint8_t>((off >> (8u * b)) & 0xffu);
+		}
+		p[5] = kind;
+	};
+	write_fo(0u, 0x00u, 0x00000ull);
+	write_fo(1u, 0x40u, 0x04000ull);
+	write_fo(2u, 0x00u, 0x40000ull);
+	write_fo(3u, 0x00u, kMetaBase);
+	write_fo(4u, 0x40u, kMountSize);
+
+	auto write_cb = [&](size_t idx, uint32_t coffset_mod) {
+		WriteLe64(naps.data() + cb_off + idx * 9u, coffset_mod & 0x3ffffu);
+	};
+	write_cb(0u, 0x00000u);
+	write_cb(1u, 0x04000u);
+	write_cb(2u, 0x14000u);
+	write_cb(3u, 0x14000u); // diff == 0 -> 0x40000
+
+	// Build Outer PFSv2 at 0x10000:
+	//   blocks 0..5: pfs_image.dat (6 blocks)
+	//   block 6: naps_pkg_layout.dat (1 block)
+	//   block 7: outer superblock (superblock_offset = pfs_offset + 7*kBlkSize)
+	//   block 8: outer inode table (inode_table_block = 8)
+	//   block 9: outer root directory
+	constexpr uint64_t kFihPfsOffset  = 0x10000ull;
+	constexpr uint32_t kOuterBlocks   = 10u;
+	constexpr uint64_t kOuterSbOffset = kFihPfsOffset + 7ull * kBlkSize;
+	std::vector<uint8_t> outer_pfs(static_cast<size_t>(kOuterBlocks) * kBlkSize, 0u);
+	std::memcpy(outer_pfs.data(), pfs_image.data(), pfs_image.size());
+	std::memcpy(outer_pfs.data() + 6u * kBlkSize, naps.data(), naps.size());
+
+	uint8_t* osb = outer_pfs.data() + 7u * kBlkSize;
+	WriteLe64(osb + 0x00, 2ull);        // version = 2
+	WriteLe64(osb + 0x08, 20130315ull); // magic
+	WriteLe16(osb + 0x1c, 0x000fu);     // signed | 64-bit | encrypted-flag (with plain seed)
+	WriteLe32(osb + 0x20, kBlkSize);
+	WriteLe64(osb + 0x30, 3ull);        // 3 inodes (0=dir, 1=pfs_image.dat, 2=naps_pkg_layout.dat)
+	WriteLe64(osb + 0x38, kOuterBlocks);
+	WriteLe64(osb + 0x40, 1ull);        // dinode_blocks
+	WriteLe64(osb + 0xd8, 8ull);        // inode_table_block
+	std::memcpy(osb + 0x370, "PPRPLAIN-NOAUTH!", 16u);
+
+	uint8_t* oino = outer_pfs.data() + 8u * kBlkSize;
+	WriteDinodeS64(oino + 0u * 0x310u, 0x416du, kBlkSize, 1u, 9ull);
+	WriteDinodeS64(oino + 1u * 0x310u, 0x816du, pfs_image.size(), 6u, 0ull);
+	WriteDinodeS64(oino + 2u * 0x310u, 0x816du, naps.size(), 1u, 6ull);
+
+	std::vector<uint8_t> odir(kBlkSize, 0u);
+	size_t               opos = 0;
+	WriteDirent(odir, opos, 0u, 4, ".");
+	WriteDirent(odir, opos, 0u, 5, "..");
+	WriteDirent(odir, opos, 1u, 2, "pfs_image.dat");
+	WriteDirent(odir, opos, 2u, 2, "naps_pkg_layout.dat");
+	std::memcpy(outer_pfs.data() + 9u * kBlkSize, odir.data(), kBlkSize);
+
+	// Embedded \x7FCNT container placed right after outer_pfs
+	const std::string    cid        = "EP9000-PPSA99999_00-KYTXTESTPS5PKG01";
+	const std::string    names_blob = std::string("\0sce_sys/param.json\0license.dat\0", 31);
+	constexpr uint32_t   kCntTbl    = 0x100u;
+	constexpr uint32_t   kNamesOff  = 0x200u;
+	constexpr uint32_t   kParamOff  = 0x300u;
+	const uint32_t       lic_off    = kParamOff + static_cast<uint32_t>(param_json.size());
+	const uint32_t       cnt_total  = lic_off + 16u;
+	std::vector<uint8_t> cnt(cnt_total, 0u);
+	WriteBe32(cnt.data() + 0x00, 0x7F434E54u);
+	WriteBe32(cnt.data() + 0x10, 3u);
+	WriteBe32(cnt.data() + 0x18, kCntTbl);
+	WriteBe64(cnt.data() + 0x20, kNamesOff);
+	WriteBe64(cnt.data() + 0x28, cnt_total - kNamesOff);
+	std::memcpy(cnt.data() + 0x40, cid.data(), cid.size());
+
+	auto write_cnt_rec = [&](size_t idx, uint32_t id, uint32_t noff, uint32_t f1, uint32_t off,
+	                         uint32_t sz) {
+		uint8_t* p = cnt.data() + kCntTbl + idx * 0x20u;
+		WriteBe32(p + 0x00, id);
+		WriteBe32(p + 0x04, noff);
+		WriteBe32(p + 0x08, f1);
+		WriteBe32(p + 0x10, off);
+		WriteBe32(p + 0x14, sz);
+	};
+	write_cnt_rec(0u, 0x0200u, 0u, 0u, kNamesOff, static_cast<uint32_t>(names_blob.size()));
+	write_cnt_rec(1u, 0x2000u, 1u, 0u, kParamOff, static_cast<uint32_t>(param_json.size()));
+	write_cnt_rec(2u, 0x0400u, 19u, 0x80000000u, lic_off, 16u);
+	std::memcpy(cnt.data() + kNamesOff, names_blob.data(), names_blob.size());
+	std::memcpy(cnt.data() + kParamOff, param_json.data(), param_json.size());
+
+	const uint64_t       cnt_offset = kFihPfsOffset + outer_pfs.size();
+	std::vector<uint8_t> pkg(static_cast<size_t>(cnt_offset + cnt.size()), 0u);
+	std::memcpy(pkg.data(), "\x7F" "FIH", 4u);
+	pkg[4] = 0x01u;
+	pkg[5] = signed_byte;
+	WriteLe16(pkg.data() + 0x06, 3u);
+	WriteLe64(pkg.data() + 0x10, kFihPfsOffset);
+	WriteLe64(pkg.data() + 0x18, outer_pfs.size());
+	WriteLe64(pkg.data() + 0x20, kOuterSbOffset);
+	WriteLe64(pkg.data() + 0x58, cnt_offset);
+	std::memcpy(pkg.data() + kFihPfsOffset, outer_pfs.data(), outer_pfs.size());
+	std::memcpy(pkg.data() + cnt_offset, cnt.data(), cnt.size());
+	return pkg;
+}
+
+void TestSyntheticPs5FihUnpack() {
+	std::error_code             ec;
+	const std::filesystem::path work_dir = std::filesystem::temp_directory_path() / "kytx-ps5-fih-test";
+	std::filesystem::remove_all(work_dir, ec);
+	Check(std::filesystem::create_directories(work_dir, ec), "create_directories failed");
+	struct Cleanup {
+		std::filesystem::path path;
+		~Cleanup() {
+			std::error_code rm_ec;
+			std::filesystem::remove_all(path, rm_ec);
+		}
+	} cleanup {work_dir};
+
+	const std::string          param_str = R"({"titleId":"PPSA99999"})";
+	const std::vector<uint8_t> param(param_str.begin(), param_str.end());
+	std::vector<uint8_t>       eboot(0x4000u);
+	for (size_t i = 0; i < eboot.size(); ++i) eboot[i] = static_cast<uint8_t>((i * 29u + 5u) & 0xffu);
+	std::vector<uint8_t> test_data(0x2000u);
+	for (size_t i = 0; i < test_data.size(); ++i)
+		test_data[i] = static_cast<uint8_t>((i * 41u + 9u) & 0xffu);
+
+	const auto pkg_bytes = BuildSyntheticPs5FihPkg(0x00u, param, eboot, test_data);
+	const auto pkg_path  = work_dir / "ps5_debug.pkg";
+	{
+		std::FILE* f = std::fopen(pkg_path.string().c_str(), "wb");
+		Check(f != nullptr && std::fwrite(pkg_bytes.data(), 1, pkg_bytes.size(), f) == pkg_bytes.size(),
+		      "failed writing synthetic PS5 pkg");
+		std::fclose(f);
+	}
+
+	// 1. Inspect succeeds and reports FIH v3 + both files + block stats
+	const auto inspected = Common::Pkg::InspectPkg(pkg_path);
+	Check(inspected.success, inspected.error.c_str());
+	Check(inspected.info.is_ps5_fih && inspected.info.fih_format_version == 3u,
+	      "expected PS5 FIH v3 metadata");
+	Check(inspected.info.content_id == "EP9000-PPSA99999_00-KYTXTESTPS5PKG01",
+	      "unexpected PS5 content ID");
+	Check(inspected.info.pfs_file_entries.size() == 2u, "expected 2 PS5 inner files");
+	Check(inspected.info.pfs_sparse_blocks > 0u, "expected sparse block count > 0");
+
+	// 2. Executables-only unpacks sce_sys/param.json + eboot.bin, skips Data/test.bin and encrypted license.dat
+	const auto                    exec_dir = work_dir / "exec_only";
+	Common::Pkg::PkgUnpackOptions exec_opts;
+	exec_opts.executables_only = true;
+	const auto exec_res        = Common::Pkg::UnpackPkg(pkg_path, exec_dir, exec_opts);
+	Check(exec_res.success, exec_res.error.c_str());
+	Check(ReadAllBytes(exec_dir / "sce_sys" / "param.json") == param, "param.json mismatch");
+	Check(ReadAllBytes(exec_dir / "eboot.bin") == eboot, "eboot.bin mismatch");
+	Check(!std::filesystem::exists(exec_dir / "Data" / "test.bin"),
+	      "Data/test.bin must be skipped in executables_only mode");
+	Check(!std::filesystem::exists(exec_dir / "sce_sys" / "license.dat"),
+	      "encrypted license.dat must be skipped cleanly");
+
+	// 3. Full unpack extracts everything byte-for-byte
+	const auto full_dir = work_dir / "full";
+	const auto full_res = Common::Pkg::UnpackPkg(pkg_path, full_dir);
+	Check(full_res.success, full_res.error.c_str());
+	Check(ReadAllBytes(full_dir / "Data" / "test.bin") == test_data, "Data/test.bin mismatch");
+
+	// 4. Retail-signed FIH header (0x80) must be refused
+	const auto retail_bytes = BuildSyntheticPs5FihPkg(0x80u, param, eboot, test_data);
+	const auto retail_path  = work_dir / "ps5_retail.pkg";
+	{
+		std::FILE* f = std::fopen(retail_path.string().c_str(), "wb");
+		Check(f != nullptr &&
+		          std::fwrite(retail_bytes.data(), 1, retail_bytes.size(), f) == retail_bytes.size(),
+		      "failed writing synthetic retail pkg");
+		std::fclose(f);
+	}
+	const auto retail_res = Common::Pkg::InspectPkg(retail_path);
+	Check(!retail_res.success, "retail PS5 FIH package must be rejected");
+}
+
 } // namespace
 
 int main() {
 	TestCryptoVectors();
 	TestSyntheticFpkgUnpack();
+	TestKrakenDecoder();
+	TestSyntheticPs5FihUnpack();
 	std::printf("PkgUnpackerTests passed.\n");
 	return 0;
 }

@@ -22,29 +22,44 @@ struct PkgEntrySummary {
 	bool        encrypted = false;
 };
 
+struct PfsFileSummary {
+	std::string path;
+	uint64_t    size = 0;
+};
+
 struct PkgInfo {
 	std::string                  content_id;
-	uint32_t                     flags            = 0;
-	uint32_t                     drm_type         = 0;
-	uint32_t                     content_type     = 0;
-	uint32_t                     content_flags    = 0;
-	uint64_t                     pfs_flags        = 0;
-	uint64_t                     pfs_image_offset = 0;
-	uint64_t                     pfs_image_size   = 0;
-	uint64_t                     package_size     = 0;
-	bool                         is_fpkg          = false;
-	bool                         pfs_encrypted    = false;
-	bool                         pfs_compressed   = false;
-	bool                         passcode_valid   = false;
+	uint32_t                     flags              = 0;
+	uint32_t                     drm_type           = 0;
+	uint32_t                     content_type       = 0;
+	uint32_t                     content_flags      = 0;
+	uint64_t                     pfs_flags          = 0;
+	uint64_t                     pfs_image_offset   = 0;
+	uint64_t                     pfs_image_size     = 0;
+	uint64_t                     package_size       = 0;
+	bool                         is_fpkg            = false;
+	bool                         is_ps5_fih         = false;
+	uint16_t                     fih_format_version = 0;
+	uint64_t                     pfs_logical_size   = 0;
+	uint64_t                     pfs_stored_blocks  = 0;
+	uint64_t                     pfs_kraken_blocks  = 0;
+	uint64_t                     pfs_sparse_blocks  = 0;
+	bool                         pfs_encrypted      = false;
+	bool                         pfs_compressed     = false;
+	bool                         passcode_valid     = false;
 	std::vector<PkgEntrySummary> entries;
 	std::vector<std::string>     pfs_files;
+	std::vector<PfsFileSummary>  pfs_file_entries;
 };
 
 struct PkgUnpackOptions {
-	std::string passcode    = std::string(kDefaultFpkgPasscode);
-	bool        extract_sc0 = true;
-	bool        extract_pfs = true;
-	bool        list_only   = false;
+	std::string              passcode         = std::string(kDefaultFpkgPasscode);
+	bool                     extract_sc0      = true;
+	bool                     extract_pfs      = true;
+	bool                     list_only        = false;
+	bool                     executables_only = false;
+	bool                     check_free_space = true;
+	std::vector<std::string> only_prefixes;
 	std::function<void(std::string_view relative_path, uint64_t bytes_written, uint64_t total_bytes)>
 	    on_progress;
 };
