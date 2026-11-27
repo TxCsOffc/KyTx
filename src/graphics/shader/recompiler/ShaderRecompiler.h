@@ -39,12 +39,24 @@ struct CompileResult {
 	IR::Program           program;
 };
 
-[[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
-                                               const CompileOptions&     options);
-[[nodiscard]] CompileResult   CompileProgram(TranslateResult                   translated,
-                                             const CompileOptions&             options,
-                                             const IR::ResourceSpecialization& specialization,
-                                             uint32_t push_data_start_dword = 0);
+struct FinalizedProgram {
+	IR::Program program;
+	std::string decoded_dump;
+	std::string ir_dump;
+};
+
+[[nodiscard]] TranslateResult  TranslateProgram(std::span<const uint32_t> code,
+                                                const CompileOptions&     options);
+[[nodiscard]] FinalizedProgram FinalizeProgramForBackend(TranslateResult                   translated,
+                                                         const CompileOptions&             options,
+                                                         const IR::ResourceSpecialization& specialization,
+                                                         uint32_t push_data_start_dword = 0);
+[[nodiscard]] std::vector<uint32_t> EmitSpirvForFinalizedProgram(const IR::Program&    program,
+                                                                 const CompileOptions& options);
+[[nodiscard]] CompileResult    CompileProgram(TranslateResult                   translated,
+                                              const CompileOptions&             options,
+                                              const IR::ResourceSpecialization& specialization,
+                                              uint32_t push_data_start_dword = 0);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

@@ -7,6 +7,13 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
 		case O::S_MOV_B32:
 		case O::S_MOVK_I32: MOV_B32(inst, false); return;
+		case O::S_CMOV_B32:
+			WriteRawU32(inst.dst, ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(inst.dst)));
+			return;
+		case O::S_CMOVK_I32:
+			WriteRawU32(inst.dst,
+			            ir.Select(ir.GetScc(), IR::U32(IR::Value(inst.src0.value)), ReadU32(inst.dst)));
+			return;
 		case O::S_MOV_B64: S_MOV_B64(inst); return;
 		case O::S_WQM_B32: S_WQM(inst, false); return;
 		case O::S_WQM_B64: S_WQM(inst, true); return;
@@ -17,26 +24,81 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CSELECT_B32: S_CSELECT_B32(inst); return;
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
-		case O::S_SETREG_B32: EmitControlNop(); return;
+		case O::S_SETREG_B32:
+		case O::S_SETREG_IMM32_B32: EmitControlNop(); return;
 		case O::S_WAITCNT: EmitWaitcnt(); return;
 
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
 			return;
+		case O::S_OR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, false);
+			return;
+		case O::S_XOR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, false);
+			return;
+		case O::S_ANDN2_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, false);
+			return;
 		case O::S_ANDN1_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false);
+			return;
+		case O::S_ORN1_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, true, false);
 			return;
 		case O::S_ORN2_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, false);
 			return;
+		case O::S_NAND_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false, true);
+			return;
+		case O::S_NOR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, false, true);
+			return;
+		case O::S_XNOR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, false, true);
+			return;
+		case O::S_ANDN1_WREXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false, false, true);
+			return;
+		case O::S_ANDN2_WREXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, false, false, true);
+			return;
 		case O::S_AND_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true);
+			return;
+		case O::S_OR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true);
+			return;
+		case O::S_XOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true);
+			return;
+		case O::S_ANDN2_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, true);
 			return;
 		case O::S_ANDN1_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true);
 			return;
+		case O::S_ORN1_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, true, true);
+			return;
 		case O::S_ORN2_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, true);
+			return;
+		case O::S_NAND_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true, true);
+			return;
+		case O::S_NOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true, true);
+			return;
+		case O::S_XNOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true, true);
+			return;
+		case O::S_ANDN1_WREXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true, false, true);
+			return;
+		case O::S_ANDN2_WREXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, true, false, true);
 			return;
 		case O::S_ADD_U32: ADD_U32(inst, false, false); return;
 		case O::S_ADDC_U32: ADD_U32(inst, false, true); return;
@@ -161,12 +223,41 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			                        IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[0]}))});
 			return;
 		}
+		case O::S_SEXT_I32_I8:
+		case O::S_SEXT_I32_I16: {
+			const uint32_t width = inst.opcode == O::S_SEXT_I32_I8 ? 8u : 16u;
+			WriteOperand(DestinationOperand(inst),
+			             ir.Emit(IR::ValueOpcode::BitFieldSExtract,
+			                     {ReadU32(inst.src0), IR::Value(0u), IR::Value(width)}));
+			return;
+		}
+		case O::S_BCNT0_I32_B32: {
+			const auto result = IR::U32(
+			    ir.Emit(IR::ValueOpcode::BitCount32, {ir.BitwiseNot(ReadU32(inst.src0))}));
+			WriteOperand(DestinationOperand(inst), result);
+			ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
+			return;
+		}
+		case O::S_BCNT0_I32_B64: {
+			const auto source = ExtractU64(ReadU64(inst.src0));
+			const auto low    = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {ir.BitwiseNot(source[0])}));
+			const auto high   = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {ir.BitwiseNot(source[1])}));
+			const auto result = ir.IAdd(low, high);
+			WriteOperand(DestinationOperand(inst), result);
+			ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
+			return;
+		}
 		case O::S_BCNT1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitCount32, IR::Type::U32, false, false,
 			                     true);
 		case O::S_BCNT1_I32_B64:
 			return SimpleInteger(inst, IR::ValueOpcode::BitCount64, IR::Type::U64, false, false,
 			                     true);
+		case O::S_FF0_I32_B32:
+			WriteOperand(DestinationOperand(inst),
+			             ir.Emit(IR::ValueOpcode::FindILsb32, {ir.BitwiseNot(ReadU32(inst.src0))}));
+			return;
+		case O::S_FF0_I32_B64: return S_FF1_I32_B64(inst, true);
 		case O::S_FF1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::FindILsb32, IR::Type::U32, false, false,
 			                     false);
@@ -197,9 +288,11 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseOr32, false, true, true);
 		case O::S_XNOR_B32:
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseXor32, false, true, true);
-		case O::S_FF1_I32_B64: return S_FF1_I32_B64(inst);
+		case O::S_FF1_I32_B64: return S_FF1_I32_B64(inst, false);
 		case O::S_FLBIT_I32_B32: return V_FFBH_32(inst, false);
-		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst);
+		case O::S_FLBIT_I32: return V_FFBH_32(inst, true);
+		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst, false);
+		case O::S_FLBIT_I32_I64: return S_FLBIT_I32_B64(inst, true);
 
 		case O::S_BITSET0_B32: return S_BITSET_B32(inst, false);
 		case O::S_BITSET1_B32: return S_BITSET_B32(inst, true);
@@ -212,6 +305,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BFE_U32: return S_BFE_U32(inst, false);
 		case O::S_BFE_I32: return S_BFE_U32(inst, true);
 		case O::S_BFE_U64: return S_BFE_U64(inst);
+		case O::S_BFE_I64: return S_BFE_I64(inst);
 		case O::S_BITCMP0_B32: return S_BITCMP_B32(inst, false);
 		case O::S_BITCMP1_B32: return S_BITCMP_B32(inst, true);
 		case O::S_BITCMP0_B64: return S_BITCMP_B64(inst, false);
@@ -221,10 +315,19 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_PACK_HH_B32_B16: return PackB16(inst, true, true);
 
 		case O::S_NOP:
+		case O::S_VERSION:
+		case O::S_CLAUSE:
 		case O::S_SLEEP:
 		case O::S_SETPRIO:
-		case O::S_TRAP: EmitControlNop(); return;
-		case O::S_WAITCNT_DEPCTR: EmitWaitcnt(); return;
+		case O::S_TRAP:
+		case O::S_WAKEUP:
+		case O::S_ICACHE_INV:
+		case O::S_INCPERFLEVEL:
+		case O::S_DECPERFLEVEL:
+		case O::S_ROUND_MODE:
+		case O::S_DENORM_MODE: EmitControlNop(); return;
+		case O::S_WAITCNT_DEPCTR:
+		case O::S_WAIT_IDLE: EmitWaitcnt(); return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;
 		case O::S_TTRACEDATA: S_TTRACEDATA(); return;
@@ -238,7 +341,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_EXECNZ:
 		case O::S_CBRANCH_CDBGSYS:
 		case O::S_CBRANCH_CDBGSYS_OR_USER:
-		case O::S_ENDPGM: return;
+		case O::S_CBRANCH_CDBG:
+		case O::S_ENDPGM:
+		case O::S_CODE_END: return;
 		default: return FailMissingTranslation(inst);
 	}
 }

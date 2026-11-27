@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -204,6 +205,10 @@ public:
 	void ClearCaches();
 
 private:
+	mutable std::shared_mutex m_depth_stencil_mutex;
+	mutable std::shared_mutex m_render_pipeline_mutex;
+	mutable std::shared_mutex m_compute_pipeline_mutex;
+
 #ifdef __OBJC__
 	std::unordered_map<MetalDepthStencilKey, id<MTLDepthStencilState>, MetalDepthStencilKeyHash>
 	    m_depth_stencil_cache;

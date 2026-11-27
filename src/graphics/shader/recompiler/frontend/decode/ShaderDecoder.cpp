@@ -186,7 +186,8 @@ bool IsConditionalBranch(Opcode opcode) {
 	switch (opcode) {
 		// Conditional shader debugging is disabled.
 		case Opcode::S_CBRANCH_CDBGSYS:
-		case Opcode::S_CBRANCH_CDBGSYS_OR_USER: return false;
+		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
+		case Opcode::S_CBRANCH_CDBG: return false;
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:
 		case Opcode::S_CBRANCH_VCCZ:
@@ -216,77 +217,107 @@ const char* ImageDimensionToString(ImageDimension dimension) {
 	}
 }
 
-void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
-	operand = {};
+namespace {
 
-	if (code <= 105u) {
-		operand.kind = OperandKind::Sgpr;
-		operand.reg  = code;
+consteval std::array<Operand, 256> BuildScalarSourceLut() {
+	std::array<Operand, 256> lut {};
+	for (uint32_t code = 0; code <= 105u; ++code) {
+		lut[code].kind = OperandKind::Sgpr;
+		lut[code].reg  = code;
+	}
+	for (uint32_t code = 128u; code <= 192u; ++code) {
+		lut[code].kind       = OperandKind::IntegerInlineConstant;
+		lut[code].signed_val = static_cast<int32_t>(code - 128u);
+		lut[code].value      = static_cast<uint32_t>(lut[code].signed_val);
+	}
+	for (uint32_t code = 193u; code <= 208u; ++code) {
+		lut[code].kind       = OperandKind::IntegerInlineConstant;
+		lut[code].signed_val = 192 - static_cast<int32_t>(code);
+		lut[code].value      = static_cast<uint32_t>(lut[code].signed_val);
+	}
+	constexpr float inline_floats[] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f};
+	for (uint32_t i = 0; i < 8u; ++i) {
+		lut[240u + i].kind  = OperandKind::FloatInlineConstant;
+		lut[240u + i].value = std::bit_cast<uint32_t>(inline_floats[i]);
+	}
+	lut[106u].kind = OperandKind::VccLo;
+	lut[107u].kind = OperandKind::VccHi;
+	lut[124u].kind = OperandKind::M0;
+	lut[125u].kind = OperandKind::Null;
+	lut[126u].kind = OperandKind::ExecLo;
+	lut[127u].kind = OperandKind::ExecHi;
+	lut[235u].kind = OperandKind::SharedBase;
+	lut[237u].kind = OperandKind::PrivateBase;
+	lut[239u].kind = OperandKind::PopsExitingWaveId;
+	lut[248u].kind = OperandKind::FloatInlineConstant;
+	lut[248u].value = std::bit_cast<uint32_t>(0.15915494309189535f);
+	lut[251u].kind = OperandKind::VccZ;
+	lut[252u].kind = OperandKind::ExecZ;
+	lut[253u].kind = OperandKind::Scc;
+	lut[255u].kind = OperandKind::LiteralConstant;
+	return lut;
+}
+
+consteval std::array<Operand, 128> BuildScalarDestLut() {
+	std::array<Operand, 128> lut {};
+	for (uint32_t code = 0; code <= 105u; ++code) {
+		lut[code].kind = OperandKind::Sgpr;
+		lut[code].reg  = code;
+	}
+	lut[106u].kind = OperandKind::VccLo;
+	lut[107u].kind = OperandKind::VccHi;
+	lut[124u].kind = OperandKind::M0;
+	lut[125u].kind = OperandKind::Null;
+	lut[126u].kind = OperandKind::ExecLo;
+	lut[127u].kind = OperandKind::ExecHi;
+	return lut;
+}
+
+consteval std::array<Family, 64> BuildEncoding64FamilyLut() {
+	std::array<Family, 64> lut {};
+	lut.fill(Family::Unknown);
+	lut[0x32u] = Family::VINTRP;
+	lut[0x33u] = Family::VOP3P;
+	lut[0x35u] = Family::VOP3;
+	lut[0x36u] = Family::DS;
+	lut[0x37u] = Family::FLAT;
+	lut[0x38u] = Family::MUBUF;
+	lut[0x3au] = Family::MTBUF;
+	lut[0x3cu] = Family::MIMG;
+	lut[0x3du] = Family::SMEM;
+	lut[0x3eu] = Family::EXP;
+	return lut;
+}
+
+constexpr auto kScalarSourceLut     = BuildScalarSourceLut();
+constexpr auto kScalarDestLut       = BuildScalarDestLut();
+constexpr auto kEncoding64FamilyLut = BuildEncoding64FamilyLut();
+
+} // namespace
+
+void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
+	if (code < 256u) {
+		operand = kScalarSourceLut[code];
+		if (__builtin_expect(operand.kind == OperandKind::Unknown, 0)) {
+			EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
+		}
 		return;
 	}
-	if (code >= 128u && code <= 192u) {
-		operand.kind       = OperandKind::IntegerInlineConstant;
-		operand.signed_val = static_cast<int32_t>(code - 128u);
-		operand.value      = static_cast<uint32_t>(operand.signed_val);
-		return;
-	}
-	if (code >= 193u && code <= 208u) {
-		operand.kind       = OperandKind::IntegerInlineConstant;
-		operand.signed_val = 192 - static_cast<int32_t>(code);
-		operand.value      = static_cast<uint32_t>(operand.signed_val);
-		return;
-	}
-	if (code >= 240u && code <= 247u) {
-		constexpr float values[] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f};
-		operand.kind             = OperandKind::FloatInlineConstant;
-		operand.value            = std::bit_cast<uint32_t>(values[code - 240u]);
-		return;
-	}
-	if (code >= 256u && code <= 511u) {
+	if (code <= 511u) {
 		DecodeVectorGpr(code - 256u, operand);
 		return;
 	}
-
-	switch (code) {
-		case 106u: operand.kind = OperandKind::VccLo; return;
-		case 107u: operand.kind = OperandKind::VccHi; return;
-		case 124u: operand.kind = OperandKind::M0; return;
-		case 125u: operand.kind = OperandKind::Null; return;
-		case 126u: operand.kind = OperandKind::ExecLo; return;
-		case 127u: operand.kind = OperandKind::ExecHi; return;
-		case 235u: operand.kind = OperandKind::SharedBase; return;
-		case 237u: operand.kind = OperandKind::PrivateBase; return;
-		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
-		case 248u:
-			operand.kind      = OperandKind::FloatInlineConstant;
-			operand.value = std::bit_cast<uint32_t>(0.15915494309189535f);
-			return;
-		case 251u: operand.kind = OperandKind::VccZ; return;
-		case 252u: operand.kind = OperandKind::ExecZ; return;
-		case 253u: operand.kind = OperandKind::Scc; return;
-		case 255u: operand.kind = OperandKind::LiteralConstant; return;
-		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
-	}
+	EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
 }
 
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
-	operand = {};
-
-	if (code <= 105u) {
-		operand.kind = OperandKind::Sgpr;
-		operand.reg  = code;
-		return;
+	if (code < 128u) {
+		operand = kScalarDestLut[code];
+		if (__builtin_expect(operand.kind != OperandKind::Unknown, 1)) {
+			return;
+		}
 	}
-
-	switch (code) {
-		case 106u: operand.kind = OperandKind::VccLo; return;
-		case 107u: operand.kind = OperandKind::VccHi; return;
-		case 124u: operand.kind = OperandKind::M0; return;
-		case 125u: operand.kind = OperandKind::Null; return;
-		case 126u: operand.kind = OperandKind::ExecLo; return;
-		case 127u: operand.kind = OperandKind::ExecHi; return;
-		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
-	}
+	EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
 }
 
 void DecodeVectorGpr(uint32_t reg, Operand& operand) {
@@ -326,11 +357,10 @@ void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const 
 
 Family GetInstructionFamily(uint32_t word) {
 	if ((word & 0x80000000u) == 0u) {
-		switch ((word >> 25u) & 0x3fu) {
-			case 0x3eu: return Family::VOPC;
-			case 0x3fu: return Family::VOP1;
-			default: return Family::VOP2;
-		}
+		const uint32_t vop = (word >> 25u) & 0x3fu;
+		if (vop == 0x3eu) return Family::VOPC;
+		if (vop == 0x3fu) return Family::VOP1;
+		return Family::VOP2;
 	}
 	if ((word & 0xc0000000u) == 0x80000000u) {
 		const auto opcode = (word >> 23u) & 0x7fu;
@@ -342,19 +372,7 @@ Family GetInstructionFamily(uint32_t word) {
 		}
 	}
 
-	switch (word >> 26u) {
-		case 0x32u: return Family::VINTRP;
-		case 0x33u: return Family::VOP3P;
-		case 0x35u: return Family::VOP3;
-		case 0x36u: return Family::DS;
-		case 0x37u: return Family::FLAT;
-		case 0x38u: return Family::MUBUF;
-		case 0x3au: return Family::MTBUF;
-		case 0x3cu: return Family::MIMG;
-		case 0x3du: return Family::SMEM;
-		case 0x3eu: return Family::EXP;
-		default: return Family::Unknown;
-	}
+	return kEncoding64FamilyLut[word >> 26u];
 }
 
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
@@ -422,7 +440,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 			}
 			branch_targets[target_index] = true;
 		}
-		if (inst.opcode == Opcode::S_ENDPGM &&
+		if (IsProgramEnd(inst.opcode) &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
 			return;
 		}
@@ -538,12 +556,22 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_NOP:
 		case Opcode::S_WAITCNT:
 		case Opcode::S_WAITCNT_DEPCTR:
+		case Opcode::S_WAIT_IDLE:
+		case Opcode::S_CLAUSE:
+		case Opcode::S_WAKEUP:
+		case Opcode::S_SETHALT:
 		case Opcode::S_SLEEP:
 		case Opcode::S_SETPRIO:
 		case Opcode::S_TRAP:
 		case Opcode::S_SENDMSG:
+		case Opcode::S_SENDMSGHALT:
 		case Opcode::S_TTRACEDATA:
 		case Opcode::S_INST_PREFETCH:
+		case Opcode::S_ICACHE_INV:
+		case Opcode::S_INCPERFLEVEL:
+		case Opcode::S_DECPERFLEVEL:
+		case Opcode::S_ROUND_MODE:
+		case Opcode::S_DENORM_MODE:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.src0).c_str()));
@@ -552,7 +580,9 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::V_NOP:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: v_nop", inst.pc));
 		case Opcode::S_ENDPGM:
-			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_endpgm", inst.pc));
+		case Opcode::S_CODE_END:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode)));
 		case Opcode::S_BRANCH:
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:

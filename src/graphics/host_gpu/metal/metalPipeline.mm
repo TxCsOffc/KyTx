@@ -2,11 +2,13 @@
 #include "graphics/host_gpu/metal/metalPipeline.h"
 #include "graphics/host_gpu/metal/metalContext.h"
 #include "graphics/host_gpu/metal/metalRenderer.h"
+#include "graphics/host_gpu/metal/metalShaderCache.h"
 #include "common/logging/log.h"
 #include <algorithm>
 #include <array>
-#include <cstdio>
 #include <atomic>
+#include <cstdio>
+#include <mutex>
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -206,8 +208,8 @@ MTLColorWriteMask TranslateColorWriteMask(uint8_t mask) {
 }
 
 MetalPipelineManager& MetalPipelineManager::Instance() {
-	static MetalPipelineManager instance;
-	return instance;
+	static auto* instance = new MetalPipelineManager();
+	return *instance;
 }
 
 MetalPipelineManager::MetalPipelineManager() = default;
@@ -217,6 +219,7 @@ MetalPipelineManager::~MetalPipelineManager() {
 }
 
 void MetalPipelineManager::ClearCaches() {
+	std::scoped_lock lock(m_depth_stencil_mutex, m_render_pipeline_mutex, m_compute_pipeline_mutex);
 	@autoreleasepool {
 		m_depth_stencil_cache.clear();
 		m_render_pipeline_cache.clear();
@@ -367,9 +370,12 @@ id<MTLDepthStencilState> MetalPipelineManager::GetOrCreateDepthStencilState(
 	                    (static_cast<uint32_t>(stencil_mask.stencil_opval_bf) << 24u);
 	key.stencil_flags = (has_stencil_attachment ? 1u : 0u) | (stencil_ops_disabled ? 2u : 0u);
 
-	auto it = m_depth_stencil_cache.find(key);
-	if (it != m_depth_stencil_cache.end()) {
-		return it->second;
+	{
+		std::shared_lock lock(m_depth_stencil_mutex);
+		auto it = m_depth_stencil_cache.find(key);
+		if (it != m_depth_stencil_cache.end()) {
+			return it->second;
+		}
 	}
 
 	@autoreleasepool {
@@ -408,8 +414,9 @@ id<MTLDepthStencilState> MetalPipelineManager::GetOrCreateDepthStencilState(
 		}
 
 		id<MTLDepthStencilState> state = [device newDepthStencilStateWithDescriptor:desc];
-		m_depth_stencil_cache.emplace(key, state);
-		return state;
+		std::unique_lock lock(m_depth_stencil_mutex);
+		auto [it, inserted] = m_depth_stencil_cache.try_emplace(key, state);
+		return it->second;
 	}
 }
 
@@ -453,9 +460,12 @@ id<MTLRenderPipelineState> MetalPipelineManager::GetOrCreateRenderPipeline(
 	if (debug_ps_active) {
 		cache_key.fs_hash ^= 0x9E3779B97F4A7C15ull;
 	}
-	auto it = m_render_pipeline_cache.find(cache_key);
-	if (it != m_render_pipeline_cache.end()) {
-		return it->second;
+	{
+		std::shared_lock lock(m_render_pipeline_mutex);
+		auto it = m_render_pipeline_cache.find(cache_key);
+		if (it != m_render_pipeline_cache.end()) {
+			return it->second;
+		}
 	}
 
 	@autoreleasepool {
@@ -580,6 +590,8 @@ id<MTLRenderPipelineState> MetalPipelineManager::GetOrCreateRenderPipeline(
 			return nil;
 		}
 
+		MetalBinaryCache::Instance().AttachToRenderDescriptor(desc);
+
 		NSError* error = nil;
 		id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
 		if (!pipeline) {
@@ -598,17 +610,24 @@ id<MTLRenderPipelineState> MetalPipelineManager::GetOrCreateRenderPipeline(
 			return nil;
 		}
 
-		m_render_pipeline_cache.emplace(key, pipeline);
-		return pipeline;
+		if (!debug_ps_active && !s_debug_quad) {
+			MetalBinaryCache::Instance().AddRenderPipeline(desc, cache_key);
+		}
+		std::unique_lock lock(m_render_pipeline_mutex);
+		auto [it, inserted] = m_render_pipeline_cache.try_emplace(cache_key, pipeline);
+		return it->second;
 	}
 }
 
 id<MTLComputePipelineState> MetalPipelineManager::GetOrCreateComputePipeline(
     uint64_t cs_hash,
     id<MTLFunction> compute_function) {
-	auto it = m_compute_pipeline_cache.find(cs_hash);
-	if (it != m_compute_pipeline_cache.end()) {
-		return it->second;
+	{
+		std::shared_lock lock(m_compute_pipeline_mutex);
+		auto it = m_compute_pipeline_cache.find(cs_hash);
+		if (it != m_compute_pipeline_cache.end()) {
+			return it->second;
+		}
 	}
 
 	@autoreleasepool {
@@ -621,6 +640,7 @@ id<MTLComputePipelineState> MetalPipelineManager::GetOrCreateComputePipeline(
 		MTLComputePipelineDescriptor* desc = [[MTLComputePipelineDescriptor alloc] init];
 		desc.computeFunction = compute_function;
 		desc.label = [NSString stringWithFormat:@"CS %016llx", (unsigned long long)cs_hash];
+		MetalBinaryCache::Instance().AttachToComputeDescriptor(desc);
 		id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
 		if (!pipeline) {
 			LOGF_COLOR(Log::Color::BrightRed, "Metal: Failed to create compute pipeline state: %s\n",
@@ -628,8 +648,10 @@ id<MTLComputePipelineState> MetalPipelineManager::GetOrCreateComputePipeline(
 			return nil;
 		}
 
-		m_compute_pipeline_cache.emplace(cs_hash, pipeline);
-		return pipeline;
+		MetalBinaryCache::Instance().AddComputePipeline(desc, cs_hash);
+		std::unique_lock lock(m_compute_pipeline_mutex);
+		auto [it, inserted] = m_compute_pipeline_cache.try_emplace(cs_hash, pipeline);
+		return it->second;
 	}
 }
 

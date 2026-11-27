@@ -14,8 +14,9 @@
 #include <cstdlib>
 #include <vector>
 #include "graphics/host_gpu/metal/metalContext.h"
-#include "graphics/host_gpu/metal/metalOrder.h"
 #include "graphics/host_gpu/metal/metalIndirect.h"
+#include "graphics/host_gpu/metal/metalOrder.h"
+#include "graphics/host_gpu/metal/metalShaderCache.h"
 #include "common/logging/log.h"
 
 #import <Metal/Metal.h>
@@ -68,6 +69,7 @@ bool MetalContext::Initialize() {
 
 		QueryCapabilities();
 		m_initialized = true;
+		MetalBinaryCache::Instance().Initialize(m_device);
 
 		LOGF_COLOR(Log::Color::BrightGreen,
 		           "Metal backend initialized: %s (Apple10: %s, Metal 4: %s, UMA: %s)\n",
@@ -88,6 +90,7 @@ void MetalContext::Shutdown() {
 
 	WaitUntilIdle();
 	EndCurrentEncoder();
+	MetalBinaryCache::Instance().Shutdown();
 
 	@autoreleasepool {
 		m_current_command_buffer = nil;

@@ -185,9 +185,9 @@ private:
 	void V_AND_OR_B32(const Decoder::Instruction& inst);
 	void V_OR3_B32(const Decoder::Instruction& inst);
 	void V_XOR3_B32(const Decoder::Instruction& inst);
-	void S_FF1_I32_B64(const Decoder::Instruction& inst);
+	void S_FF1_I32_B64(const Decoder::Instruction& inst, bool zero = false);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
-	void S_FLBIT_I32_B64(const Decoder::Instruction& inst);
+	void S_FLBIT_I32_B64(const Decoder::Instruction& inst, bool sign = false);
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
@@ -204,6 +204,7 @@ private:
 	void    S_BFM_B64(const Decoder::Instruction& inst);
 	void    S_BFE_U32(const Decoder::Instruction& inst, bool sign);
 	void    S_BFE_U64(const Decoder::Instruction& inst);
+	void    S_BFE_I64(const Decoder::Instruction& inst);
 	void    V_BFE_U32(const Decoder::Instruction& inst, bool sign);
 	void    V_BFI_B32(const Decoder::Instruction& inst);
 	void    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
@@ -219,7 +220,8 @@ private:
 
 	void S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin);
 	void S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation, bool negate_exec,
-	                bool negate_source, bool write_64);
+	                bool negate_source, bool write_64, bool negate_result = false,
+	                bool write_result = false);
 	void ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in);
 	void SUB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);
 	void SUBB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);

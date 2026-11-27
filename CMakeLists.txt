@@ -234,6 +234,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/translate/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/metal/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/metal/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/msl/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/msl/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/*.cpp"
@@ -623,6 +625,11 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+add_kyty_full_emulator_test(fast_translator_tests "${KYTY_TESTS_DIR}/FastTranslatorTests.cpp")
+if(APPLE)
+	add_kyty_full_emulator_test(fast_metal_translator_tests "${KYTY_TESTS_DIR}/FastMetalTranslatorTests.mm")
+	set_source_files_properties("${KYTY_TESTS_DIR}/FastMetalTranslatorTests.mm" PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
@@ -697,6 +704,10 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME fast_translator COMMAND $<TARGET_FILE:fast_translator_tests>)
+	if(APPLE)
+		add_test(NAME fast_metal_translator COMMAND $<TARGET_FILE:fast_metal_translator_tests>)
+	endif()
 	add_test(NAME shader_optimization_gpu
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-optimization-only)
 	add_test(NAME shader_recompiler_alignbyte
